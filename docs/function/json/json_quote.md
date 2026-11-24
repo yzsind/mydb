@@ -20,6 +20,10 @@ JSON_QUOTE(str)
 
 Returns text containing a quoted and escaped JSON string literal. The input is string content, not a JSON document to parse; SQL NULL returns SQL NULL.
 
+The result is a character string, not a JSON-typed value. CTAS therefore creates
+a character column, and passing the result to JSON_ARRAY quotes that text as a
+string instead of embedding it as a JSON scalar.
+
 ## Examples
 
 ```sql

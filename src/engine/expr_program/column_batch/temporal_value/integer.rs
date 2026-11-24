@@ -84,12 +84,10 @@ pub(super) fn evaluate(
             let first = lanes[0].integer(row);
             match name.as_str() {
                 "FROM_DAYS" => {
-                    if first <= 0 {
+                    if first <= 365 {
                         Some(i64::from(crate::types::ZERO_DATE))
                     } else {
-                        let ce =
-                            i32::try_from(first.checked_sub(if first < 60 { 366 } else { 365 })?)
-                                .ok()?;
+                        let ce = i32::try_from(first.checked_sub(365)?).ok()?;
                         let date = chrono::NaiveDate::from_num_days_from_ce_opt(ce)?;
                         if date.year() > 9999 {
                             return None;

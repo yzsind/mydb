@@ -348,6 +348,12 @@ fn infer_column_type_checked<const SCHEMA: bool>(
                 .map_or(ColumnType::VarString, |descriptor| descriptor.column_type())
         }
         Expr::Function { name, args, .. } => {
+            if name.eq_ignore_ascii_case("SOUNDEX")
+                && args.len() == 1
+                && recurse(&args[0]) == ColumnType::Blob
+            {
+                return ColumnType::Blob;
+            }
             if let Some(descriptor) = resolved_stored_function_type(name) {
                 return descriptor.column_type();
             }
@@ -533,6 +539,7 @@ fn json_value_result_type(args: &[Expr]) -> ColumnType {
         "DATE" => ColumnType::Date,
         "TIME" => ColumnType::Time,
         "DATETIME" => ColumnType::DateTime,
+        "JSON" => ColumnType::Json,
         _ => ColumnType::VarString,
     }
 }

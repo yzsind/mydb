@@ -835,11 +835,12 @@ fn finish_statement_diagnostics(
     // thread-local directly still sees it.
     session.pending_statement_matched_rows = crate::engine::api::statement_matched_rows();
     let pending_info = crate::engine::api::peek_statement_info();
-    session.pending_statement_info = if pending_info.is_empty() {
-        None
-    } else {
-        Some(pending_info)
-    };
+    session.pending_statement_info =
+        if pending_info.is_empty() && !crate::engine::api::statement_info_is_explicit() {
+            None
+        } else {
+            Some(pending_info)
+        };
     if insert_id != 0 {
         session
             .last_insert_id

@@ -95,10 +95,10 @@ def main():
             check("SELECT e<'medium',e>'medium',e<2 FROM t",[0,1,1],[8]*3)
             check("SELECT LPAD('中文',4,''),RPAD('abc',2,'')",['','ab'])
             check("SELECT WEEK('10:11:12'),YEAR('10:11:12'),DATE_FORMAT('10:11:12','%Y-%m-%d'),LAST_DAY('2020-02-00')",[45,2010,'2010-11-12',datetime.date(2020,2,29)])
-            # mydb preserves year-zero day-number round trips (the existing
-            # expression_functions_1028::e13_from_days and verified_100 contract).
+            # MySQL day numbers 1–365 map to the zero date; the first
+            # nonzero calendar date starts at 366.
             check("SELECT FROM_DAYS(0),FROM_DAYS(1),FROM_DAYS(365),FROM_DAYS(366),YEAR(0),MONTH(0),DAY(0)",
-                  ['0000-00-00','0000-01-01','0000-12-31',datetime.date(1,1,1),0,0,0])
+                  ['0000-00-00','0000-00-00','0000-00-00',datetime.date(1,1,1),0,0,0])
             check("SELECT CAST(1900 AS YEAR),CAST(2156 AS YEAR)",[None,None],warnings=[1292,1292])
             check("SELECT CHAR(233),CONCAT(b,'!'),SUBSTRING(b,2) FROM t",[b'\xe9',b'\xe9\xff!',b'\xff'],charsets=[63]*3)
             check("SELECT BIN_TO_UUID(UUID_TO_BIN('6ccd780c-baba-1026-9564-5b8c656024db')),INET6_NTOA(INET6_ATON('::1'))",['6ccd780c-baba-1026-9564-5b8c656024db','::1'],charsets=[255,255])

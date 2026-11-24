@@ -952,7 +952,7 @@ impl IndexBatchStream {
         };
         let ranges = self
             .db
-            .zone_map_candidate_ranges(&self.table.schema, &predicate)
+            .zone_map_candidate_ranges_for_read(self.txn, &self.table.schema, &predicate)
             .and_then(|ranges| {
                 let covered_pages = ranges
                     .iter()

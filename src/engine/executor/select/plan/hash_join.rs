@@ -3660,6 +3660,7 @@ pub(super) fn try_execute_streaming_inner_hash_join(
     let requested_degree = probe_shape.degree.max(limits.parallelism).max(1);
     let (probe_tasks, worker_count) = crate::engine::executor::select::parallel::scan_morsels(
         db,
+        txn,
         probe_shape.table,
         probe_shape.filter,
         probe_shape.use_zone_map,

@@ -394,12 +394,18 @@ fn build_ok_packet_into(
         .pending_statement_matched_rows
         .take()
         .or(local_matched);
+    // Always drain this worker's trailer, even when the executor supplied a
+    // session copy. Otherwise inline INSERT state survives a later blocking
+    // UPDATE and is emitted as that UPDATE's info.
+    let explicit_info = context.pending_statement_info.is_some()
+        || crate::engine::api::statement_info_is_explicit();
+    let local_info = crate::engine::api::take_statement_info();
     let mut info = match context.pending_statement_info.take() {
         Some(info) => info,
-        None => crate::engine::api::take_statement_info(),
+        None => local_info,
     };
     let warnings = context.warning_count();
-    if info.is_empty() {
+    if info.is_empty() && !explicit_info {
         if let Some(matched_rows) = matched {
             info = format!(
                 "Rows matched: {} Changed: {} Warnings: {}",
@@ -11329,6 +11335,31 @@ fn bind_sql_params(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn audit_five_ok_info_drains_inline_state_and_honors_empty_trailer() {
+        let mut context = SessionContext::default();
+        let mut payload = Vec::new();
+        crate::engine::api::set_statement_info("Records: 2  Duplicates: 0  Warnings: 0");
+        context.pending_statement_info = Some(crate::engine::api::peek_statement_info());
+        build_ok_packet_into(&mut context, 0, 2, SERVER_STATUS_AUTOCOMMIT, &mut payload);
+        assert!(crate::engine::api::take_statement_info().is_empty());
+        context.pending_statement_matched_rows = Some(3);
+        build_ok_packet_into(&mut context, 0, 2, SERVER_STATUS_AUTOCOMMIT, &mut payload);
+        assert!(String::from_utf8_lossy(&payload).contains("Rows matched: 3 Changed: 2"));
+        assert!(!String::from_utf8_lossy(&payload).contains("Records:"));
+        context.pending_statement_info = Some(String::new());
+        context.pending_statement_matched_rows = Some(1);
+        build_ok_packet_into(
+            &mut context,
+            CLIENT_FOUND_ROWS,
+            2,
+            SERVER_STATUS_AUTOCOMMIT,
+            &mut payload,
+        );
+        assert_eq!(payload[1], 1);
+        assert!(!String::from_utf8_lossy(&payload).contains("Rows matched"));
+    }
 
     #[tokio::test]
     async fn command_idle_timer_respects_both_shorter_and_later_deadlines() {

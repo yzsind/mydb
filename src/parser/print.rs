@@ -503,6 +503,28 @@ fn render_expr_options(expr: &Expr, canonical: bool, queries: bool) -> String {
             args,
             distinct,
         } => {
+            if !distinct
+                && super::IntrinsicFunction::from_name(name)
+                    == Some(super::IntrinsicFunction::MatchAgainst)
+                && args.len() >= 3
+            {
+                if let Expr::Literal(Literal::String(mode)) = &args[0] {
+                    let modifier = if mode == "boolean" {
+                        " IN BOOLEAN MODE"
+                    } else {
+                        " IN NATURAL LANGUAGE MODE"
+                    };
+                    return format!(
+                        "MATCH({}) AGAINST({}{modifier})",
+                        args[2..]
+                            .iter()
+                            .map(expr_to_sql)
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                        expr_to_sql(&args[1])
+                    );
+                }
+            }
             if canonical && !distinct {
                 if let Some(sql) = native_scalar_sql(name, args, &expr_to_sql) {
                     return sql;

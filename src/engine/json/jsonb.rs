@@ -1047,7 +1047,7 @@ pub(super) fn write_f64(v: f64, out: &mut String) {
 }
 
 /// Append `s` as a JSON string literal with the standard escapes.
-pub(super) fn write_json_string(s: &str, out: &mut String) {
+pub(crate) fn write_json_string(s: &str, out: &mut String) {
     // Copy unescaped UTF-8 runs intact. Only ASCII controls, quotes and
     // backslashes need escaping; decoding and re-encoding every character
     // otherwise dominates formatting large JSON documents.

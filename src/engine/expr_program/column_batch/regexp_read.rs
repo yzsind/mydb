@@ -228,10 +228,8 @@ impl<'a> RegexpRead<'a> {
         if !matches!(input, ColumnVector::Utf8 { .. } | ColumnVector::Null { .. }) {
             return None;
         }
-        if (0..batch.num_rows()).all(|row| input.is_null(row)) {
-            return Some(ColumnVector::Null {
-                len: batch.num_rows(),
-            });
+        if batch.num_rows() == 0 {
+            return Some(ColumnVector::Null { len: 0 });
         }
         let flags = match self.flags {
             Some(flags) => Some(flags.with(|s| Some(Value::String(s.into())))?),
@@ -242,6 +240,11 @@ impl<'a> RegexpRead<'a> {
                 crate::engine::expr::mysql_regex_for_operand(pattern, flags.as_ref(), false).ok()
             })
         })?;
+        if (0..batch.num_rows()).all(|row| input.is_null(row)) {
+            return Some(ColumnVector::Null {
+                len: batch.num_rows(),
+            });
+        }
         let input_bytes = match input {
             ColumnVector::Utf8 { data, .. } => data.as_slice(),
             _ => &[],

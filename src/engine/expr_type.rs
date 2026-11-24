@@ -1142,7 +1142,51 @@ pub(crate) fn checked_branch_types(
                 &operands.iter().collect::<Vec<_>>(),
                 "UNION",
             )?;
+        } else if matches!(
+            result.kind,
+            ExprTypeKind::String {
+                kind: StringKind::Character
+            }
+        ) {
+            // Numeric/temporal metadata uses the binary protocol collation;
+            // their textual common domain belongs to the connection charset.
+            result.collation_id = Some(crate::engine::expr::connection_collation_id());
         }
+        // Numeric and temporal widths are presentation characters, whereas
+        // character operands already advertise octets. Convert the former to
+        // the selected result charset before taking the common capacity.
+        let mb = result
+            .collation_id
+            .and_then(crate::charset::resolve_collation_id)
+            .and_then(|info| crate::charset::resolve_charset(info.charset).ok())
+            .map_or(1, |charset| u32::from(charset.max_len));
+        let octets = |ty: ExprType| -> Option<u32> {
+            let chars = match ty.kind {
+                ExprTypeKind::Integer { width, unsigned } => ty
+                    .max_octets
+                    .unwrap_or(u32::from(width.decimal_precision()))
+                    .saturating_add(u32::from(!unsigned)),
+                ExprTypeKind::Decimal {
+                    precision,
+                    scale,
+                    unsigned,
+                } => u32::from(precision) + u32::from(scale > 0) + u32::from(!unsigned),
+                ExprTypeKind::Float { .. } => 24,
+                ExprTypeKind::Year => 4,
+                ExprTypeKind::Temporal { kind, fsp } => match kind {
+                    TemporalKind::Date => 10,
+                    TemporalKind::Time => 10 + if fsp > 0 { u32::from(fsp) + 1 } else { 0 },
+                    _ => 19 + if fsp > 0 { u32::from(fsp) + 1 } else { 0 },
+                },
+                ExprTypeKind::Null => return Some(0),
+                _ => return ty.max_octets,
+            };
+            Some(chars.saturating_mul(mb))
+        };
+        result.max_octets = match (octets(left), octets(right)) {
+            (Some(l), Some(r)) => Some(l.max(r)),
+            _ => None,
+        };
     }
     Ok(result)
 }
@@ -1740,6 +1784,7 @@ pub(crate) fn aggregate_result_type(
 ) -> ExprType {
     let normalized = crate::engine::sys_schema::NormalizedFuncName::new(name);
     match normalized.as_str() {
+        "JSON_ARRAYAGG" | "JSON_OBJECTAGG" => ExprType::new(ExprTypeKind::Json, true),
         "BIT_AND" | "BIT_OR" | "BIT_XOR" => argument
             .filter(|arg| {
                 matches!(
@@ -2055,7 +2100,8 @@ fn infer_expr_type_checked(expr: &Expr, context: &TypeContext<'_>) -> ExprType {
                         Integer { width, unsigned } => {
                             *width = IntegerWidth::Big;
                             *unsigned = false;
-                            result.max_octets = None;
+                            result.max_octets =
+                                input.max_octets.map(|width| width.saturating_add(1));
                         }
                         Decimal { unsigned, .. } => *unsigned = false,
                         Year => {
@@ -2709,6 +2755,46 @@ fn infer_expr_type_checked(expr: &Expr, context: &TypeContext<'_>) -> ExprType {
                     }
                     result
                 }
+                "TO_BASE64" if args.len() == 1 => {
+                    let input = infer_expr_type(&args[0], context);
+                    let width = display_octet_bound(&input).map(|n| {
+                        let encoded = n.div_ceil(3).saturating_mul(4);
+                        encoded
+                            .saturating_add(encoded.saturating_sub(1) / 76)
+                            .saturating_mul(u32::from(context.connection_mbmaxlen))
+                    });
+                    let mut result = fixed_string_result(width, input.nullable);
+                    result.collation_id = Some(context.connection_collation_id);
+                    result
+                }
+                "SOUNDEX" if args.len() == 1 => {
+                    let input = infer_expr_type(&args[0], context);
+                    let binary = input.collation_id == Some(crate::charset::BINARY_COLLATION_ID)
+                        || matches!(
+                            input.kind,
+                            String {
+                                kind: StringKind::Binary | StringKind::Blob
+                            }
+                        );
+                    let mut result = fixed_string_result(
+                        display_octet_bound(&input)
+                            .map(|n| n.max(4 * u32::from(context.connection_mbmaxlen))),
+                        input.nullable,
+                    );
+                    if binary {
+                        result.kind = String {
+                            kind: StringKind::Binary,
+                        };
+                    }
+                    result.collation_id = Some(if binary {
+                        crate::charset::BINARY_COLLATION_ID
+                    } else {
+                        input
+                            .collation_id
+                            .unwrap_or(context.connection_collation_id)
+                    });
+                    result
+                }
                 "HEX" if args.len() == 1 => {
                     let input = infer_expr_type(&args[0], context);
                     let width = display_octet_bound(&input).map(|n| {
@@ -2821,6 +2907,30 @@ fn infer_expr_type_checked(expr: &Expr, context: &TypeContext<'_>) -> ExprType {
                         true,
                     )
                 }
+                "JSON_QUOTE" => {
+                    let input = args.first().map(|arg| infer_expr_type(arg, context));
+                    let mut result = fixed_string_result(None, true);
+                    result.collation_id = Some(context.connection_collation_id);
+                    let input_width = input.and_then(|input| {
+                        if matches!(input.kind, Null) {
+                            Some(0)
+                        } else {
+                            input.max_octets
+                        }
+                    });
+                    result.max_octets = input_width.map(|width| {
+                        width
+                            .saturating_mul(6)
+                            .saturating_add(2 * u32::from(context.connection_mbmaxlen))
+                    });
+                    result
+                }
+                "JSON_VALUE"
+                    if matches!(args.get(2), Some(Expr::Literal(Literal::String(target)))
+                        if target.eq_ignore_ascii_case("JSON")) =>
+                {
+                    ExprType::new(Json, true)
+                }
                 "JSON_VALUE"
                     if crate::engine::expr::expression_metadata_decimals(expr).is_some() =>
                 {
@@ -2885,13 +2995,33 @@ fn infer_expr_type_checked(expr: &Expr, context: &TypeContext<'_>) -> ExprType {
                             TemporalKind::Date if !time_unit => TemporalKind::Date,
                             _ => TemporalKind::DateTime,
                         };
+                        let interval_fsp = match args.get(1) {
+                            Some(Expr::Function {
+                                name,
+                                args: interval,
+                                ..
+                            }) if name.eq_ignore_ascii_case("__INTERVAL") => {
+                                if unit.is_some_and(|unit| unit.contains("MICROSECOND")) {
+                                    6
+                                } else if unit.is_some_and(|unit| unit.contains("SECOND")) {
+                                    match interval
+                                        .first()
+                                        .map(|amount| infer_expr_type(amount, context).kind)
+                                    {
+                                        Some(Decimal { scale, .. }) => scale.min(6),
+                                        Some(Integer { .. } | Year | Bit { .. }) => 0,
+                                        _ => 6,
+                                    }
+                                } else {
+                                    0
+                                }
+                            }
+                            _ => 0,
+                        };
                         ExprType::new(
                             Temporal {
                                 kind,
-                                fsp: fsp.max(
-                                    crate::engine::expr::expression_metadata_decimals(expr)
-                                        .unwrap_or(0),
-                                ),
+                                fsp: fsp.max(interval_fsp),
                             },
                             true,
                         )
@@ -2942,7 +3072,17 @@ fn infer_expr_type_checked(expr: &Expr, context: &TypeContext<'_>) -> ExprType {
                         .first()
                         .map(|arg| infer_expr_type(arg, context))
                         .unwrap_or_else(|| ExprType::new(Unknown, true));
+                    let dynamic = args
+                        .first()
+                        .is_some_and(crate::engine::expr::dynamic_temporal_parameter);
                     match input.kind {
+                        _ if dynamic => ExprType::new(
+                            Temporal {
+                                kind: TemporalKind::Time,
+                                fsp: 6,
+                            },
+                            true,
+                        ),
                         Temporal { kind, fsp } => ExprType::new(
                             Temporal {
                                 kind,
@@ -3186,6 +3326,8 @@ fn infer_expr_type_checked(expr: &Expr, context: &TypeContext<'_>) -> ExprType {
                     result
                 }
                 "COUNT"
+                | "JSON_ARRAYAGG"
+                | "JSON_OBJECTAGG"
                 | "SUM"
                 | "AVG"
                 | "MIN"
@@ -3310,7 +3452,7 @@ fn infer_expr_type_checked(expr: &Expr, context: &TypeContext<'_>) -> ExprType {
                     fixed_integer_result(IntegerWidth::Big, true, false)
                 }
                 "COUNT" => fixed_integer_result(IntegerWidth::Big, false, false),
-                "SUM" | "AVG" | "MIN" | "MAX" => {
+                "SUM" | "AVG" | "MIN" | "MAX" | "JSON_ARRAYAGG" | "JSON_OBJECTAGG" => {
                     aggregate_result_type(normalized.as_str(), argument, context)
                 }
                 "LAG" | "LEAD" | "FIRST_VALUE" | "LAST_VALUE" | "NTH_VALUE" => {

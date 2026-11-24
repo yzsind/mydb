@@ -361,7 +361,16 @@ impl Database {
                 .map_err(io_err)?;
             fs::create_dir_all(crate::storage::naming::system_undo_dir(&data_dir))
                 .map_err(io_err)?;
-            fs::create_dir_all(crate::storage::naming::system_replication_dir(&data_dir))
+            // This directory also contains MySQL source credentials. Start
+            // private rather than relying on a later channel writer to chmod it.
+            let mut replication_directory = fs::DirBuilder::new();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                replication_directory.mode(0o700);
+            }
+            replication_directory.recursive(true)
+                .create(crate::storage::naming::system_replication_dir(&data_dir))
                 .map_err(io_err)?;
             fs::create_dir_all(crate::storage::naming::system_tmp_dir(&data_dir))
                 .map_err(io_err)?;
@@ -1511,5 +1520,8 @@ fn copy_test_seed_tree(source: &Path, destination: &Path) -> Result<(), QueryErr
             crate::util::file::copy_fixture_file(&entry.path(), &target).map_err(io_err)?;
         }
     }
+    // Match clonefile's directory modes, including private credential parents.
+    let permissions = fs::metadata(source).map_err(io_err)?.permissions();
+    fs::set_permissions(destination, permissions).map_err(io_err)?;
     Ok(())
 }

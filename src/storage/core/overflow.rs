@@ -75,6 +75,10 @@ const OVFL_OFF_FLAGS: usize = 22;
 const OVFL_OFF_NEXT: usize = 24;
 const OVFL_OFF_GENERATION: usize = 32;
 
+// Memory files have no WAL identity, but COPY must still avoid reusing an
+// allocation identity while an older physical generation owns undo.
+static MEMORY_LOB_GENERATION: AtomicU64 = AtomicU64::new(1);
+
 // Meta page (page 0) payload fields.
 const OVFL_META_FREE_HEAD: usize = OVFL_HEADER_SIZE; // u64
 const OVFL_META_PAGE_COUNT: usize = OVFL_HEADER_SIZE + 8; // u64 (high-water mark; >= 1)
@@ -334,6 +338,9 @@ impl OverflowFile {
                 me.free_count = me.count_free_list()?;
             }
         }
+        if durability == DurabilityMode::Memory {
+            MEMORY_LOB_GENERATION.fetch_max(me.next_generation, Ordering::Relaxed);
+        }
         Ok(me)
     }
 
@@ -424,18 +431,64 @@ impl OverflowFile {
     /// pointing at never-written pages or at live chains. Allocation is
     /// therefore always repeated by redo; a chain whose owning row is undone
     /// after a crash is merely unreferenced space, never corruption.
-    fn write_page_logged(&mut self, page_id: u64, mut after: Vec<u8>) -> Result<(), QueryError> {
+    fn write_page_logged(&mut self, page_id: u64, after: Vec<u8>) -> Result<(), QueryError> {
+        self.write_page_logged_inner(page_id, after, false)
+            .map(|_| ())
+    }
+
+    fn write_page_logged_inner(
+        &mut self,
+        page_id: u64,
+        mut after: Vec<u8>,
+        allocation: bool,
+    ) -> Result<u64, QueryError> {
         debug_assert_eq!(after.len(), PAGE_SIZE);
         stamp_page_owner(&mut after, &self.file_key.owner, page_id);
         if self.durability == DurabilityMode::Memory {
+            let generation = if allocation {
+                let prior = MEMORY_LOB_GENERATION
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                        current.max(self.next_generation).checked_add(1)
+                    })
+                    .map_err(|_| {
+                        error(
+                            crate::error::catalog::ER_TOO_BIG_ROWSIZE,
+                            "overflow allocation generation is exhausted",
+                        )
+                    })?;
+                prior.max(self.next_generation)
+            } else {
+                0
+            };
+            if allocation {
+                self.next_generation = generation.checked_add(1).ok_or_else(|| {
+                    error(
+                        crate::error::catalog::ER_TOO_BIG_ROWSIZE,
+                        "overflow allocation generation is exhausted",
+                    )
+                })?;
+                write_u64(&mut after, OVFL_META_NEXT_GENERATION, self.next_generation);
+            }
             refresh_page_checksum(&mut after);
             self.buffer_pool
                 .store_page(self.page_key(page_id), after, 0)?;
-            return Ok(());
+            return Ok(generation);
         }
         let lsn = {
             let mut log = self.log.lock();
             let lsn = log.reserve_lsn()?;
+            if allocation {
+                // A table's physical COPY generation can reuse page ids while
+                // old undo still owns descriptors. WAL identities are unique
+                // across those files; per-file counters are not.
+                self.next_generation = lsn.checked_add(1).ok_or_else(|| {
+                    error(
+                        crate::error::catalog::ER_TOO_BIG_ROWSIZE,
+                        "overflow allocation generation is exhausted",
+                    )
+                })?;
+                write_u64(&mut after, OVFL_META_NEXT_GENERATION, self.next_generation);
+            }
             set_page_lsn(&mut after, lsn);
             refresh_page_checksum(&mut after);
             log.append_reserved(
@@ -447,13 +500,24 @@ impl OverflowFile {
         };
         self.buffer_pool
             .store_page(self.page_key(page_id), after, lsn)?;
-        Ok(())
+        Ok(lsn)
     }
 
     fn persist_meta(&mut self) -> Result<(), QueryError> {
+        self.persist_metadata(false).map(|_| ())
+    }
+
+    fn persist_metadata(&mut self, allocation: bool) -> Result<u64, QueryError> {
+        #[cfg(test)]
+        if FAIL_LOB_META_ONCE.with(|flag| flag.replace(false)) {
+            return Err(error(
+                crate::error::catalog::ER_GET_ERRNO,
+                "induced LOB meta write failure",
+            ));
+        }
         let after =
             encode_overflow_meta_page(self.free_head, self.page_count, self.next_generation);
-        self.write_page_logged(0, after)
+        self.write_page_logged_inner(0, after, allocation)
     }
 
     fn ensure_initialized(&mut self) -> Result<(), QueryError> {
@@ -524,11 +588,15 @@ impl OverflowFile {
     /// Interaction with M3: contiguous reuse pops `free_head` / `free_count` in lockstep; the high-water
     /// path only bumps `page_count`. Both paths preserve the accounting invariants of `shrink_to_fit` /
     /// `count_free_list`.
-    fn alloc_pages_for_chain(&mut self, n_pages: usize) -> Result<Vec<u64>, QueryError> {
+    fn alloc_pages_for_chain(
+        &mut self,
+        n_pages: usize,
+        unlink: &mut Option<(u64, Vec<u8>)>,
+    ) -> Result<Vec<u64>, QueryError> {
         let extent_min = lob_extent_min_pages();
         let use_extent = extent_min > 0 && n_pages as u64 >= extent_min;
         if use_extent {
-            if let Some(reused) = self.try_alloc_contiguous_free_extent(n_pages)? {
+            if let Some(reused) = self.try_alloc_contiguous_free_extent(n_pages, unlink)? {
                 return Ok(reused);
             }
             // Contiguous run: bump n_pages pages from the high-water mark in one go.
@@ -570,6 +638,7 @@ impl OverflowFile {
     fn try_alloc_contiguous_free_extent(
         &mut self,
         n_pages: usize,
+        unlink: &mut Option<(u64, Vec<u8>)>,
     ) -> Result<Option<Vec<u64>>, QueryError> {
         if n_pages == 0 || self.free_head == 0 || self.free_count < n_pages as u64 {
             return Ok(None);
@@ -612,7 +681,10 @@ impl OverflowFile {
                     }
                     let mut predecessor_after = predecessor_before.clone();
                     write_u64(&mut predecessor_after, OVFL_OFF_NEXT, next);
-                    self.write_page_logged(run_predecessor, predecessor_after)?;
+                    // Stage the unlink until reservation metadata succeeds.
+                    // A failed meta write must leave the persistent free list
+                    // identical to the allocator state restored by the caller.
+                    *unlink = Some((run_predecessor, predecessor_after));
                 }
                 self.free_count -= n_pages as u64;
                 return Ok(Some(pages));
@@ -691,23 +763,33 @@ impl OverflowFile {
         let saved_page_count = self.page_count;
         let saved_next_generation = self.next_generation;
         let saved_free_count = self.free_count;
+        let mut reserved = false;
         let result = (|| {
-            let generation = self.next_generation;
-            self.next_generation = self.next_generation.checked_add(1).ok_or_else(|| {
+            self.next_generation.checked_add(1).ok_or_else(|| {
                 error(
                     crate::error::catalog::ER_TOO_BIG_ROWSIZE,
                     "overflow allocation generation is exhausted",
                 )
             })?;
-            let allocated = self.alloc_pages_for_chain(n_pages)?;
-            self.persist_meta()?;
+            let mut unlink = None;
+            let allocated = self.alloc_pages_for_chain(n_pages, &mut unlink)?;
+            let generation = self.persist_metadata(true)?;
+            reserved = true;
+            if let Some((page_id, after)) = unlink {
+                self.write_page_logged(page_id, after)?;
+            }
             Ok((generation, allocated))
         })();
-        if result.is_err() {
+        if result.is_err() && !reserved {
             self.free_head = saved_free_head;
             self.page_count = saved_page_count;
             self.next_generation = saved_next_generation;
             self.free_count = saved_free_count;
+        } else if result.is_err() {
+            // Metadata already owns the reservation. Do not pretend the old
+            // generation/free-list counters are still authoritative after an
+            // ambiguous WAL/page publication failure. Reopen recomputes them.
+            self.free_count = self.count_free_list()?;
         }
         result
     }
@@ -868,9 +950,9 @@ impl OverflowFile {
             .ok()
             .and_then(|count| count.checked_mul(128));
         if bytes.is_none_or(|bytes| {
-            !self.free_list_cache_charge.try_grow_optional(
-                bytes.saturating_sub(self.free_list_cache_charge.bytes()),
-            )
+            !self
+                .free_list_cache_charge
+                .try_grow_optional(bytes.saturating_sub(self.free_list_cache_charge.bytes()))
         }) {
             self.clear_free_list_cache();
             return self.free_list_contains(target);
@@ -1086,9 +1168,10 @@ impl OverflowFile {
         self.persist_meta()?;
         // Memory mode has no WAL; persist_meta lands directly in the buffer. Under strict/relaxed the
         // meta WAL record is already appended here. To ensure "meta is durable before set_len",
-        // flush the WAL once before truncating (a no-op for memory).
+        // Sync the WAL before truncating; flush alone only reaches the OS cache.
         if self.durability != DurabilityMode::Memory {
-            self.log.lock().flush()?;
+            let lsn = self.log.lock().last_lsn();
+            crate::wal::LogManager::sync_durable_to(&self.log, lsn)?;
         }
         // 5) Physical truncation + drop the buffer frames of truncated pages (prevents page_id reuse from reading stale frames).
         self.set_file_len(new_page_count)?;
@@ -1185,7 +1268,8 @@ impl OverflowFile {
         // Clamp to the file's high-water mark to avoid out-of-range page ids.
         let end = start.saturating_add(n_pages).min(self.page_count);
         if end > start {
-            self.buffer_pool.prefetch_range(&self.file_key, start, end, None);
+            self.buffer_pool
+                .prefetch_range(&self.file_key, start, end, None);
         }
     }
 
@@ -1416,7 +1500,8 @@ impl OverflowFile {
                     .saturating_add(last_pg + 1)
                     .min(self.page_count);
                 if pe > ps {
-                    self.buffer_pool.prefetch_range(&self.file_key, ps, pe, None);
+                    self.buffer_pool
+                        .prefetch_range(&self.file_key, ps, pe, None);
                 }
             }
         }
@@ -1613,6 +1698,9 @@ impl LobMaterializer for LobRefCollector {
 }
 #[cfg(test)]
 static LOB_FULL_MATERIALIZATIONS_FOR_TEST: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+thread_local! { static FAIL_LOB_META_ONCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
 
 #[cfg(test)]
 pub(crate) fn lob_full_materializations_for_test() -> u64 {

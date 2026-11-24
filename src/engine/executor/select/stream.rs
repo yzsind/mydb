@@ -207,7 +207,7 @@ pub(super) fn seq_scan_stream(
     let candidate_ranges = use_zone_map
         .then(|| filter.as_ref())
         .flatten()
-        .and_then(|expr| db.zone_map_candidate_ranges_for_plan(&table.schema, expr));
+        .and_then(|expr| db.zone_map_candidate_ranges_for_plan(txn, &table.schema, expr));
     let budget = crate::engine::executor::mem_budget::current_budget().unwrap_or_else(|| {
         std::sync::Arc::new(crate::engine::executor::mem_budget::MemBudget::from_env())
     });
@@ -1044,7 +1044,7 @@ pub(super) fn parallel_exchange_unordered_stream(
         );
     }
     let (tasks, worker_count) =
-        super::parallel::scan_morsels(db, table, filter.as_ref(), use_zone_map, degree)?;
+        super::parallel::scan_morsels(db, txn, table, filter.as_ref(), use_zone_map, degree)?;
     if tasks.is_empty() {
         return Ok(Box::new(super::plan::MaterializedStream::new(Vec::new())));
     }
@@ -1420,6 +1420,7 @@ pub(super) fn parallel_exchange_partitioned_stream(
                                 .flatten()
                                 .and_then(|expr| {
                                     db.zone_map_candidate_ranges_for_storage_for_plan(
+                                        txn,
                                         &table_owned.schema,
                                         storage_id,
                                         expr,

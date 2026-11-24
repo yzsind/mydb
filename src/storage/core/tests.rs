@@ -1,6 +1,7 @@
 use super::*;
 
 include!("storage_handle_memo_tests.rs");
+include!("audit_five_storage_tests.rs");
 
 #[test]
 fn snapshot_slots_preserve_other_readers_across_threads_and_reuse() {
@@ -1027,6 +1028,49 @@ fn test_seed_clone_keeps_the_destination_name_reserved() {
     assert_eq!(
         std::fs::read(destination.join("seed")).unwrap(),
         b"seed-data"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn portable_test_seed_copy_preserves_private_directory_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let source = root.path().join("seed");
+    let directories = [
+        ("", 0o700),
+        ("system", 0o750),
+        ("system/replication", 0o700),
+        ("system/replication/channels", 0o700),
+    ];
+    for (relative, mode) in directories {
+        let path = source.join(relative);
+        fs::create_dir_all(&path).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+    }
+    let channel = "system/replication/channels/default.json";
+    fs::write(source.join(channel), b"private credentials").unwrap();
+    fs::set_permissions(source.join(channel), fs::Permissions::from_mode(0o600)).unwrap();
+    let destination = tempfile::tempdir_in(root.path()).unwrap();
+
+    // Exercise the Linux copy path even when this test runs on APFS.
+    copy_test_seed_tree(&source, destination.path()).unwrap();
+    for (relative, mode) in directories.into_iter().chain([(channel, 0o600)]) {
+        assert_eq!(
+            fs::metadata(destination.path().join(relative))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            mode,
+            "{relative}"
+        );
+    }
+    fs::write(destination.path().join(channel), b"changed").unwrap();
+    assert_eq!(
+        fs::read(source.join(channel)).unwrap(),
+        b"private credentials"
     );
 }
 

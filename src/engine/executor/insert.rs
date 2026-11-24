@@ -322,6 +322,7 @@ pub(super) fn enforce_missing_required_columns(
 pub(super) fn finalize_insert_info(records: u64, is_select: bool) {
     let duplicates = crate::engine::api::take_insert_duplicates();
     if records == 1 && !is_select {
+        crate::engine::api::set_statement_info("");
         return;
     }
     let warnings = crate::engine::api::statement_warning_count();

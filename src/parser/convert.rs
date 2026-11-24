@@ -2929,9 +2929,12 @@ fn convert_select(
         if let SelectItem::Expr { expr, alias } = internal {
             if alias.is_none()
                 && (crate::engine::expr::expr_name(expr) == "expr"
+                    || matches!(sql_item, SqlSelectItem::UnnamedExpr(SqlExpr::RLike { .. }))
                     || matches!(
                         expr,
-                        Expr::Literal(Literal::HexBytes(_) | Literal::BitBytes(_))
+                        Expr::Literal(
+                            Literal::HexBytes(_) | Literal::BitBytes(_) | Literal::Float(_)
+                        )
                     ))
                 && !parser_fragment_mode()
             {
@@ -2944,9 +2947,16 @@ fn convert_select(
                     // every form to the same `' '` column name.
                     if matches!(sql_expr, SqlExpr::Trim { .. } | SqlExpr::Extract { .. }) {
                         *alias = Some(adapter::display_sql(sql_expr));
-                    } else if let Some(raw) = capture_select_item_text(sql, sql_expr.span().start)?
-                    {
-                        *alias = Some(raw);
+                    } else {
+                        // sqlparser 0.61 gives RLIKE an empty span. Its left
+                        // operand still identifies the source expression.
+                        let start = match sql_expr {
+                            SqlExpr::RLike { expr, .. } => expr.span().start,
+                            _ => sql_expr.span().start,
+                        };
+                        if let Some(raw) = capture_select_item_text(sql, start)? {
+                            *alias = Some(raw);
+                        }
                     }
                 }
             }
@@ -6694,12 +6704,12 @@ fn unsupported_dml_join(kind: DmlKind, target: &TableRef, joins: &[Join]) -> Opt
     let (temporal, derived, unsupported) = match kind {
         DmlKind::Update => (
             "FOR SYSTEM_TIME AS OF on an UPDATE target or source",
-            "UPDATE join with derived table",
+            "UPDATE with LATERAL source",
             "UPDATE SEMI/ANTI/FULL join",
         ),
         DmlKind::Delete => (
             "FOR SYSTEM_TIME AS OF on a DELETE target or source",
-            "DELETE join with derived table",
+            "DELETE with LATERAL source",
             "DELETE supports only INNER / CROSS / LEFT / RIGHT joins",
         ),
     };
@@ -6707,7 +6717,7 @@ fn unsupported_dml_join(kind: DmlKind, target: &TableRef, joins: &[Join]) -> Opt
         return Some(temporal);
     }
     for join in joins {
-        if join.derived.is_some() {
+        if join.lateral {
             return Some(derived);
         }
         if !matches!(

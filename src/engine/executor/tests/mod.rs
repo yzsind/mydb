@@ -1,4 +1,5 @@
 mod ai;
+mod audit_five_resolution;
 mod availability;
 mod bug_report_1107;
 mod collated_constant_in;
@@ -612,3 +613,5 @@ mod partial_index;
 mod fulltext_incremental;
 
 mod github_issues_1123;
+mod issues_101_105;
+mod issues_87_99;

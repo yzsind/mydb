@@ -59,6 +59,31 @@ intentional differences, and migration boundaries.
 
 **➕ Table sampling:** `TABLESAMPLE` supports row/page sampling by percentage or exact row count, execution-time parameters, `REPEATABLE`, and parallel scans over user base tables and partitions. The default is `SYSTEM` percentage sampling. MySQL 8.0.46 has no equivalent TABLESAMPLE clause; see [SELECT table sampling](statement/query/select.md#table-sampling) for semantics and restrictions.
 
+### Intentional SQL Differences
+
+The following behaviors are intentional and should be considered when comparing
+results or affected-row counts with MySQL:
+
+- Mixed integer/DECIMAL `CASE` and `IF` results retain the common DECIMAL scale,
+  consistent with their result metadata; a selected integer branch can display
+  as `128.0`.
+- Nonrecursive CTEs can reference a CTE defined later in the same `WITH` clause.
+  Window position functions return signed integers, so subtracting two
+  `ROW_NUMBER()` results can produce a negative number.
+- Valid year-0000 dates use the proleptic Gregorian calendar. Date arithmetic
+  preserves valid dates, and `FROM_DAYS(TO_DAYS(date))` round-trips them. Week
+  functions and zero-date clamping can therefore differ from MySQL.
+- `REPLACE` counts the actual deleted and inserted rows. Replacing one
+  conflicting row reports two affected rows even when its values are unchanged.
+- Mixed explicit/generated `AUTO_INCREMENT` inserts allocate generated values
+  as needed; they do not discard MySQL-style unused batch reservations.
+- When several columns in one strict INSERT are invalid, the first reported
+  error can differ because expressions are evaluated before row coercion. The
+  rejected statement remains atomic.
+- For very large finite DOUBLE values, `ROUND`/`TRUNCATE` preserve the input
+  when the requested decimal positions are below its numeric resolution;
+  `FORMAT` renders that finite result instead of an intermediate-overflow zero.
+
 ---
 
 ## 1. Client Protocol and Connections
@@ -349,6 +374,15 @@ compact redo, and checkpoints merge into `mysql.innodb_dynamic_metadata`;
 recovery merges the DD baseline followed by subsequent redo. There is no
 per-table `.ai` file, and ROLLBACK does not reclaim allocated values.
 
+Exact generated-ID sequences and gap positions are not guaranteed to match
+InnoDB. `INSERT IGNORE` may consume a candidate on a duplicate, while ordinary
+`ON DUPLICATE KEY UPDATE` can probe the conflict before allocating a candidate.
+References to the proposed auto-increment value still allocate that value.
+`LAST_INSERT_ID()` describes the actual successful insert; applications must
+not infer row counts or replay identity mappings from sequence gaps.
+The compatibility variable `innodb_autoinc_lock_mode` does not select an
+InnoDB reservation algorithm in mydb. MySQL replication remains ROW/FULL only.
+
 Closing the loop on MySQL 8.0 semantics:
 
 - **sql_mode-aware numeric/string coercion**: strict out-of-range 1264 / overlong 1406 hard errors; non-strict saturating clamp/truncation + warnings 1264/1265. Numeric, string, and temporal writes follow consistent conversion rules. Session and global default `sql_mode=ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION`; an explicitly empty mode and new sessions inheriting an empty global mode both execute in non-strict mode.
@@ -379,7 +413,11 @@ Closing the loop on MySQL 8.0 semantics:
 ### UPDATE / DELETE
 
 - **Single-table UPDATE / DELETE + ORDER BY + LIMIT**: ✅ candidates carry the partition `storage_id` throughout; sort-key errors are not demoted to NULL, and huge LIMITs are not preallocated from the user value; unordered small LIMITs stop early while streaming, and ordered paths support forward/reverse indexes, partition-local index merges, bounded TopN, and spillable sorts for large K, writing row by row in candidate order. UPDATE LIMIT counts matched rows and DELETE LIMIT counts successfully deleted rows; both OFFSET spellings are rejected with 1064.
-- **Multi-table UPDATE / DELETE**: ✅ inner/cross/comma joins + LEFT JOIN targets on both sides. Only genuinely matched rows on the non-preserving side are writable; NULL-padding virtual rows are skipped; a single two-table `a RIGHT JOIN b` is normalized by flipping to `b LEFT JOIN a` (RIGHT inside a chain still reports 1235).
+- **Multi-table UPDATE / DELETE**: ✅ inner/cross/comma joins + LEFT JOIN targets on both sides. Only genuinely matched rows on the non-preserving side are writable; NULL-padding virtual rows are skipped; a single plain two-table `a RIGHT JOIN b` may be normalized to `b LEFT JOIN a`.
+  Longer INNER/LEFT/RIGHT chains preserve each original ON scope and outer-row semantics.
+  Uncorrelated derived SELECT sources, including aliases, grouping and set operations,
+  are materialized as read-only sources; derived results cannot be UPDATE/DELETE targets.
+  LATERAL DML sources remain explicitly unsupported.
 - **DELETE in both forms**: `DELETE t1,t2 FROM refs` and `DELETE FROM t1,t2 USING refs` are both supported; the `tbl_name.*` target suffix; per-table `PARTITION(...)` pruning.
 - **`UPDATE LOW_PRIORITY [IGNORE]`**: ✅ IGNORE covers everything (unique key 1062 / NOT NULL 1048 / FK 1452·1451 / out-of-range 1264 / truncation 1265·1366 / CHECK 3819 converted row-wise to warnings and skipped).
 - **True no-op detection for UPDATE**: column-wise post-coercion comparison; no-op rows write nothing to heap/undo/binlog and do not refresh `ON UPDATE CURRENT_TIMESTAMP`.
@@ -1231,7 +1269,10 @@ degenerate into no-ops.
 - Cross-base-table UPDATE (1393) and DELETE (1395) on join views and other unimplemented shapes;
   single-target UPDATE over INNER/CROSS JOIN directly projected views is supported — see §2 for the specific limitations.
 - UPDATE/DELETE `RETURNING` that genuinely modifies multiple target tables; single-target JOIN DML is available.
-- `MATCH ... AGAINST ... WITH QUERY EXPANSION`.
+- Both `MATCH ... AGAINST (... WITH QUERY EXPANSION)` and
+  `MATCH ... AGAINST (... IN NATURAL LANGUAGE MODE WITH QUERY EXPANSION)` return
+  1064. Query expansion is an unimplemented two-pass search feature; it is never
+  ignored or substituted with ordinary natural-language mode. See [full-text search](fulltext-search.md).
 - The non-standard spelling `GROUP BY ... WITH CUBE`; use the mydb extension
   `GROUP BY CUBE(...)` instead. `ROLLUP(...)`, CUBE, and row constructors themselves are already supported.
 - MERGE, PostgreSQL `ON CONFLICT`, UPDATE FROM, and data-modifying CTEs.

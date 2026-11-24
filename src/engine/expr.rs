@@ -2374,6 +2374,16 @@ pub(crate) fn session_utc_now() -> chrono::NaiveDateTime {
         .unwrap_or_else(|| chrono::Utc::now().naive_utc())
 }
 
+/// SQL-visible object creation uses the statement clock; storage-only callers
+/// retain the real clock. Recovery and physical generation clocks stay separate.
+pub(crate) fn session_creation_time_ms() -> u64 {
+    if with_session_view(|view| view.is_some()) {
+        session_utc_now().and_utc().timestamp_millis().max(0) as u64
+    } else {
+        crate::storage::naming::current_unix_ms()
+    }
+}
+
 /// Current time in the session's configured time zone, returned as
 /// `NaiveDateTime`. Used by NOW() / CURRENT_TIMESTAMP / CURDATE / CURTIME
 /// so a session that runs `SET time_zone = '+08:00'` actually sees +08:00.
@@ -6221,7 +6231,7 @@ where
         "REGEXP_LIKE" => {
             expect_arg_range(name, args, 2, 3)?;
             let values = eval_args(args, &mut eval_arg)?;
-            null_if_any(values, |values| eval_regexp_like_values(&values))
+            eval_regexp_like_values(&values)
         }
         "LOCATE" => {
             // String search is directional: MySQL coerces the needle into
@@ -6831,6 +6841,22 @@ where
                 // (1-69 → 2001-2069, 70-99 → 1970-1999). Valid range is
                 // 1901-2155 plus the literal 0.
                 "YEAR" => {
+                    if matches!(
+                        &value,
+                        Value::String(_) | Value::SmallString(_) | Value::Bytes(_)
+                    ) {
+                        let text = str_value(&value);
+                        let trimmed = text.trim_start_matches(|c: char| c.is_ascii_whitespace());
+                        let digits = trimmed.strip_prefix(['+', '-']).unwrap_or(trimmed);
+                        if !digits.as_bytes().first().is_some_and(u8::is_ascii_digit) {
+                            crate::engine::api::push_statement_warning(
+                                crate::error::ConditionLevel::Warning,
+                                crate::error::catalog::ER_WRONG_VALUE,
+                                format!("Incorrect YEAR value: '{}'", diagnostic_value(&text)),
+                            );
+                            return Ok(Value::Null);
+                        }
+                    }
                     let year = match &value {
                         Value::String(s) => lenient_str_to_i64(s)?,
                         Value::SmallString(s) => {
@@ -7796,9 +7822,7 @@ where
         // -- Date/time functions --
         "DATE_ADD" | "ADDDATE" | "DATE_SUB" | "SUBDATE" => {
             expect_arg_range(name, args, 2, 2)?;
-            let prepared_dynamic_first = args
-                .first()
-                .is_some_and(|arg| matches!(arg, Expr::Placeholder(_) | Expr::BoundValue(_)));
+            let prepared_dynamic_first = args.first().is_some_and(dynamic_temporal_parameter);
             let date_val = eval_arg(&args[0])?;
             if matches!(date_val, Value::Null) {
                 return Ok(Value::Null);
@@ -7876,12 +7900,15 @@ where
         "MONTHNAME" => {
             let value = eval_one(name, args, &mut eval_arg)?;
             null_or(value, |value| {
-                let Some(dt) = parse_temporal_function_datetime(&value, "date")? else {
+                let Some(month) = temporal_month_component(&value)? else {
                     return Ok(Value::Null);
                 };
+                if month == 0 {
+                    return Ok(Value::Null);
+                }
                 let locale = session_time_locale();
                 Ok(Value::String(
-                    locale.months[dt.month0() as usize].to_string(),
+                    locale.months[(month - 1) as usize].to_string(),
                 ))
             })
         }
@@ -7931,11 +7958,10 @@ where
             let value = eval_one(name, args, &mut eval_arg)?;
             null_or(value, |value| {
                 let day_number = int_value(&value)?;
-                if day_number <= 0 {
+                if day_number <= 365 {
                     return Ok(Value::Date(crate::types::ZERO_DATE));
                 }
-                let offset = if day_number < 60 { 366 } else { 365 };
-                let Some(days_from_ce) = day_number.checked_sub(offset) else {
+                let Some(days_from_ce) = day_number.checked_sub(365) else {
                     return Ok(Value::Null);
                 };
                 let Ok(days_from_ce) = i32::try_from(days_from_ce) else {
@@ -8266,9 +8292,7 @@ where
         }
         "ADDTIME" | "SUBTIME" => {
             expect_arg_count(name, args, 2)?;
-            let prepared_dynamic_first = args
-                .first()
-                .is_some_and(|arg| matches!(arg, Expr::Placeholder(_) | Expr::BoundValue(_)));
+            let prepared_dynamic_first = args.first().is_some_and(dynamic_temporal_parameter);
             let values = eval_args(args, &mut eval_arg)?;
             null_if_any(values, |values| {
                 if is_zero_datetime_value(&values[0]) {
@@ -9107,7 +9131,18 @@ where
         "SOUNDEX" => {
             let value = eval_one(name, args, eval_arg)?;
             null_or(value, |value| {
-                Ok(Value::String(soundex_mysql(&string_value(&value))))
+                Ok(match value {
+                    Value::Bytes(bytes) => Value::Bytes(
+                        soundex_letters(
+                            bytes
+                                .into_iter()
+                                .filter(u8::is_ascii_alphabetic)
+                                .map(char::from),
+                        )
+                        .into_bytes(),
+                    ),
+                    value => Value::String(soundex_mysql(&string_value(&value))),
+                })
             })
         }
         // REGEXP_LIKE previously appeared twice in this match: the first
@@ -9118,7 +9153,7 @@ where
         "REGEXP_INSTR" => {
             expect_arg_range(name, args, 2, 6)?;
             let values = eval_args(args, eval_arg)?;
-            null_if_any(values, |values| {
+            regexp_null_if_any(values, 5, |values| {
                 if regexp_binary::binary_operands(&values, 2)? {
                     return regexp_binary::evaluate("REGEXP_INSTR", &values);
                 }
@@ -9176,7 +9211,7 @@ where
         "REGEXP_SUBSTR" => {
             expect_arg_range(name, args, 2, 5)?;
             let values = eval_args(args, eval_arg)?;
-            null_if_any(values, |values| {
+            regexp_null_if_any(values, 4, |values| {
                 if regexp_binary::binary_operands(&values, 2)? {
                     return regexp_binary::evaluate("REGEXP_SUBSTR", &values);
                 }
@@ -9483,9 +9518,8 @@ where
                         "Incorrect type for argument 1 in function JSON_QUOTE",
                     ));
                 }
-                // Wrap the input as a JSON string scalar (escaping as needed).
-                Ok(json_value_from_dom(&serde_json::Value::String(
-                    string_value_for_connection(&value)?,
+                Ok(Value::String(crate::engine::json::quote_text(
+                    &string_value_for_connection(&value)?,
                 )))
             })
         }
@@ -10847,9 +10881,6 @@ fn round_or_truncate_f64(value: f64, d: i32, round: bool) -> Result<Value, Query
         if !divisor.is_finite() {
             return Ok(Value::Double(0.0));
         }
-        if value.is_finite() && value + divisor == value {
-            return Ok(Value::Double(value));
-        }
         let scaled = value / divisor;
         let integral = if round {
             scaled.round_ties_even()
@@ -10857,7 +10888,9 @@ fn round_or_truncate_f64(value: f64, d: i32, round: bool) -> Result<Value, Query
             scaled.trunc()
         };
         let result = integral * divisor;
-        return Ok(Value::Double(if result.is_finite() { result } else { 0.0 }));
+        // Preserve rescaling overflow for enclosing expressions: FORMAT
+        // renders a non-finite REAL as "0", distinct from finite zero.
+        return Ok(Value::Double(result));
     }
     let factor = 10_f64.powi(d);
     if !factor.is_finite() || factor == 0.0 {
@@ -10876,10 +10909,7 @@ fn round_or_truncate_f64(value: f64, d: i32, round: bool) -> Result<Value, Query
         scaled.trunc()
     };
     let result = out / factor;
-    // With a large negative D, division by a tiny factor can overflow even
-    // though both the input and the intermediate remain finite. MySQL treats
-    // that unrepresentable rounded/truncated magnitude as zero.
-    Ok(Value::Double(if result.is_finite() { result } else { 0.0 }))
+    Ok(Value::Double(result))
 }
 
 /// MySQL `ABS()`: the result type follows the argument — integers stay
@@ -11830,13 +11860,37 @@ pub(crate) fn extract_datetime_part(
             Err(err) => Ok(warn_invalid_temporal_function("time", value, err)),
         };
     }
-    if matches!(value, Value::Time(_))
-        && matches!(
-            part.as_str(),
-            "DAY_HOUR" | "DAY_MINUTE" | "DAY_SECOND" | "DAY_MICROSECOND"
-        )
-    {
-        let (negative, hour, minute, second, micros) = parse_time_value_components(value)?;
+    let duration_domain = matches!(
+        part.as_str(),
+        "DAY_HOUR" | "DAY_MINUTE" | "DAY_SECOND" | "DAY_MICROSECOND"
+    ) && (matches!(value, Value::Time(_))
+        || match value {
+            Value::String(_) | Value::SmallString(_) | Value::Bytes(_) => {
+                let text = str_value(value);
+                let text = text.trim();
+                // Calendar dates retain their day field. Duration and compact
+                // time inputs must not inherit the epoch's day-of-month.
+                let main = text.split('.').next().unwrap_or("");
+                let compact_calendar = main.len() >= 9 && main.bytes().all(|b| b.is_ascii_digit());
+                let clock = main.contains(':')
+                    && main
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || matches!(b, b':' | b' '));
+                !compact_calendar
+                    && !text
+                        .trim_start_matches(['+', '-'])
+                        .contains(['-', '/', 'T'])
+                    && (clock
+                        || crate::util::temporal::parse_delimited_datetime_components(text)
+                            .is_none())
+            }
+            _ => value_is_numeric(value) && numeric(value)?.abs() < 100_000_000.0,
+        });
+    if duration_domain {
+        let (negative, hour, minute, second, micros) = match parse_time_value_components(value) {
+            Ok(parts) => parts,
+            Err(err) => return Ok(warn_invalid_temporal_function("time", value, err)),
+        };
         let mut number = i64::from(hour);
         if part != "DAY_HOUR" {
             number = number * 100 + i64::from(minute);
@@ -13303,54 +13357,22 @@ pub(crate) fn is_zero_datetime_value(value: &Value) -> bool {
 // can never drift apart.
 
 pub(crate) fn eval_datediff_values(a: &Value, b: &Value) -> Result<Value, QueryError> {
-    let parse = |value: &Value| {
-        if temporal_value_has_year_zero(value) {
-            if !strict_dml_expression() {
-                crate::engine::api::push_statement_warning(
-                    crate::error::ConditionLevel::Warning,
-                    crate::error::catalog::ER_TRUNCATED_WRONG_VALUE,
-                    format!(
-                        "Truncated incorrect datetime value: '{}'",
-                        string_value(value)
-                    ),
-                );
-                return Ok(None);
-            }
-            return Err(error(
+    let parse = |value: &Value| match parse_datetime_null_on_zero(value) {
+        Ok(parsed) => Ok(parsed),
+        Err(err) if !strict_dml_expression() => {
+            crate::engine::api::push_statement_warning(
+                crate::error::ConditionLevel::Warning,
                 crate::error::catalog::ER_TRUNCATED_WRONG_VALUE,
-                format!("Incorrect datetime value: '{}'", string_value(value)),
-            ));
+                err.to_string(),
+            );
+            Ok(None)
         }
-        match parse_datetime_null_on_zero(value) {
-            Ok(parsed) => Ok(parsed),
-            Err(err) if !strict_dml_expression() => {
-                crate::engine::api::push_statement_warning(
-                    crate::error::ConditionLevel::Warning,
-                    crate::error::catalog::ER_TRUNCATED_WRONG_VALUE,
-                    err.to_string(),
-                );
-                Ok(None)
-            }
-            Err(err) => Err(err),
-        }
+        Err(err) => Err(err),
     };
     let (Some(left), Some(right)) = (parse(a)?, parse(b)?) else {
         return Ok(Value::Null);
     };
     Ok(Value::Int((left.date() - right.date()).num_days()))
-}
-
-fn temporal_value_has_year_zero(value: &Value) -> bool {
-    match value {
-        Value::Date(days) => crate::types::date_components(*days).0 == 0,
-        Value::DateTime(micros) | Value::Timestamp(micros) => {
-            crate::types::datetime_components(*micros).0 == 0
-        }
-        Value::String(_) | Value::SmallString(_) | Value::Bytes(_) | Value::Decimal(_) => {
-            string_value(value).trim_start().starts_with("0000-")
-        }
-        _ => false,
-    }
 }
 
 fn reject_zero_date_text(value: &Value) -> bool {
@@ -13572,31 +13594,47 @@ pub(crate) fn eval_unix_timestamp_scalar_value(v: &Value) -> Result<Value, Query
     }
 }
 
-pub(crate) fn eval_quarter_value(v: &Value) -> Result<Value, QueryError> {
+fn temporal_month_component(v: &Value) -> Result<Option<u32>, QueryError> {
     if reject_zero_date_text(v) {
-        return Ok(warn_invalid_temporal_cast("date", v));
+        warn_invalid_temporal_cast("date", v);
+        return Ok(None);
     }
     if is_zero_datetime_value(v) {
-        return Ok(Value::Int(0));
+        return Ok(Some(0));
     }
-    let tagged_month = match v {
+    let month = match v {
         Value::Date(days) => crate::types::decode_tagged_date(*days).map(|(_, month, _)| month),
         Value::DateTime(micros) => {
             crate::types::decode_tagged_datetime(*micros).map(|(_, month, ..)| month)
         }
+        Value::String(_) | Value::SmallString(_) | Value::Bytes(_) => {
+            crate::util::temporal::parse_delimited_datetime_components(&str_value(v))
+                .filter(|p| {
+                    p.month == 0
+                        || p.day == 0
+                        || (session_temporal_sql_mode_bits()
+                            & crate::engine::api::TEMPORAL_MODE_ALLOW_INVALID_DATES
+                            != 0
+                            && invalid_date_components_are_preservable(p.year, p.month, p.day))
+                })
+                .map(|p| p.month)
+        }
         _ => None,
     };
-    if let Some(month) = tagged_month {
-        return Ok(Value::Int(if month == 0 {
+    if month.is_some() {
+        return Ok(month);
+    }
+    Ok(parse_temporal_function_datetime(v, "date")?.map(|dt| dt.month()))
+}
+
+pub(crate) fn eval_quarter_value(v: &Value) -> Result<Value, QueryError> {
+    Ok(temporal_month_component(v)?.map_or(Value::Null, |month| {
+        Value::Int(if month == 0 {
             0
         } else {
             i64::from((month - 1) / 3 + 1)
-        }));
-    }
-    let Some(dt) = parse_temporal_function_datetime(v, "date")? else {
-        return Ok(Value::Null);
-    };
-    Ok(Value::Int(((dt.month() - 1) / 3 + 1) as i64))
+        })
+    }))
 }
 
 pub(crate) fn mysql_calendar_day_number(year: i32, month: u32, day: u32) -> i64 {
@@ -13704,9 +13742,12 @@ pub(crate) fn eval_week_value(v: &Value, mode: Option<i64>) -> Result<Value, Que
     Ok(Value::Int(mysql_calc_week(dt.date(), mode).1 as i64))
 }
 
-/// `DATE_ADD` / `DATE_SUB` (and the ADDDATE/SUBDATE aliases) on
-/// already-evaluated values. Output shape follows the input: a date-only
-/// argument yields a DATE string.
+/// Auto-parameterized literals keep their source domain; genuine prepared
+/// parameters use the function's prepare-time temporal conversion contract.
+pub(crate) fn dynamic_temporal_parameter(expr: &Expr) -> bool {
+    matches!(expr, Expr::Placeholder(_)) && !crate::engine::params::auto_parameterized_active()
+}
+
 /// Typed temporal result for textual temporal-function operands. MySQL's
 /// temporal functions return a value that reads as `YYYYMMDD[HHMMSS]` in numeric
 /// context even when their operand was text, so a whole-second result keeps a
@@ -13719,7 +13760,7 @@ fn typed_textual_temporal_result(result: NaiveDateTime, date_only: bool, fsp: us
         if let Ok(days) = i32::try_from(days) {
             return Value::Date(days);
         }
-    } else if fsp == 0 {
+    } else if fsp == 0 || result.nanosecond() == 0 {
         return Value::DateTime(result.and_utc().timestamp_micros());
     }
     Value::String(if date_only {
@@ -13882,12 +13923,18 @@ pub(crate) fn eval_date_add_values(
             .expect("valid epoch")
             .and_hms_opt(0, 0, 0)
             .expect("valid midnight");
-        return Ok(Value::Time(
-            result
-                .signed_duration_since(epoch)
-                .num_microseconds()
-                .unwrap_or(if result < epoch { i64::MIN } else { i64::MAX }),
-        ));
+        let micros = result.signed_duration_since(epoch).num_microseconds();
+        let Some(micros) =
+            micros.filter(|v| v.unsigned_abs() <= (TIME_MAX_SECONDS * 1_000_000) as u64)
+        else {
+            crate::engine::api::push_statement_warning(
+                crate::error::ConditionLevel::Warning,
+                crate::error::catalog::ER_DATETIME_FUNCTION_OVERFLOW,
+                "Datetime function: datetime field overflow",
+            );
+            return Ok(Value::Null);
+        };
+        return Ok(Value::Time(micros));
     }
     if matches!(
         date_val,
@@ -13910,11 +13957,13 @@ pub(crate) fn eval_date_add_values(
         // fractional amount). Previously the `%H:%M:%S` format silently
         // truncated to whole seconds, so `+ INTERVAL 500000 MICROSECOND` was
         // a no-op and `.123456` inputs lost their fraction.
-        let arg_fsp = text_fsp(date_val);
-        let unit_fsp = if unit_upper.contains("MICROSECOND") {
+        let arg_fsp = if text_fsp(date_val) > 0 { 6 } else { 0 };
+        let unit_fsp = if unit_upper.contains("MICROSECOND")
+            || (unit_upper.contains("SECOND") && result.nanosecond() > 0)
+        {
             6
         } else {
-            text_fsp(amount)
+            0
         };
         Ok(typed_textual_temporal_result(
             result,
@@ -15129,12 +15178,24 @@ impl StrToDateBuilder {
             return None;
         }
 
-        // For DATE / DATETIME: year/month/day must all be present and valid.
+        // Calendar components may be incomplete or invalid when the session
+        // mode permits them. Preserve those components in the tagged lanes.
         if has_date {
             let y = self.year?;
             let mo = self.month?;
             let d = self.day?;
-            chrono::NaiveDate::from_ymd_opt(y, mo, d)?;
+            let zero = y == 0 && mo == 0 && d == 0;
+            if zero
+                && session_temporal_sql_mode_bits() & crate::engine::api::TEMPORAL_MODE_NO_ZERO_DATE
+                    != 0
+            {
+                return None;
+            }
+            let date = if zero {
+                Some(Value::Date(crate::types::ZERO_DATE))
+            } else {
+                date_value_from_components(u32::try_from(y).ok()?, mo, d)
+            }?;
             if has_time {
                 let h = self.hour.unwrap_or(0);
                 let mi = self.minute.unwrap_or(0);
@@ -15143,13 +15204,18 @@ impl StrToDateBuilder {
                 if h > 23 || mi > 59 || s > 59 || us > 999_999 {
                     return None;
                 }
-                let micros = chrono::NaiveDate::from_ymd_opt(y, mo, d)?
-                    .and_hms_micro_opt(h, mi, s, us)?
-                    .and_utc()
-                    .timestamp_micros();
+                let micros = if zero && h == 0 && mi == 0 && s == 0 && us == 0 {
+                    crate::types::ZERO_DATETIME
+                } else if let Some(date) = chrono::NaiveDate::from_ymd_opt(y, mo, d) {
+                    date.and_hms_micro_opt(h, mi, s, us)?
+                        .and_utc()
+                        .timestamp_micros()
+                } else {
+                    crate::types::encode_tagged_datetime(y as u32, mo, d, h, mi, s, us)?
+                };
                 Some(Value::DateTime(micros))
             } else {
-                date_value_from_components(y as u32, mo, d)
+                Some(date)
             }
         } else {
             // Time-only
@@ -15683,22 +15749,12 @@ fn format_exact_decimal_parts(v: &Value) -> Option<(i128, u8)> {
 /// `decimals` fractional digits. Single source of truth for FORMAT rounding.
 fn format_round_fixed(value: &Value, decimals: usize) -> Result<String, QueryError> {
     if let Some((mag, scale)) = format_exact_decimal_parts(value) {
-        let overflow = || {
-            error(
-                crate::error::catalog::ER_DATA_OUT_OF_RANGE,
-                "DECIMAL value is out of range",
-            )
-        };
-        let (rmag, rscale) = crate::util::decimal::round_exact_parts(mag, scale, decimals as i32)
-            .ok_or_else(overflow)?;
-        let pad = decimals as u32 - rscale as u32;
-        let final_mag = rmag
-            .checked_mul(10i128.checked_pow(pad).ok_or_else(overflow)?)
-            .ok_or_else(overflow)?;
-        return Ok(crate::util::decimal::format_decimal_parts(
-            final_mag,
+        return Ok(crate::util::decimal::rescale_exact(
+            crate::util::decimal::ExactDecimal::from_i128(mag, scale),
             decimals as u8,
-        ));
+            true,
+        )
+        .format());
     }
     // DECIMAL(39..65) cannot be represented by i128. Keep it in the wide
     // fixed-point lane; FORMAT is an explicit presentation boundary, so this
@@ -15743,15 +15799,27 @@ fn format_round_fixed(value: &Value, decimals: usize) -> Result<String, QueryErr
             f64::MAX
         };
     }
-    let factor = 10f64.powi(decimals as i32);
-    let scaled = (n.abs() * factor).round_ties_even();
-    // MySQL's FORMAT boundary returns the stable fallback "0" when scaling
-    // an otherwise finite DOUBLE overflows. Besides matching its observable
-    // result, this prevents `inf` from escaping a presentation function.
-    if !scaled.is_finite() && n.is_finite() {
-        return Ok("0".to_string());
+    if !n.is_finite() {
+        return Ok("0".into());
     }
-    let mut out = format!("{:.prec$}", scaled / factor, prec = decimals);
+    let mut out = if n.is_finite() && n.abs() >= 1e22 {
+        // Large REALs have no fractional bits to round. Render their shortest
+        // decimal spelling before padding, avoiding binary expansion noise
+        // and intermediate overflow from multiplying by the scale factor.
+        let text = n.abs().to_string();
+        let (magnitude, scale) = crate::util::decimal::parse_exact_decimal_big(&text)
+            .ok_or_else(decimal_overflow_error)?;
+        crate::util::decimal::rescale_exact(
+            crate::util::decimal::ExactDecimal::from_big(magnitude, scale),
+            decimals as u8,
+            false,
+        )
+        .format()
+    } else {
+        let factor = 10f64.powi(decimals as i32);
+        let rounded = (n.abs() * factor).round_ties_even() / factor;
+        format!("{:.prec$}", rounded, prec = decimals)
+    };
     if n.is_sign_negative() {
         out.insert(0, '-');
     }
@@ -16322,7 +16390,72 @@ fn function_arg_with_table_octets(
     crate::charset::encode_string(charset, &text).map(Value::Bytes)
 }
 
+// Pattern and match-type validation precedes nullable search operands, but
+// a NULL pattern or match_type itself still determines a NULL result. Run
+// this only during value evaluation so invisible rows/branches stay lazy.
+fn regexp_has_null(values: &[Value], flags_index: usize) -> Result<bool, QueryError> {
+    if !values.iter().any(|value| matches!(value, Value::Null)) {
+        return Ok(false);
+    }
+    if !matches!(values[1], Value::Null) && !matches!(values.get(flags_index), Some(Value::Null)) {
+        match &values[1] {
+            Value::Bytes(bytes) => {
+                validate_null_binary_regexp_pattern(bytes, values.get(flags_index))?
+            }
+            pattern => {
+                mysql_regex_for_operand(&string_value(pattern), values.get(flags_index), false)?;
+            }
+        }
+    }
+    Ok(true)
+}
+
+// Keep governed binary decoding out of the common non-NULL/text callsite.
+// Inlining its allocation/error machinery makes every REGEXP_LIKE row pay
+// for a branch that only nullable binary operands can reach.
+#[cold]
+#[inline(never)]
+fn validate_null_binary_regexp_pattern(
+    bytes: &[u8],
+    flags: Option<&Value>,
+) -> Result<(), QueryError> {
+    // Keep the binary evaluator's resource contract on this NULL
+    // path as well; validation must not bypass its decode budget.
+    if bytes.len() > 8192 {
+        return Err(crate::error::catalog::ER_REGEXP_INTERNAL_ERROR
+            .error("regular expression exceeded the implementation resource limit"));
+    }
+    let _scratch = crate::engine::executor::mem_budget::ControlledMemoryCharge::try_new(
+        crate::engine::executor::mem_budget::ControlledMemoryCategory::Executor,
+        if bytes.is_ascii() {
+            0
+        } else {
+            bytes.len().saturating_mul(3)
+        },
+    )?;
+    let pattern = encoding_rs::WINDOWS_1252
+        .decode_without_bom_handling(bytes)
+        .0;
+    mysql_regex_for_operand(&pattern, flags, true)?;
+    Ok(())
+}
+
+fn regexp_null_if_any(
+    values: Vec<Value>,
+    flags_index: usize,
+    evaluate: impl FnOnce(Vec<Value>) -> Result<Value, QueryError>,
+) -> Result<Value, QueryError> {
+    if regexp_has_null(&values, flags_index)? {
+        Ok(Value::Null)
+    } else {
+        evaluate(values)
+    }
+}
+
 pub(crate) fn eval_regexp_like_values(values: &[Value]) -> Result<Value, QueryError> {
+    if regexp_has_null(values, 2)? {
+        return Ok(Value::Null);
+    }
     if regexp_binary::binary_operands(values, 2)? {
         return regexp_binary::evaluate("REGEXP_LIKE", values);
     }
@@ -16736,7 +16869,7 @@ pub(crate) fn regexp_replace_single_into(
 /// Value-level REGEXP_REPLACE implementation shared by the legacy evaluator
 /// and the compiled expression kernel. Arity is checked by the callers.
 pub(crate) fn eval_regexp_replace_values(values: Vec<Value>) -> Result<Value, QueryError> {
-    null_if_any(values, |values| {
+    regexp_null_if_any(values, 5, |values| {
         if regexp_binary::binary_operands(&values, 3)? {
             return regexp_binary::evaluate("REGEXP_REPLACE", &values);
         }
@@ -16824,6 +16957,14 @@ pub(crate) fn eval_char_values(values: &[Value]) -> Value {
 }
 
 pub(crate) fn soundex_mysql(input: &str) -> String {
+    soundex_letters(
+        input
+            .chars()
+            .filter(|c| c.is_ascii_alphabetic() || *c > '\u{00c0}'),
+    )
+}
+
+fn soundex_letters(mut letters: impl Iterator<Item = char>) -> String {
     fn code(ch: char) -> char {
         match ch.to_ascii_uppercase() {
             'B' | 'F' | 'P' | 'V' => '1',
@@ -16835,9 +16976,6 @@ pub(crate) fn soundex_mysql(input: &str) -> String {
             _ => '0',
         }
     }
-    let mut letters = input
-        .chars()
-        .filter(|c| c.is_ascii_alphabetic() || *c > '\u{00c0}');
     let Some(first) = letters.next() else {
         return String::new();
     };
@@ -17809,12 +17947,13 @@ where
     // JSON_SEARCH(doc, one_or_all, pattern [, escape [, path ...]])
     expect_min_args(name, args, 3)?;
     let values = eval_args(args, eval_arg)?;
-    if values.iter().take(3).any(|v| matches!(v, Value::Null)) {
+    if values.iter().take(2).any(|v| matches!(v, Value::Null)) {
         return Ok(Value::Null);
     }
     let doc = json_doc_bytes(&values[0], 1, name)?;
     let root = crate::engine::json::JsonbRef::new(&doc)?;
     let one = parse_json_one_or_all(&str_value(&values[1]))?;
+    let null_search = matches!(values[2], Value::Null);
     let pattern = str_value(&values[2]);
     // The 4th arg is the LIKE escape character (previously hard-coded to
     // `\`). NULL / absent → default `\`; an empty string disables escaping.
@@ -17844,12 +17983,17 @@ where
                 return Ok(Value::Null);
             }
             let path = crate::engine::func_cache::cached_json_path(&string_value(pv))?;
-            for node in path.eval_without_auto_wrap(root) {
-                scopes.push((node.identity(), priority));
+            if !null_search {
+                for node in path.eval_without_auto_wrap(root) {
+                    scopes.push((node.identity(), priority));
+                }
             }
         }
     } else {
         scopes.push((root.identity(), 0));
+    }
+    if null_search {
+        return Ok(Value::Null);
     }
     if scopes.is_empty() {
         return Ok(Value::Null);
@@ -18399,7 +18543,34 @@ fn json_value_cast(value: Value, returning: &str) -> Result<Value, QueryError> {
         }
         "TIME" => {
             let fsp = params.first().copied().unwrap_or(0).clamp(0, 6) as u8;
-            json_value_require_conversion(value_to_time_string(&value, fsp))
+            // JSON_VALUE accepts time-shaped character scalars, not the
+            // compact numeric spelling accepted by the general CAST path.
+            let text = match &value {
+                Value::String(text) => text.as_str(),
+                Value::SmallString(text) => std::str::from_utf8(text).unwrap_or(""),
+                _ => "",
+            };
+            let parsed = text
+                .contains(':')
+                .then(|| parse_time_components(text))
+                .transpose()?;
+            let invalid = || {
+                crate::error::catalog::ER_INVALID_JSON_VALUE_FOR_CAST
+                    .error("JSON_VALUE TIME requires an in-range time string")
+            };
+            let (negative, h, m, s, us) = parsed.ok_or_else(invalid)?;
+            let round_up = session_temporal_sql_mode_bits()
+                & crate::engine::api::TEMPORAL_MODE_TIME_TRUNCATE_FRACTIONAL
+                == 0
+                && comparison_fraction_rounds_up(&value);
+            let micros = (i64::from(h) * 3600 + i64::from(m) * 60 + i64::from(s)) * 1_000_000
+                + i64::from(us)
+                + i64::from(round_up);
+            if micros > TIME_MAX_SECONDS * 1_000_000 {
+                return Err(invalid());
+            }
+            let time = Value::Time(if negative { -micros } else { micros });
+            json_value_require_conversion(value_to_time_string(&time, fsp))
         }
         "DATETIME" => json_value_require_conversion(cast_value_to_datetime(
             &value,
@@ -19887,7 +20058,10 @@ pub(super) fn function_metadata_decimals(name: &str, args: &[Expr]) -> Option<u8
         let text = match expr {
             Expr::Literal(Literal::Decimal(text) | Literal::String(text)) => text.as_str(),
             Expr::BoundValue(Value::Decimal(text) | Value::String(text)) => text.as_str(),
-            Expr::BoundValue(Value::DecimalCompact(_, scale)) => return Some((*scale).min(6)),
+            Expr::BoundValue(Value::DecimalCompact(_, scale) | Value::Decimal128(_, scale)) => {
+                return Some((*scale).min(6))
+            }
+            Expr::BoundValue(Value::DecimalWide(value)) => return Some(value.scale.min(6)),
             _ => return None,
         };
         let (_, fraction) = text.rsplit_once('.')?;
@@ -19953,6 +20127,29 @@ pub(super) fn function_metadata_decimals(name: &str, args: &[Expr]) -> Option<u8
             }) =>
         {
             Some(6)
+        }
+        "DATE_ADD" | "DATE_SUB" | "ADDDATE" | "SUBDATE" => {
+            let Expr::Function {
+                name,
+                args: interval,
+                ..
+            } = args.get(1)?
+            else {
+                return None;
+            };
+            if !name.eq_ignore_ascii_case("__INTERVAL")
+                || !interval
+                    .get(1)
+                    .is_some_and(|unit| interval_unit_from_arg(unit).contains("SECOND"))
+            {
+                return None;
+            }
+            let amount = interval.first()?;
+            Some(match amount {
+                Expr::Literal(Literal::Int(_) | Literal::UInt(_))
+                | Expr::BoundValue(Value::Int(_) | Value::UInt(_)) => 0,
+                _ => literal_fsp(amount).unwrap_or(6),
+            })
         }
         "NOW" | "CURRENT_TIMESTAMP" | "LOCALTIME" | "LOCALTIMESTAMP" | "UTC_TIMESTAMP"
         | "SYSDATE" | "CURTIME" | "CURRENT_TIME" | "UTC_TIME" => match args.first() {
@@ -20181,6 +20378,14 @@ fn expr_collation_checked(
                 coercibility: ty.coercibility,
             });
         }
+        if name.eq_ignore_ascii_case("TO_BASE64") {
+            let info = connection_collation_info();
+            return Some(ExprCollation {
+                charset: info.charset,
+                collation_id: info.id,
+                coercibility: 4,
+            });
+        }
         let result_type = function_result_type(name);
         if result_type == ColumnType::Geometry {
             return Some(ExprCollation {
@@ -20380,9 +20585,26 @@ fn expr_collation_checked(
 
     match expr {
         Expr::Placeholder(index) => crate::engine::params::with_current_param(*index, |value| {
+            // Genuine prepared string parameters derive a collation from the
+            // connection, even when their bound value is binary or NULL.
+            // Cached text literals and internal bindings retain their domain.
+            let value = value?;
+            if crate::engine::params::user_parameter_active(*index)
+                && matches!(
+                    value,
+                    Value::String(_) | Value::SmallString(_) | Value::Bytes(_) | Value::Null
+                )
+            {
+                let info = connection_collation_info();
+                return Some(ExprCollation {
+                    charset: info.charset,
+                    collation_id: info.id,
+                    coercibility: 4,
+                });
+            }
             // Cached text shapes replace literals with parameters. Keep the
             // same string/binary derivation as their bound literal values.
-            let (info, coercibility) = match value? {
+            let (info, coercibility) = match value {
                 Value::String(_) | Value::SmallString(_) => (connection_collation_info(), 4),
                 Value::Bytes(_) | Value::Geometry(_) => (
                     crate::charset::resolve_collation_id(crate::charset::BINARY_COLLATION_ID)?,
@@ -22460,7 +22682,25 @@ fn fold_constant_subexprs_inner_checked(expr: &mut Expr) {
     }
     // If the whole subtree is constant, evaluate once.
     if is_constant {
-        let typed_domain = contains_typed_constant(expr).then(|| {
+        // Preserve a constant function's declared domain even when its value
+        // is NULL, without disabling value folding and repeating JSON work
+        // for every source row.
+        let preserve_json_type = match expr {
+            Expr::Function { name, .. }
+                if matches!(
+                    name.to_ascii_uppercase().as_str(),
+                    "JSON_QUOTE" | "TO_BASE64" | "SOUNDEX"
+                ) =>
+            {
+                true
+            }
+            Expr::Function { name, args, .. } if name.eq_ignore_ascii_case("JSON_VALUE") => {
+                matches!(args.get(2), Some(Expr::Literal(Literal::String(target)))
+                    if target.eq_ignore_ascii_case("JSON"))
+            }
+            _ => false,
+        };
+        let typed_domain = (contains_typed_constant(expr) || preserve_json_type).then(|| {
             let no_column = |_: &Expr| None;
             let no_placeholder = |_: usize| None;
             crate::engine::expr_type::infer_expr_type(
@@ -24298,6 +24538,10 @@ fn eval_arithmetic_inner(left: &Value, op: BinaryOp, right: &Value) -> Result<Va
                 BinaryOp::Mod => crate::util::decimal::DecimalBinaryOp::Mod,
                 _ => unreachable!(),
             };
+            let wide = |value: &crate::util::decimal::ExactDecimal| {
+                matches!(value, crate::util::decimal::ExactDecimal::Big(..))
+            };
+            let wide_operand = wide(&left_decimal) || wide(&right_decimal);
             let result = if decimal_op == crate::util::decimal::DecimalBinaryOp::Div {
                 Some(crate::util::decimal::DecimalResultSpec {
                     precision: crate::util::decimal::MAX_DECIMAL_INTERMEDIATE_PRECISION,
@@ -24309,6 +24553,7 @@ fn eval_arithmetic_inner(left: &Value, op: BinaryOp, right: &Value) -> Result<Va
                 })
             } else {
                 (decimal_op == crate::util::decimal::DecimalBinaryOp::Mod
+                    || wide_operand
                     || left_decimal.scale().saturating_add(right_decimal.scale()) > 30)
                     .then(|| {
                         // MySQL exposes the full 81-digit scratch result for a
@@ -24401,9 +24646,9 @@ fn eval_arithmetic_inner(left: &Value, op: BinaryOp, right: &Value) -> Result<Va
         BinaryOp::Mod => l % r,
         _ => unreachable!(),
     };
-    // MySQL: DOUBLE arithmetic that overflows from finite operands is an
-    // error (1690), never silent infinity.
-    if value.is_infinite() && l.is_finite() && r.is_finite() {
+    // Non-finite DOUBLE arithmetic is an error, including when an operand
+    // came from an overflowing ROUND/TRUNCATE rescaling operation.
+    if !value.is_finite() {
         return Err(error(
             crate::error::catalog::ER_DATA_OUT_OF_RANGE,
             "DOUBLE value is out of range",
@@ -25121,11 +25366,10 @@ pub(crate) fn eval_negate_typed(
         // negates it (result is a DOUBLE, matching `-str` = REAL_RESULT):
         // `-'3'` → -3, `-'3.5'` → -3.5, `-'abc'` → 0 with warning 1292.
         // `lenient_str_to_f64` reuses the shared implicit-conversion rules
-        // and raises the truncation warning. Guard against `-0.0` so a
-        // non-numeric string prints `0`, not `-0`, like MySQL.
+        // and raises the truncation warning. Preserve IEEE signed zero.
         Value::String(_) | Value::SmallString(_) | Value::Bytes(_) => {
             let n = lenient_str_to_f64(&str_value(&value))?;
-            Ok(Value::Double(if n == 0.0 { 0.0 } else { -n }))
+            Ok(Value::Double(-n))
         }
         other => Err(error(
             crate::error::catalog::ER_TRUNCATED_WRONG_VALUE_FOR_FIELD,
@@ -25656,10 +25900,8 @@ fn decimal_overflow_error() -> QueryError {
 }
 
 thread_local! {
-    /// MySQL normalizes an overwide exact literal to DECIMAL(65), but keeps
-    /// enough source provenance for its immediately enclosing addition or
-    /// subtraction to use the result formula's carry digit. A genuine
-    /// DECIMAL(65,0) operand has no such provenance and still overflows.
+    /// Keep oversized source tokens on the bounded wide-literal +/- path,
+    /// including tokens that exceed the literal scratch buffer and saturate.
     static OVERWIDE_DECIMAL_LITERAL_CARRY: Cell<bool> = const { Cell::new(false) };
 }
 
@@ -25712,8 +25954,8 @@ pub(crate) fn exact_numeric_string_operand(value: &Value) -> Option<Value> {
 
 /// Evaluate arithmetic with the source-expression context needed by MySQL's
 /// bounded wide-literal rules.  Carry provenance applies only to +/-; MOD has
-/// its own 81-digit scratch-operand path.  Multiplication and division keep
-/// the ordinary DECIMAL(65,30) shaping rules.
+/// its own scratch-operand path. Destination coercion remains independent of
+/// these expression intermediates and enforces DECIMAL(65,30) on storage.
 pub(crate) fn eval_arithmetic_expression(
     left_expr: &Expr,
     right_expr: &Expr,
@@ -25738,8 +25980,8 @@ pub(crate) fn eval_arithmetic_expression(
 
 /// MOD reads an exact literal through MySQL's full nine-word decimal scratch
 /// buffer (81 decimal digits) before the result is shaped to DECIMAL(65,30).
-/// Preserve that source only for this operation; globally widening literal
-/// values would change the established normalization of +, *, CTAS and DML.
+/// Recover source provenance for MOD before its operation-specific scratch
+/// shaping; destination coercion remains bounded to DECIMAL(65,30).
 fn eval_modulo_expression(
     left_expr: &Expr,
     right_expr: &Expr,
@@ -25952,7 +26194,7 @@ fn try_decimal_big_arithmetic(
                 _ => unreachable!(),
             };
             let max_precision = if OVERWIDE_DECIMAL_LITERAL_CARRY.with(Cell::get) {
-                crate::util::decimal::MAX_DECIMAL_PRECISION as usize + 1
+                crate::util::decimal::MAX_DECIMAL_INTERMEDIATE_PRECISION as usize
             } else {
                 crate::util::decimal::MAX_DECIMAL_PRECISION as usize
             };
@@ -27671,11 +27913,10 @@ pub(crate) fn literal_into_value(lit: Literal) -> Value {
 }
 
 /// Convert an exact numeric token to MySQL's expression DECIMAL operand.
-/// MySQL keeps at most 65 significant digits when an expression DECIMAL is
-/// materialized, while the source token remains available to comparison and
-/// arithmetic paths that require a bounded wider intermediate. Merely
-/// resolving an exact literal is not a lossy string conversion and therefore
-/// must not publish warning 1292.
+/// Literal operands retain the nine-word exact scratch domain independently
+/// of DECIMAL(65,30) destination columns. Over-capacity integer tokens follow
+/// MySQL's saturated literal behavior; fractional words truncate only when
+/// the scratch buffer is full.
 pub(crate) fn mysql_decimal_literal_value(text: &str) -> Value {
     use num_bigint::BigInt;
     use num_traits::Signed;
@@ -27684,22 +27925,24 @@ pub(crate) fn mysql_decimal_literal_value(text: &str) -> Value {
         return Value::Decimal(text.to_string());
     };
     let digits = magnitude.abs().to_str_radix(10).len();
-    if digits <= crate::util::decimal::MAX_DECIMAL_PRECISION as usize {
+    let integer_digits = digits.saturating_sub(scale as usize);
+    if integer_digits <= crate::util::decimal::MAX_DECIMAL_INTERMEDIATE_PRECISION as usize {
+        // Literal operands use MySQL's nine base-1e9 scratch words. Storage
+        // columns still enforce DECIMAL(65,30) at the assignment boundary.
+        let integer_words = integer_digits.max(1).div_ceil(9);
+        let target_scale = scale.min(((9 - integer_words) * 9) as u8);
+        let magnitude = if target_scale < scale {
+            magnitude / BigInt::from(10u8).pow(u32::from(scale - target_scale))
+        } else {
+            magnitude
+        };
         return Value::from_exact_decimal(crate::util::decimal::ExactDecimal::from_big(
-            magnitude, scale,
+            magnitude,
+            target_scale,
         ));
     }
-
-    if let Some((normalized, normalized_scale)) = normalized_decimal_big_parts(text) {
-        return Value::from_exact_decimal(crate::util::decimal::ExactDecimal::from_big(
-            normalized,
-            normalized_scale,
-        ));
-    }
-
-    // The integer part alone exceeds DECIMAL(65). Materialize the normalized
-    // 65-digit coefficient; the enclosing AST guard preserves provenance so
-    // add/sub can still use MySQL's one carry digit.
+    // An integer token beyond the scratch capacity saturates at the SQL
+    // DECIMAL precision, matching MySQL's literal overflow normalization.
     let max = BigInt::from(10u8).pow(crate::util::decimal::MAX_DECIMAL_PRECISION as u32)
         - BigInt::from(1u8);
     let clamped = if magnitude.is_negative() { -max } else { max };
@@ -28313,6 +28556,11 @@ pub(crate) fn coerce_result_to_expr_type(
                 cast_to_decimal(&value, precision, scale)
             }
         }
+        // An already-typed REAL result needs no SQL CAST. In particular,
+        // preserve ROUND/TRUNCATE's non-finite intermediate for FORMAT;
+        // explicit casts still perform their range checks.
+        ExprTypeKind::Float { single: false, .. } if matches!(value, Value::Double(_)) => Ok(value),
+        ExprTypeKind::Float { single: true, .. } if matches!(value, Value::Float(_)) => Ok(value),
         ExprTypeKind::Float { single, .. } => cast_to_float(&value, single),
         ExprTypeKind::String {
             kind: StringKind::Binary | StringKind::Blob,
@@ -30034,11 +30282,35 @@ pub(crate) fn parse_time_value_components(
     value: &Value,
 ) -> Result<(bool, u32, u32, u32, u32), QueryError> {
     let (negative, h, m, s, us) = parse_time_value_components_inner(value)?;
+    // Native TIME is already quantized to microseconds. In-range values need
+    // neither textual fraction inspection nor a session-mode lookup.
+    if matches!(value, Value::Time(micros)
+        if micros.unsigned_abs() <= (TIME_MAX_SECONDS * 1_000_000) as u64)
+    {
+        return Ok((negative, h, m, s, us));
+    }
+    let numeric_input = value_is_numeric(value);
     let round_up = session_temporal_sql_mode_bits()
         & crate::engine::api::TEMPORAL_MODE_TIME_TRUNCATE_FRACTIONAL
         == 0
         && comparison_fraction_rounds_up(value);
-    if value_is_numeric(value) || round_up {
+    // Character TIME conversion clips at the whole-second endpoint. Numeric
+    // input retains its distinct NULL-on-overflow rule above.
+    if !numeric_input
+        && h >= 838
+        && (u64::from(h) * 3600 + u64::from(m) * 60 + u64::from(s)) * 1_000_000
+            + u64::from(us)
+            + u64::from(round_up)
+            > (TIME_MAX_SECONDS * 1_000_000) as u64
+    {
+        crate::engine::api::push_statement_warning(
+            crate::error::ConditionLevel::Warning,
+            crate::error::catalog::ER_TRUNCATED_WRONG_VALUE,
+            format!("Truncated incorrect time value: '{}'", string_value(value)),
+        );
+        return Ok((negative, 838, 59, 59, 0));
+    }
+    if numeric_input || round_up {
         let total = (u64::from(h) * 3600 + u64::from(m) * 60 + u64::from(s)) * 1_000_000
             + u64::from(us)
             + u64::from(round_up);
@@ -30119,7 +30391,20 @@ fn parse_time_value_components_inner(
         .split('.')
         .next()
         .unwrap_or("");
-    if !main.is_empty() && main.len() <= 7 && main.bytes().all(|b| b.is_ascii_digit()) {
+    if !main.is_empty() && main.len() <= 8 && main.bytes().all(|b| b.is_ascii_digit()) {
+        return parse_time_components(&text);
+    }
+    // An unambiguous character duration needs no calendar parse first. Keep
+    // compact dates, alternate date delimiters and typed temporals on their
+    // existing conversion paths.
+    if matches!(
+        value,
+        Value::String(_) | Value::SmallString(_) | Value::Bytes(_)
+    ) && main.contains(':')
+        && main
+            .bytes()
+            .all(|b| b.is_ascii_digit() || matches!(b, b':' | b' '))
+    {
         return parse_time_components(&text);
     }
     if let Ok(dt) = parse_datetime(value) {

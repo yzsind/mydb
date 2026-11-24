@@ -360,14 +360,17 @@ pub(crate) fn plan_metadata(spec: &RrfFusion, columns: &[Column]) -> serde_json:
     serde_json::json!({
         "score_details": spec.score_details,
         "identity": columns[..width].iter().map(|column| serde_json::json!({
-            "name": column.name, "type": format!("{:?}", identity_type(column)),
+            "name": column.name, "type": crate::engine::show::mysql_type_name_with_unsigned(
+                &crate::storage::schema::data_type_kind_for_result_column(column),
+                column.source.flags & crate::mysql::protocol::UNSIGNED_FLAG != 0),
+            "collation_id": column.source.collation_id,
         })).collect::<Vec<_>>(),
         "branches": spec.branches.iter().enumerate().map(|(i,branch)| {
             let select = branch.query.leftmost_select().expect("validated fusion branch");
             serde_json::json!({"branch_id":i+1, "name":branch.name,
                 "order_by": select.order_by.iter().map(|order|serde_json::json!({
                     "expression":crate::parser::expr_to_sql(&order.expr),"ascending":order.asc,
-                })).collect::<Vec<_>>(), "limit":format!("{:?}",select.limit),
+                })).collect::<Vec<_>>(), "limit":select.limit.as_ref().map(super::window::limit_json),
             })
         }).collect::<Vec<_>>(),
     })

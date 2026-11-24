@@ -349,20 +349,25 @@ fn delete_right_join_matches_left_equivalent() {
 }
 
 #[test]
-fn delete_right_join_chain_rejected() {
-    // RIGHT inside a multi-join chain is not the lone-flip case → clear error.
+fn delete_right_join_chain_skips_null_padded_targets() {
+    // Preserved right rows never make a NULL-padded target writable.
     let dir = tempfile::tempdir().unwrap();
     let engine = open_test_engine(dir.path());
     let mut session = SessionContext::default();
     setup_ab(&engine, &mut session);
     exec(&engine, &mut session, "CREATE TABLE c (id INT PRIMARY KEY)").unwrap();
-    let err = exec(
+    exec(&engine, &mut session, "INSERT INTO c VALUES(2),(4)").unwrap();
+    exec(
         &engine,
         &mut session,
         "DELETE a FROM a JOIN b ON a.id = b.id RIGHT JOIN c ON b.id = c.id",
     )
-    .unwrap_err();
-    assert_eq!(err.code(), 1235, "{}", err.message());
+    .unwrap();
+    let rs = exec(&engine, &mut session, "SELECT id FROM a ORDER BY id").unwrap();
+    let QueryResponse::ResultSet(rs) = rs else {
+        panic!("expected result set");
+    };
+    assert_eq!(rs.rows, vec![vec![Value::Int(1)], vec![Value::Int(3)]]);
 }
 
 // ---------------------------------------------------------------------------

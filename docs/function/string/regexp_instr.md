@@ -35,6 +35,14 @@ Result: 3
 
 ## Notes
 
+Malformed non-NULL patterns are validated even when the subject is NULL.
+A NULL pattern or explicit NULL match_type returns NULL. Validation follows
+value evaluation: an unexecuted CASE branch or an empty input does not execute
+the regular-expression search. Other optional NULL arguments retain their
+function-specific validation order.
+
+
+
 - Text operands use character positions and the resolved collation. When all string operands are binary, matching, positions, and results preserve bytes; mixing binary and text operands returns error 3995. Unsupported pattern backreferences return an explicit error.
 
 - Defaults, flag precedence, supported pattern constructs and SQL escaping are described in [regular expression rules](README.md#regular-expression-rules). Invalid positions, flags or patterns raise SQL errors.

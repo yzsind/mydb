@@ -70,9 +70,9 @@ document authorization. The Python example below includes document ACLs.
 ## Grammar and parameters
 
 ```text
-rrf_query  := (ordered_select_or_with) [AS branch_name]
-             RRF (ordered_select_or_with) [AS branch_name]
-             { RRF (ordered_select_or_with) [AS branch_name] }
+rrf_query  := (ordered_select_or_with) [[AS] branch_name]
+             RRF (ordered_select_or_with) [[AS] branch_name]
+             { RRF (ordered_select_or_with) [[AS] branch_name] }
              [WITH(option {, option})]
 option     := RANK_CONSTANT = numeric_literal_or_parameter
             | WEIGHTS = (numeric_literal_or_parameter {, numeric_literal_or_parameter})

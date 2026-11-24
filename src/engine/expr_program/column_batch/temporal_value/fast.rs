@@ -125,14 +125,12 @@ pub(super) fn evaluate(
     if !add && !convert {
         return None;
     }
-    // A bound value/parameter has a distinct prepare-time TIME coercion in
+    // A dynamic parameter has a distinct prepare-time TIME coercion in
     // ADDTIME. Preserve that syntax-sensitive conversion on the scalar path.
     if add
         && read.syntax.is_some_and(|args| {
-            matches!(
-                args.first(),
-                Some(Expr::Placeholder(_) | Expr::BoundValue(_))
-            )
+            args.first()
+                .is_some_and(crate::engine::expr::dynamic_temporal_parameter)
         })
     {
         return None;
@@ -247,7 +245,11 @@ pub(super) fn evaluate(
             let mut buffer = [0; 32];
             let bytes = crate::types::write_datetime_canonical_with_fsp(
                 result,
-                Some(precision(value).max(delta_fsp)),
+                Some(if add && result.rem_euclid(1_000_000) == 0 {
+                    0
+                } else {
+                    precision(value).max(delta_fsp)
+                }),
                 &mut buffer,
             );
             data.extend_from_slice(bytes);

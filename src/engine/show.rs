@@ -444,12 +444,7 @@ pub(crate) fn show_tables(
                 )
             })
         });
-        apply_show_filter(
-            &mut rows,
-            &columns,
-            filter,
-            &format!("Tables_in_{database}"),
-        )?;
+        apply_show_filter(&mut rows, &columns, filter, &columns[0].name)?;
         append_show_like_heading(&mut columns, filter);
         return Ok(QueryResponse::ResultSet(ResultSet { columns, rows }));
     }
@@ -504,12 +499,7 @@ pub(crate) fn show_tables(
         rows.push(row);
     }
     rows.sort_by(|a, b| a[0].to_display_string().cmp(&b[0].to_display_string()));
-    apply_show_filter(
-        &mut rows,
-        &columns,
-        filter,
-        &format!("Tables_in_{database}"),
-    )?;
+    apply_show_filter(&mut rows, &columns, filter, &columns[0].name)?;
     append_show_like_heading(&mut columns, filter);
     Ok(QueryResponse::ResultSet(ResultSet { columns, rows }))
 }

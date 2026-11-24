@@ -54,6 +54,19 @@ Requires global REPLICATION_SLAVE_ADMIN. The default channel is named `default`;
 
 A secure transport policy can reject DISABLED. VERIFY_CA needs valid CA material; VERIFY_IDENTITY additionally verifies endpoint identity. Client certificate/key must be supplied together. Password values are credentials, not suitable status or log output. Verify connection/application state with SHOW REPLICA STATUS after START, rather than assuming CHANGE established a live connection.
 
+Channel configuration contains the source password and is stored under
+`<data_dir>/system/replication/channels/<channel>.json`. On Unix, metadata files
+are server-owned regular files with no group/other access (new files use `0600`),
+and the `replication` and `channels` directories must be server-owned and private
+(`0700` when created or secured by a writer). The data root and `system` directory
+must be server-owned and not writable by group/other users. Reads, restart loading,
+and validation before CHANGE reject unsafe permissions; correct ownership and
+permissions before retrying. Symbolic links below the configured data root and
+hard-linked credential files are rejected. A configured data-root alias is allowed.
+On Windows, protect the data root with an appropriate server-account ACL; metadata
+paths below it reject reparse points. Configuration writes use private temporary
+files and atomic replacement, so concurrent progress writers cannot splice files.
+
 ## Examples
 
 ```sql

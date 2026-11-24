@@ -908,6 +908,7 @@ fn visit_filtered_row_ids(
                         let ranges = if matches!(access, PhysicalPlan::ZoneMapScan { .. }) {
                             filter.as_ref().and_then(|e| {
                                 db.zone_map_candidate_ranges_for_storage_for_plan(
+                                    txn,
                                     &table.schema,
                                     sid,
                                     e,

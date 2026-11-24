@@ -265,6 +265,7 @@ pub(super) type ParallelScanTask = ScanTask;
 /// prepared parameters and concurrently-published generations are honoured.
 pub(super) fn scan_tasks(
     db: &Arc<Database>,
+    txn: TxnView,
     table: &PlanTable,
     filter: Option<&Expr>,
     use_zone_map: bool,
@@ -298,7 +299,7 @@ pub(super) fn scan_tasks(
     for storage_id in storage_ids {
         let page_count = db.heap_page_count_for_storage(storage_id)?;
         let candidates = use_zone_map.then(|| filter).flatten().and_then(|expr| {
-            db.zone_map_candidate_ranges_for_storage_for_plan(&table.schema, storage_id, expr)
+            db.zone_map_candidate_ranges_for_storage_for_plan(txn, &table.schema, storage_id, expr)
         });
         let ranges = match candidates {
             Some(ranges)
@@ -348,21 +349,23 @@ pub(super) fn scan_tasks(
 
 pub(super) fn parallel_zone_map_morsels(
     db: &Arc<Database>,
+    txn: TxnView,
     table: &PlanTable,
     filter: Option<&Expr>,
     degree: u32,
 ) -> Result<(Vec<ScanTask>, usize), QueryError> {
-    scan_morsels(db, table, filter, true, degree)
+    scan_morsels(db, txn, table, filter, true, degree)
 }
 
 pub(super) fn scan_morsels(
     db: &Arc<Database>,
+    txn: TxnView,
     table: &PlanTable,
     filter: Option<&Expr>,
     use_zone_map: bool,
     degree: u32,
 ) -> Result<(Vec<ScanTask>, usize), QueryError> {
-    let ranges = scan_tasks(db, table, filter, use_zone_map)?;
+    let ranges = scan_tasks(db, txn, table, filter, use_zone_map)?;
 
     let surviving_pages = ranges.iter().map(|task| task.pages()).sum::<u64>();
     if surviving_pages == 0 {
@@ -1142,7 +1145,7 @@ fn execute_parallel_zone_map_scan(
     projected_columns: Option<&[usize]>,
     degree: u32,
 ) -> Result<Vec<PlanRow>, QueryError> {
-    let (tasks, requested_workers) = parallel_zone_map_morsels(db, table, filter, degree)?;
+    let (tasks, requested_workers) = parallel_zone_map_morsels(db, txn, table, filter, degree)?;
     if tasks.is_empty() {
         return Ok(Vec::new());
     }
@@ -2981,7 +2984,8 @@ fn try_execute_parallel_distinct_topk_scan(
     {
         return Ok(None);
     }
-    let (tasks, worker_count) = scan_morsels(db, table, filter.as_ref(), use_zone_map, *degree)?;
+    let (tasks, worker_count) =
+        scan_morsels(db, txn, table, filter.as_ref(), use_zone_map, *degree)?;
     if worker_count <= 1 || tasks.is_empty() {
         return Ok(None);
     }

@@ -86,7 +86,11 @@ pub(super) fn qualify_statement_tables<'q>(
         crate::parser::QueryMut::Other(Statement::Update(stmt)) => {
             stmt.table = qualify_dml_source_name(session, &stmt.table);
             for join in &mut stmt.joins {
-                join.table.name = qualify_dml_source_name(session, &join.table.name);
+                if let Some(query) = &mut join.derived {
+                    qualify_statement_tables(db, session, query)?;
+                } else {
+                    join.table.name = qualify_dml_source_name(session, &join.table.name);
+                }
                 if let Some(condition) = &mut join.condition {
                     qualify_expr_tables(db, session, condition)?;
                 }
@@ -104,7 +108,11 @@ pub(super) fn qualify_statement_tables<'q>(
         crate::parser::QueryMut::Other(Statement::Delete(stmt)) => {
             stmt.table = qualify_dml_source_name(session, &stmt.table);
             for join in &mut stmt.joins {
-                join.table.name = qualify_dml_source_name(session, &join.table.name);
+                if let Some(query) = &mut join.derived {
+                    qualify_statement_tables(db, session, query)?;
+                } else {
+                    join.table.name = qualify_dml_source_name(session, &join.table.name);
+                }
                 if let Some(condition) = &mut join.condition {
                     qualify_expr_tables(db, session, condition)?;
                 }

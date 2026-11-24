@@ -18,7 +18,9 @@ TO_BASE64(value)
 
 ## Return Value
 
-Returns Base64 text; NULL input returns NULL.
+Returns character text in the connection character set and collation, including
+for binary input. NULL input returns NULL. This output contract also applies to
+prepared metadata, empty results and CREATE TABLE AS SELECT.
 
 ## Examples
 

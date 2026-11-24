@@ -320,19 +320,19 @@ impl Database {
     /// sparse-undo full-row rewrites. A true result cannot create LOB owners.
     fn row_lobs_stay_inline(codec: &RowCodec, values: &[Value]) -> bool {
         let mut maximum = 0usize;
-        let mut total = 0usize;
         for value in values.iter().take(codec.columns.len()) {
             let len = match value {
                 Value::Bytes(bytes) | Value::Json(bytes) | Value::Geometry(bytes) => bytes.len(),
                 Value::Vector(bytes) => bytes.len(),
+                Value::SmallString(bytes) => bytes.len(),
                 Value::String(text) => text.len(),
                 _ => 0,
             };
             maximum = maximum.max(len);
-            total = total.saturating_add(len);
         }
         maximum <= lob_inline_max()
-            && total.saturating_add(18) < PAGE_SIZE - PAGE_HEADER_SIZE - SLOT_SIZE
+            && estimate_value_section_len(values, codec, &[])
+                <= PAGE_SIZE - PAGE_HEADER_SIZE - SLOT_SIZE
     }
 
     /// M1(LOB) — reuse-aware variant of `externalize_row_lobs`: for every column judged
@@ -370,6 +370,7 @@ impl Database {
             Value::String(s) => s.len(),
             Value::Json(b) | Value::Geometry(b) => b.len(),
             Value::Vector(b) => b.len(),
+            Value::SmallString(b) => b.len(),
             _ => 0,
         };
         let mut externalized = vec![false; values.len()];

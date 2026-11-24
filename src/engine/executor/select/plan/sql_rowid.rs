@@ -123,7 +123,7 @@ pub(super) fn open(
             PhysicalPlan::ZoneMapScan { .. } | PhysicalPlan::ParallelZoneMapScan { .. }
         );
         tasks.extend(
-            super::super::parallel::scan_tasks(db, table, filter.as_ref(), zone_map)?
+            super::super::parallel::scan_tasks(db, txn, table, filter.as_ref(), zone_map)?
                 .into_iter()
                 .map(|task| (task.storage_id, task.page_lo, task.page_hi)),
         );

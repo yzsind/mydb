@@ -3581,15 +3581,8 @@ fn date_add_edge_intervals_year_zero_and_diagnostics_match_mysql() {
              - INTERVAL(TO_SECONDS(CURRENT_TIMESTAMP)) DAY_SECOND, \
            DATE'1000-01-01')",
     );
-    assert_eq!(datediff, vec![Value::Null]);
-    assert_eq!(
-        session
-            .warnings
-            .iter()
-            .map(|warning| warning.code())
-            .collect::<Vec<_>>(),
-        vec![1292]
-    );
+    assert_eq!(datediff, vec![Value::Int(-365243)]);
+    assert!(session.warnings.is_empty());
 }
 
 #[test]

@@ -18,7 +18,10 @@ FROM_DAYS(day_number)
 
 ## Return Value
 
-Returns a DATE derived from the MySQL day number. Nonpositive day numbers return the zero date; out-of-calendar-range results return NULL with the applicable diagnostic. This is not a Unix epoch day count. SQL NULL in a required input returns NULL.
+Returns a DATE derived from the MySQL day number. Day numbers at or below 365
+return `0000-00-00`; 366 returns `0001-01-01`. Out-of-calendar-range results
+return NULL with the applicable diagnostic. This is not a Unix epoch day count.
+SQL NULL in a required input returns NULL.
 
 ## Examples
 

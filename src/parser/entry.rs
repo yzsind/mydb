@@ -980,15 +980,23 @@ impl Dialect for MydbDialect {
         } else {
             None
         };
-        let native = super::function_names::parse_prefix(parser)
-            .or(bit_prefixed)
-            .or_else(|| super::adapter::parse_high_prefix(parser, PREC_PREFIX))
-            .or_else(|| super::adapter::parse_cast_prefix(parser, PREC_COLLATE))
-            .or_else(|| super::adapter::parse_json_value_prefix(parser))
-            .or_else(|| super::adapter::parse_scalar_clause_prefix(parser))
-            .or_else(|| super::adapter::parse_interval_prefix(parser))
-            .or_else(|| super::adapter::parse_trim_prefix(parser))
-            .or_else(|| self.inner.parse_prefix(parser));
+        // Commit to reserved CASE syntax without upstream's identifier retry,
+        // retaining the common COLLATE suffix for successful expressions.
+        let native = if matches!(&parser.peek_token_ref().token, Token::Word(word) if word.keyword == Keyword::CASE)
+        {
+            parser.next_token();
+            Some(parser.parse_case_expr())
+        } else {
+            super::function_names::parse_prefix(parser)
+                .or(bit_prefixed)
+                .or_else(|| super::adapter::parse_high_prefix(parser, PREC_PREFIX))
+                .or_else(|| super::adapter::parse_cast_prefix(parser, PREC_COLLATE))
+                .or_else(|| super::adapter::parse_json_value_prefix(parser))
+                .or_else(|| super::adapter::parse_scalar_clause_prefix(parser))
+                .or_else(|| super::adapter::parse_interval_prefix(parser))
+                .or_else(|| super::adapter::parse_trim_prefix(parser))
+                .or_else(|| self.inner.parse_prefix(parser))
+        };
         native.map(|result| {
             result.and_then(|expr| {
                 // Returning from a dialect prefix bypasses sqlparser's COLLATE

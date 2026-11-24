@@ -181,6 +181,7 @@ fn copy_seed_tree(source: &Path, destination: &Path) -> io::Result<()> {
             fs::copy(entry.path(), target)?;
         }
     }
+    fs::set_permissions(destination, fs::metadata(source)?.permissions())?;
     Ok(())
 }
 

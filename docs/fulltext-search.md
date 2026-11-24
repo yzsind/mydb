@@ -76,7 +76,13 @@ Grouping `()`, weights `> < ~`, and proximity `@` return error 1235.
 Signs may be separated from their operand by whitespace. An internal `*`
 terminates a prefix operand (`data*base` is `data* base`); an unclosed quoted
 phrase extends to the end of the search string, matching MySQL's tolerance.
-Malformed operands and repeated leading signs return error 1064. `WITH QUERY EXPANSION` is not supported and returns a parse error.
+Malformed operands and repeated leading signs return error 1064. `WITH QUERY EXPANSION` and `IN NATURAL LANGUAGE MODE WITH QUERY EXPANSION`
+are not supported and return error 1064. This is an explicit product boundary:
+query expansion requires a second search using terms from the highest-ranked
+first-pass documents, which may add hits that lack the original search phrase.
+Neither spelling is silently ignored or treated as ordinary natural-language
+search. Use the supported natural-language or Boolean mode when expansion is
+not required; these modes do not provide equivalent expansion semantics.
 `AGAINST` accepts a string literal or prepared parameter; arbitrary SQL
 expressions and implicit numeric/NULL coercions are explicitly rejected.
 

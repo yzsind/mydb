@@ -704,14 +704,15 @@ fn arithmetic_reads_float_metadata_and_keeps_nonfinite_fallback() {
                 vec![0, 1],
             ));
     let actual = program.try_eval_column(&selected).unwrap();
-    let expected = oracle(&program, &batch).unwrap();
+    assert!(oracle(&program, &batch)
+        .unwrap_err()
+        .is(crate::error::catalog::ER_DATA_OUT_OF_RANGE));
+    let expected = [f64::from(1.234567890123_f32), -0.0_f64];
     for row in 0..2 {
-        let (Value::Double(actual), Value::Double(expected)) =
-            (actual.value_at(row), &expected[row])
-        else {
+        let Value::Double(actual) = actual.value_at(row) else {
             panic!("float result")
         };
-        assert_eq!(actual.to_bits(), expected.to_bits());
+        assert_eq!(actual.to_bits(), expected[row].to_bits());
     }
     assert_eq!(actual.value_at(2), Value::Null);
     assert_eq!(actual.value_at(3), Value::Null);
@@ -3544,7 +3545,16 @@ fn regexp_columns_keep_collation_flags_unicode_offsets_occurrences_and_nulls() {
         "REGEXP_INSTR(x,'[')",
         "REGEXP_SUBSTR(x,'[')",
     ] {
-        checked_legacy_column(expr, schema.clone(), vec![ColumnVector::Null { len: 3 }]);
+        let (program, schema) = compile(expr, ColumnType::VarString);
+        let batch = Batch::new(schema.clone(), vec![ColumnVector::Null { len: 3 }]);
+        assert_eq!(oracle(&program, &batch).unwrap_err().code(), 3696, "{expr}");
+        // A rejected native kernel must fall back to the same visible-row
+        // error, rather than synthesizing NULLs for a malformed pattern.
+        assert!(program.try_eval_column(&batch).is_none(), "{expr}");
+        let ast = crate::parser::parse_expr_fragment(expr).unwrap();
+        let input = crate::engine::executor::vec::expr_batch::batch_schema_to_input(&schema);
+        let legacy = ExprCompiler::compile_legacy_oracle(&ast, &input).unwrap();
+        assert_eq!(oracle(&legacy, &batch).unwrap_err().code(), 3696, "{expr}");
     }
     // An invisible out-of-range position must not abort a selected row.
     let (program, schema) = compile("REGEXP_SUBSTR(x,'a',2)", ColumnType::VarString);

@@ -16,11 +16,14 @@
 //!     `Database::delete_row_by_id`.
 //!
 //! Restrictions surfaced as a clear unsupported error:
-//!   * Only INNER / CROSS joins. LEFT/RIGHT/SEMI/ANTI must use single-table.
+//!   * INNER / CROSS / LEFT / RIGHT joins; SEMI/ANTI/FULL remain unsupported.
 //!   * No ORDER BY / LIMIT (MySQL also rejects these on multi-table forms).
 //!   * No view-check predicate (multi-table UPDATE through a view is rare and
 //!     hard to validate row-by-row).
-//!   * No subqueries inside ON / WHERE / SET expressions.
+//!   * Uncorrelated derived sources are read-only, governed CTE producers.
+//!   * Correlated expressions requiring a per-row subquery remain unsupported.
+
+mod outer;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -677,6 +680,7 @@ fn current_joined_candidate(
     ctx: &MultiContext,
     indices: &[usize],
     conditions: &[Option<BoundMultiExpr>],
+    join_types: &[JoinType],
     selection: Option<&BoundMultiExpr>,
     cache: &mut HashMap<(u64, RowId), Option<Vec<Value>>>,
 ) -> Result<Option<Vec<Value>>, QueryError> {
@@ -731,9 +735,17 @@ fn current_joined_candidate(
                     },
                 )?);
         }
-        if let Some(condition) = &conditions[p_idx] {
-            if !truthy(&eval_in_context(condition, ctx, &combined)?) {
-                return Ok(None);
+        // A preserved RIGHT row with a wholly padded prefix did not pass
+        // ON; rechecking ON would incorrectly discard its outer tuple.
+        let padded_prefix = join_types[p_idx] == JoinType::Right
+            && indices[..p_idx]
+                .iter()
+                .all(|&index| index == OUTER_NULL_PARTICIPANT);
+        if !padded_prefix {
+            if let Some(condition) = &conditions[p_idx] {
+                if !truthy(&eval_in_context(condition, ctx, &combined)?) {
+                    return Ok(None);
+                }
             }
         }
     }
@@ -761,7 +773,9 @@ fn current_joined_for_target(
     selection: Option<&BoundMultiExpr>,
     cache: &mut HashMap<(u64, RowId), Option<Vec<Value>>>,
 ) -> Result<Option<Vec<Value>>, QueryError> {
-    let first = current_joined_candidate(db, txn, ctx, first, conditions, selection, cache)?;
+    let first = current_joined_candidate(
+        db, txn, ctx, first, conditions, join_types, selection, cache,
+    )?;
     if first.is_some() {
         return Ok(first);
     }
@@ -777,8 +791,9 @@ fn current_joined_for_target(
             }
             let stored = &ctx.participants[target].rows[indices[target]];
             if (stored.storage_id, stored.row_id) == identity {
-                found =
-                    current_joined_candidate(db, txn, ctx, indices, conditions, selection, cache)?;
+                found = current_joined_candidate(
+                    db, txn, ctx, indices, conditions, join_types, selection, cache,
+                )?;
             }
             Ok(())
         },
@@ -807,6 +822,23 @@ where
     let total_width: usize = ctx.participants.iter().map(|p| p.width).sum();
     let mut combined = vec![Value::Null; total_width];
     let mut indices = vec![0usize; n];
+    if join_types.contains(&JoinType::Right) {
+        return outer::enumerate(
+            ctx,
+            join_types,
+            join_conditions,
+            &mut combined,
+            &mut indices,
+            &mut |combined, indices| {
+                if let Some(predicate) = where_predicate {
+                    if !truthy(&eval_in_context(predicate, ctx, combined)?) {
+                        return Ok(());
+                    }
+                }
+                visit(combined, indices)
+            },
+        );
+    }
     enumerate_recursive(
         ctx,
         join_types,
@@ -915,8 +947,8 @@ where
 /// correct semantics (rows of B always present, A only where matched).
 ///
 /// Only the single, plain (non-derived / non-lateral / non-natural /
-/// non-partitioned) RIGHT join is rewritten. Join *chains* containing RIGHT
-/// need a full reorder and are left for `validate_join_shape` to reject.
+/// non-partitioned) RIGHT join is rewritten. Join chains retain their original order
+/// and use the streaming outer-prefix enumerator.
 pub(super) fn flip_lone_right_join(stmt: &mut Update) {
     flip_lone_right_join_parts(
         &mut stmt.table,
@@ -939,7 +971,7 @@ pub(super) fn flip_lone_right_join_delete(stmt: &mut Delete) {
 /// `b LEFT JOIN a` by swapping the base and the join relation (the ON predicate
 /// and all aliases are preserved, so target resolution by name/alias is
 /// unaffected). Only the clean lone-join case is flipped; RIGHT inside a longer
-/// chain needs a full reorder and is left for `validate_join_shape` to reject.
+/// chain keeps its prefix grouping in the outer-prefix enumerator.
 /// Shared by the multi-table UPDATE and DELETE paths.
 fn flip_lone_right_join_parts(
     table: &mut String,
@@ -988,24 +1020,11 @@ fn flip_lone_right_join_parts(
 fn validate_join_shape(joins: &[Join], kind: &str) -> Result<(), QueryError> {
     for join in joins {
         match join.join_type {
-            JoinType::Inner | JoinType::Cross | JoinType::Left => {}
-            JoinType::Right => {
-                // RIGHT JOIN in multi-table DML is rare and tricky to swap to
-                // LEFT (the participants list and targets are ordered). Reject
-                // for now with a clear hint; LEFT JOIN covers the typical
-                // `DELETE a FROM a LEFT JOIN b WHERE b.id IS NULL` pattern.
-                return Err(error(
-                    crate::error::catalog::ER_NOT_SUPPORTED_YET,
-                    format!(
-                        "multi-table {kind} does not support RIGHT JOIN — \
-                         rewrite as LEFT JOIN with the table order reversed"
-                    ),
-                ));
-            }
+            JoinType::Inner | JoinType::Cross | JoinType::Left | JoinType::Right => {}
             _ => {
                 return Err(error(
                     crate::error::catalog::ER_NOT_SUPPORTED_YET,
-                    format!("multi-table {kind} supports only INNER / CROSS / LEFT joins"),
+                    format!("multi-table {kind} supports only INNER / CROSS / LEFT / RIGHT joins"),
                 ));
             }
         }
@@ -1031,19 +1050,16 @@ fn validate_join_shape(joins: &[Join], kind: &str) -> Result<(), QueryError> {
     Ok(())
 }
 
-/// Replay `planner::resolve_join_using_natural` on a multi-table
-/// UPDATE/DELETE so its NATURAL / USING joins resolve to plain `ON`
-/// predicates before the dispatch reaches `validate_join_shape`.
-///
-/// Wraps the DML's table + joins in an ephemeral `Select` because the
-/// planner helper expects that shape; the post-call `joins` payload is
-/// copied back into the DML statement. The helper only mutates joins
-/// (USING list, ON condition, natural flag) — no other Select fields
-/// are read or assigned to from the temp wrapper.
+/// Resolve NATURAL/USING through the common SELECT scope resolver. Carry
+/// WHERE and assignment reads through the same coalesced-column rewrite as
+/// ON, including the preserved right column of a RIGHT join. Assignment
+/// targets retain their original names and are resolved independently.
 pub(super) fn normalize_natural_using_joins(
     db: &Arc<Database>,
     base: &crate::parser::TableRef,
     joins: &mut Vec<Join>,
+    selection: &mut Option<Expr>,
+    assignments: &mut [crate::parser::Assignment],
 ) -> Result<(), QueryError> {
     if joins
         .iter()
@@ -1051,20 +1067,31 @@ pub(super) fn normalize_natural_using_joins(
     {
         return Ok(());
     }
-    // The planner helper signs for `&mut Select`, so wrap the DML's
-    // (table, joins) in a throwaway Select whose other fields are all
-    // empty defaults. The helper only mutates `joins` + walks `derived`
-    // (we pass None) + reads `from[0]` — every other field is left
-    // untouched.
+    // Use a temporary SELECT only for binding and coalesced-column rewriting;
+    // execution remains in the DML path with the original writable targets.
     let mut wrapper = crate::parser::Select {
         rls_security_context: None,
         rls_expression_settings: None,
         from: vec![base.clone()],
         joins: std::mem::take(joins),
+        selection: selection.take(),
+        projection: assignments
+            .iter()
+            .map(|assignment| crate::parser::SelectItem::Expr {
+                expr: assignment.value.clone(),
+                alias: None,
+            })
+            .collect(),
         ..crate::parser::Select::default()
     };
     crate::planner::resolve_join_using_natural(db, &mut wrapper)?;
     *joins = wrapper.joins;
+    *selection = wrapper.selection;
+    for (assignment, item) in assignments.iter_mut().zip(wrapper.projection) {
+        if let crate::parser::SelectItem::Expr { expr, .. } = item {
+            assignment.value = expr;
+        }
+    }
     Ok(())
 }
 
@@ -1093,6 +1120,13 @@ pub(super) fn execute_multi_update(
             "ORDER BY/LIMIT is not allowed in multi-table UPDATE",
         ));
     }
+    if stmt.joins.iter().any(|join| join.derived.is_some()) {
+        return super::cte::with_cte_registry_extended(HashMap::new(), || {
+            super::cte::materialize_dml_join_sources(db, session, &mut stmt.joins, registry)?;
+            execute_multi_update(db, session, txn, stmt, registry)
+        });
+    }
+
     // M3 — fold non-correlated subqueries in the WHERE clause and every SET
     // value into literals before the join machinery runs. `substitute`
     // evaluates SET/WHERE expressions against a per-row join context and
@@ -1125,7 +1159,13 @@ pub(super) fn execute_multi_update(
         column_aliases: Vec::new(),
         generate_series: None,
     };
-    normalize_natural_using_joins(db, &base_ref, &mut stmt.joins)?;
+    normalize_natural_using_joins(
+        db,
+        &base_ref,
+        &mut stmt.joins,
+        &mut stmt.selection,
+        &mut stmt.assignments,
+    )?;
     validate_join_shape(&stmt.joins, "UPDATE")?;
 
     let mut ctx = build_context(
@@ -1149,6 +1189,12 @@ pub(super) fn execute_multi_update(
         };
         let (p_idx, col_idx) = ctx.participant_for_combined(combined_idx);
         let participant = &ctx.participants[p_idx];
+        if participant.cte.is_some() {
+            return Err(crate::error::catalog::ER_NON_UPDATABLE_TABLE.error(format!(
+                "The target table '{}' is not updatable",
+                participant.alias
+            )));
+        }
         super::routines::check_trigger_write_target(&participant.storage_key)?;
         if col_idx >= participant.schema.columns.len() {
             return Err(crate::error::catalog::ER_BAD_FIELD_ERROR.error("ROWID is read-only"));
@@ -1555,9 +1601,16 @@ pub(super) fn execute_multi_delete(
             "ORDER BY/LIMIT is not allowed in multi-table DELETE",
         ));
     }
+    if stmt.joins.iter().any(|join| join.derived.is_some()) {
+        return super::cte::with_cte_registry_extended(HashMap::new(), || {
+            super::cte::materialize_dml_join_sources(db, session, &mut stmt.joins, registry)?;
+            execute_multi_delete(db, session, txn, stmt, registry)
+        });
+    }
+
     // Normalise a lone `a RIGHT JOIN b` to `b LEFT JOIN a` before building the
     // participant context (targets resolve by name/alias, unaffected by the
-    // flip). RIGHT inside a chain is left for `validate_join_shape` to reject.
+    // flip). RIGHT inside a chain retains its original prefix grouping.
     flip_lone_right_join_delete(&mut stmt);
     let base_ref = crate::parser::TableRef {
         name: stmt.table.clone(),
@@ -1569,7 +1622,7 @@ pub(super) fn execute_multi_delete(
         column_aliases: Vec::new(),
         generate_series: None,
     };
-    normalize_natural_using_joins(db, &base_ref, &mut stmt.joins)?;
+    normalize_natural_using_joins(db, &base_ref, &mut stmt.joins, &mut stmt.selection, &mut [])?;
     validate_join_shape(&stmt.joins, "DELETE")?;
 
     let mut ctx = build_context(
@@ -1611,6 +1664,12 @@ pub(super) fn execute_multi_delete(
     }
 
     for &index in &target_participants {
+        if ctx.participants[index].cte.is_some() {
+            return Err(crate::error::catalog::ER_NON_UPDATABLE_TABLE.error(format!(
+                "The target table '{}' is not updatable",
+                ctx.participants[index].alias
+            )));
+        }
         super::routines::check_trigger_write_target(&ctx.participants[index].storage_key)?;
     }
 

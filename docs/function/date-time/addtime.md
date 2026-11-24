@@ -32,6 +32,10 @@ Result: 13:30:00
 ## Notes
 
 - See [temporal inputs and precision](README.md#temporal-inputs-and-precision) for SQL mode, input conversion, fractional seconds, and range diagnostics.
+- A dynamic first parameter in a prepared ADDTIME or SUBTIME expression binds
+  a TIME result. String-valued arithmetic suppresses an all-zero fractional
+  suffix while preserving nonzero microseconds. Typed temporal results retain
+  their declared fractional precision.
 
 ## Related Functions
 
