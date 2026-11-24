@@ -991,14 +991,20 @@ impl Database {
             file.write_quantization_model(&data, txn.snapshot_scn.max(1))?;
         }
         let mut used_parallel = false;
-        if let (Some(q), Some(file)) = (&quantizer, graph.file()) {
-            if q.trained_rows() >= 2048
-                // Construction codes are independent of the published payload:
-                // BQ can use the same bounded SQ8 topology as SQ/PQ. The scan
-                // below rejects values requiring lossless exceptions before
-                // direct materialization is admitted.
-                && matches!(q.name(), "sq8" | "sq4" | "pq" | "bq")
+        if let Some(file) = graph.file().filter(|_| !used_parallel) {
+            let q = quantizer.as_ref();
+            // Construction codes are independent of the published payload.
+            // Typed unquantized rows and SQ/PQ/BQ share this topology route;
+            // lossless quantization exceptions retain incremental construction.
+            if (!requested
+                || q.is_some_and(|q| {
+                    q.trained_rows() >= 2048 && matches!(q.name(), "sq8" | "sq4" | "pq" | "bq")
+                }))
                 && file.supports_direct_bulk_build()
+                && matches!(
+                    meta.metric_enum(),
+                    vector::Metric::L2 | vector::Metric::Cosine | vector::Metric::Dot
+                )
             {
                 let mut stats = CompactHnswStats::new(meta.metric_enum());
                 let mut encodable = true;
@@ -1012,7 +1018,8 @@ impl Database {
                     |_, values| {
                         if let Some(Value::Vector(value)) = values.first() {
                             stats.observe(&vector::to_f32(value));
-                            encodable &= q.name() == "pq" || q.encode(value).is_some();
+                            encodable &=
+                                q.is_none_or(|q| q.name() == "pq" || q.encode(value).is_some());
                         }
                         Ok(false)
                     },
@@ -1021,7 +1028,7 @@ impl Database {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
                 if encodable {
-                    if let Some(build) = self.try_bounded_hnsw_topology(
+                    if let Some(mut build) = self.try_bounded_hnsw_topology(
                         table,
                         txn,
                         storage_id,
@@ -1031,6 +1038,7 @@ impl Database {
                         meta.m as usize,
                         meta.ef_construction as usize,
                         hnsw_build_threads(),
+                        !requested,
                     )? {
                         let started = Instant::now();
                         let vids = self.materialize_bounded_hnsw(
@@ -1040,8 +1048,17 @@ impl Database {
                             col,
                             &build.graph,
                             file,
-                            Some(q),
+                            q,
                         )?;
+                        let released = build.graph.release_link_storage();
+                        if let Some(charge) = &mut build._lease.charge {
+                            charge.shrink(released);
+                        }
+                        if released
+                            > crate::engine::executor::mem_budget::memory_target_bytes() / 16
+                        {
+                            crate::engine::memory_reclaimer::release_allocator_cached_memory();
+                        }
                         graph.import_bulk_layout(&build.graph, vids)?;
                         drop(build);
                         used_parallel = true;
@@ -1482,54 +1499,174 @@ impl Database {
         m: usize,
         ef: usize,
         threads: usize,
+        native_unquantized: bool,
     ) -> Result<Option<BoundedHnswBuild>, QueryError> {
-        let Some(calibration) = stats.quantization_params() else {
+        if !matches!(
+            metric,
+            vector::Metric::L2 | vector::Metric::Cosine | vector::Metric::Dot
+        ) {
             return Ok(None);
+        }
+        let exact_int8 = native_unquantized
+            && matches!(
+                table.columns[col].data_type,
+                DataTypeKind::Vector {
+                    datatype: crate::vector::VectorDataType::Int8,
+                    ..
+                }
+            );
+        let calibration = if exact_int8 {
+            Some((0.0, 1.0, 1.0))
+        } else {
+            stats.quantization_params()
         };
+        // Native unquantized rows retain their online geometry when resident.
+        // Quantized native indexes prefer this packed route to a raw topology.
+        // Paged callers arrive here after actual resident admission declined.
+        let resident_bytes = stats
+            .estimated_bytes(m, threads)
+            .saturating_add(stats.rows().saturating_mul(stats.dim()).saturating_mul(4))
+            .saturating_add(stats.rows().saturating_mul(64));
+        if native_unquantized
+            && calibration.is_none()
+            && resident_bytes as u64 <= hnsw_bulk_memory_budget_bytes()?
+        {
+            return Ok(None);
+        }
+        let scan_codec = if calibration.is_none() && vector::hnsw::build_navigation_code_enabled() {
+            stats.navigation_codec()
+        } else {
+            None
+        };
+        if calibration.is_none() && scan_codec.is_none() {
+            return Ok(None);
+        }
         if stats.rows() < 2048 {
             return Ok(None);
         }
-        let Some(bytes) =
-            vector::bulk_hnsw::BulkHnsw::estimated_bytes(stats.rows(), stats.dim(), m, threads, ef)
-        else {
+        let stride = scan_codec
+            .as_ref()
+            .map_or(stats.dim(), |codec| codec.record_len());
+        let Some(code_bytes) = stats.rows().checked_mul(stride) else {
             return Ok(None);
         };
-        if bytes as u64 > hnsw_bulk_memory_budget_bytes()? {
-            return Ok(None);
-        }
         // Reclaimable, immutable code pages must not require a second full
         // anonymous working-set reservation. Keep all resident metadata and
         // bounded I/O buffers governed; the spill owns its disk quota and the
         // kernel accounts mapped pages against the unchanged cgroup ceiling.
-        let spilled_codes = stats.rows().saturating_mul(stats.dim())
-            > crate::engine::executor::mem_budget::memory_target_bytes() / 4;
-        let scratch_bytes = if spilled_codes {
-            bytes.saturating_sub(stats.rows().saturating_mul(stats.dim()))
+        let spilled_codes =
+            code_bytes > crate::engine::executor::mem_budget::memory_target_bytes() / 4;
+        // When the navigation image and amortized topology almost fit the
+        // physical ceiling, duplicating upper records shrinks the useful file
+        // cache. Keep reverse-edge headroom and use one reclaimable code copy.
+        let navigation_fits = spilled_codes
+            && !native_unquantized
+            && vector::bulk_hnsw::BulkHnsw::estimated_mapped_bytes(
+                stats.rows(),
+                stride,
+                m,
+                threads.max(1),
+                ef,
+                0,
+            )
+            .is_some_and(|bytes| {
+                let limit = crate::engine::executor::mem_budget::effective_memory_limit_bytes();
+                bytes <= limit.saturating_sub(limit / 16)
+            });
+        let mut upper_cache_limit = if navigation_fits {
+            0
         } else {
-            bytes
+            (crate::engine::executor::mem_budget::memory_target_bytes() / 12)
+                .min(crate::engine::executor::mem_budget::effective_memory_limit_bytes() / 16)
         };
-        let Some(mut lease) =
-            HnswBuildMemoryLease::try_acquire_streaming(self.buffer_pool.clone(), scratch_bytes)
-        else {
-            if std::env::var("MYDB_HNSW_BUILD_TIMING").is_ok() {
-                eprintln!(
-                    "[hnsw] bounded admission refused: bytes={bytes} controlled={:?} private={:?}",
-                    crate::engine::executor::mem_budget::controlled_memory_snapshot(),
-                    crate::engine::memory_reclaimer::current_private_footprint_bytes()
-                );
+        let mut threads = if native_unquantized {
+            1
+        } else {
+            threads.max(1)
+        };
+        let requested_threads = threads;
+        let mut compact_links = native_unquantized;
+        let (scratch_bytes, mut lease) = loop {
+            let Some(bytes) = (if spilled_codes {
+                if compact_links {
+                    vector::bulk_hnsw::BulkHnsw::estimated_compact_bytes(
+                        stats.rows(), stride, m, threads, ef, upper_cache_limit,
+                    )
+                } else {
+                    vector::bulk_hnsw::BulkHnsw::estimated_mapped_bytes(
+                        stats.rows(), stride, m, threads, ef, upper_cache_limit,
+                    )
+                }
+            } else {
+                vector::bulk_hnsw::BulkHnsw::estimated_bytes(stats.rows(), stride, m, threads, ef)
+            }) else {
+                return Ok(None);
+            };
+            let scratch = if spilled_codes {
+                bytes.saturating_sub(code_bytes)
+            } else {
+                bytes
+            };
+            // Mapped immutable codes are reclaimable file memory. Only the
+            // resident topology and bounded buffers consume this reservation.
+            if scratch as u64 <= hnsw_bulk_memory_budget_bytes()? {
+                if let Some(lease) =
+                    HnswBuildMemoryLease::try_acquire_streaming(self.buffer_pool.clone(), scratch)
+                {
+                    break (scratch, lease);
+                }
             }
-            return Ok(None);
+            if threads == 1 {
+                if spilled_codes && upper_cache_limit != 0 {
+                    upper_cache_limit = 0;
+                    threads = requested_threads;
+                    continue;
+                }
+                if spilled_codes && !compact_links {
+                    compact_links = true;
+                    threads = requested_threads;
+                    continue;
+                }
+                return Ok(None);
+            }
+            threads = threads.div_ceil(2);
         };
         lease.use_streaming_buffer()?;
-        let mut graph = vector::bulk_hnsw::BulkHnsw::new(
-            stats.rows(),
-            stats.dim(),
-            metric,
-            m,
-            ef,
-            calibration,
-            spilled_codes.then_some(self.data_dir.as_path()),
-        )?;
+        let mut graph = if let Some(codec) = scan_codec {
+            vector::bulk_hnsw::BulkHnsw::new_scan(
+                stats.rows(),
+                stats.dim(),
+                metric,
+                m,
+                ef,
+                codec,
+                self.data_dir.as_path(),
+                spilled_codes,
+            )?
+        } else {
+            vector::bulk_hnsw::BulkHnsw::new(
+                stats.rows(),
+                stats.dim(),
+                metric,
+                m,
+                ef,
+                calibration.expect("global construction calibration"),
+                spilled_codes.then_some(self.data_dir.as_path()),
+            )?
+        };
+        if spilled_codes {
+            graph = if compact_links {
+                graph.with_compact_links(upper_cache_limit)
+            } else {
+                graph.with_mapped_links(upper_cache_limit)
+            };
+        }
+        if native_unquantized {
+            graph = graph.with_native_fanout(exact_int8);
+        }
+        graph = graph.with_prefetch_limit(
+            (hnsw_bulk_memory_budget_bytes()? as usize).saturating_sub(scratch_bytes),
+        );
         let started = Instant::now();
         self.scan_hnsw_build_rows(
             table,
@@ -1545,26 +1682,41 @@ impl Database {
                 Ok(false)
             },
         )?;
+        if native_unquantized && !graph.has_distinct_native_codes()? {
+            return Ok(None);
+        }
         let encode_ms = started.elapsed().as_millis() as u64;
+        if spilled_codes {
+            // Encoding completed the input pass. Its clean kernel pages are
+            // redundant with the governed raw buffer and must not displace
+            // navigation records during the random-access phase. Keep the
+            // live heap descriptor/generation bound while issuing the hint.
+            self.with_heap_read(storage_id, |heap| {
+                crate::platform::file::advise_completed_read(&heap.file);
+                Ok(())
+            })?;
+            crate::engine::memory_reclaimer::release_allocator_cached_memory();
+            self.buffer_pool.reclaim_worker_allocators();
+        }
         if std::env::var("MYDB_HNSW_BUILD_TIMING").is_ok() {
             eprintln!(
-                "[hnsw] bounded encode: rows={} reserved={} mapped_codes={} elapsed={:?}",
+                "[hnsw] bounded encode: rows={} reserved={} mapped_codes={} compact_links={} workers={} stride={} elapsed={:?}",
                 stats.rows(),
                 scratch_bytes,
                 spilled_codes,
+                compact_links,
+                threads,
+                stride,
                 started.elapsed()
             );
         }
         let started = Instant::now();
         graph.build(threads)?;
         let link_ms = started.elapsed().as_millis() as u64;
-        graph.release_codes();
+        let prefetch_bytes = graph.prefetch_bytes();
+        let released_codes = graph.release_codes();
         if let Some(charge) = &mut lease.charge {
-            charge.shrink(stats.rows().saturating_mul(if spilled_codes {
-                4
-            } else {
-                stats.dim() + 4
-            }));
+            charge.shrink(released_codes);
         }
         if std::env::var("MYDB_HNSW_BUILD_TIMING").is_ok() {
             eprintln!("[hnsw] bounded link: {:?}", started.elapsed());
@@ -1574,7 +1726,7 @@ impl Database {
             _lease: lease,
             encode_ms,
             link_ms,
-            peak_scratch_bytes: scratch_bytes,
+            peak_scratch_bytes: scratch_bytes.saturating_add(prefetch_bytes),
         }))
     }
 
@@ -1767,33 +1919,34 @@ impl Database {
                 received += 1;
                 Ok(value)
             };
-            let result = if quantizer.is_some() {
-                file.bulk_build_native_direct(
-                    graph.len(),
-                    graph.entry(),
-                    |id| graph.level(id),
-                    |id, payload, links| {
-                        let encoded = next(id)?;
-                        payload.clear();
-                        payload.extend_from_slice(&encoded.payload);
-                        graph.copy_links(id, links);
-                        Ok(graph.row(id))
-                    },
-                )
-            } else {
-                file.bulk_build_direct(
-                    graph.len(),
-                    graph.entry(),
-                    |id| graph.level(id),
-                    |id, payload, links| {
-                        let value = next(id)?;
-                        *payload = vector::to_f32(&value);
-                        graph.copy_links(id, links);
-                        Ok(graph.row(id))
-                    },
-                )
-                .map(|_| Vec::new())
-            };
+            let result =
+                if quantizer.is_some() || datatype != crate::vector::VectorDataType::Float32 {
+                    file.bulk_build_native_direct(
+                        graph.len(),
+                        graph.entry(),
+                        |id| graph.level(id),
+                        |id, payload, links| {
+                            let encoded = next(id)?;
+                            payload.clear();
+                            payload.extend_from_slice(&encoded.payload);
+                            graph.copy_links(id, links);
+                            Ok(graph.row(id))
+                        },
+                    )
+                } else {
+                    file.bulk_build_direct(
+                        graph.len(),
+                        graph.entry(),
+                        |id| graph.level(id),
+                        |id, payload, links| {
+                            let value = next(id)?;
+                            *payload = vector::to_f32(&value);
+                            graph.copy_links(id, links);
+                            Ok(graph.row(id))
+                        },
+                    )
+                    .map(|_| Vec::new())
+                };
             let drain_result = (|| -> Result<(), QueryError> {
                 if result.is_err() {
                     return Ok(());
@@ -1931,58 +2084,19 @@ impl Database {
         let _build_gate = hnsw_build_memory_gate()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if raw_mode == "auto" && paged.supports_direct_bulk_build() {
-            if let Some(build) = self.try_bounded_hnsw_topology(
-                table,
-                txn,
-                storage_id,
-                cols[0],
-                &stats,
-                metric,
-                m,
-                ef_construction,
-                threads,
-            )? {
-                let materialize_started = Instant::now();
-                self.materialize_bounded_hnsw(
-                    table,
-                    txn,
-                    storage_id,
-                    cols[0],
-                    &build.graph,
-                    paged.file(),
-                    None,
-                )?;
-                let materialize_ms = materialize_started.elapsed().as_millis() as u64;
-                let rows = build.graph.len() as u64;
-                paged.record_build_stats(HnswBuildStats {
-                    mode: "bounded-topology",
-                    rows,
-                    stats_ms: stats_started.elapsed().as_millis() as u64
-                        - build.encode_ms
-                        - build.link_ms
-                        - materialize_ms,
-                    encode_ms: build.encode_ms,
-                    link_ms: build.link_ms,
-                    peak_scratch_bytes: build.peak_scratch_bytes as u64,
-                    materialize_ms,
-                    total_ms: total_started.elapsed().as_millis() as u64,
-                    ..HnswBuildStats::default()
-                });
-                drop(build);
-                if timing {
-                    eprintln!(
-                        "[hnsw] bounded materialize: {}ms total={:?}",
-                        materialize_ms,
-                        total_started.elapsed()
-                    );
-                }
-                return Ok(());
-            }
-        }
+        // A calibrated global code is already a fast resident representation.
+        // Preserve that route before considering the larger raw-f32 builder.
+        // Per-axis/error-aware builds still prefer an admitted exact graph.
+        let mut prebuilt = if raw_mode == "auto" && paged.supports_direct_bulk_build()
+            && stats.quantization_params().is_some()
+        {
+            self.try_bounded_hnsw_topology(table, txn, storage_id, cols[0], &stats,
+                metric, m, ef_construction, threads, false)?
+        } else { None };
         let mut lease: Option<HnswBuildMemoryLease> = None;
-        let preferred =
-            hnsw_preferred_cold_build_mode(&raw_mode, full_bytes, compact_bytes, budget, false);
+        let preferred = if prebuilt.is_some() { HnswColdBuildMode::ChunkedPaged } else {
+            hnsw_preferred_cold_build_mode(&raw_mode, full_bytes, compact_bytes, budget, false)
+        };
         let mut build_mode = match preferred {
             HnswColdBuildMode::FullMemory if full_bytes > budget => {
                 return Err(error(
@@ -2021,6 +2135,52 @@ impl Database {
             build_mode = HnswColdBuildMode::ChunkedPaged;
         }
 
+        if raw_mode == "auto"
+            && build_mode == HnswColdBuildMode::ChunkedPaged
+            && paged.supports_direct_bulk_build()
+        {
+            let build = if let Some(build) = prebuilt.take() { Some(build) } else {
+                self.try_bounded_hnsw_topology(table, txn, storage_id, cols[0], &stats,
+                    metric, m, ef_construction, threads, false)?
+            };
+            if let Some(build) = build {
+                let materialize_started = Instant::now();
+                self.materialize_bounded_hnsw(
+                    table,
+                    txn,
+                    storage_id,
+                    cols[0],
+                    &build.graph,
+                    paged.file(),
+                    None,
+                )?;
+                let materialize_ms = materialize_started.elapsed().as_millis() as u64;
+                let rows = build.graph.len() as u64;
+                paged.record_build_stats(HnswBuildStats {
+                    mode: "bounded-topology",
+                    rows,
+                    stats_ms: stats_started.elapsed().as_millis() as u64
+                        - build.encode_ms
+                        - build.link_ms
+                        - materialize_ms,
+                    encode_ms: build.encode_ms,
+                    link_ms: build.link_ms,
+                    peak_scratch_bytes: build.peak_scratch_bytes as u64,
+                    materialize_ms,
+                    total_ms: total_started.elapsed().as_millis() as u64,
+                    ..HnswBuildStats::default()
+                });
+                drop(build);
+                if timing {
+                    eprintln!(
+                        "[hnsw] bounded materialize: {}ms total={:?}",
+                        materialize_ms,
+                        total_started.elapsed()
+                    );
+                }
+                return Ok(());
+            }
+        }
         if timing {
             eprintln!(
                 "[paged] build plan: mode={build_mode:?} rows={} dim={} stats={:?} reserved={} budget={}",
@@ -2275,9 +2435,10 @@ impl Database {
             }
             scratch_bytes = (scratch_bytes / 2).max(8 * 1024 * 1024);
         };
-        if paged.chunk_vector_bytes_per_dimension(stats.quantization_params().is_some())
-            == std::mem::size_of::<f32>() + std::mem::size_of::<i8>()
-        {
+        let compact_navigation = paged
+            .chunk_vector_bytes_per_dimension(stats.quantization_params().is_some())
+            == std::mem::size_of::<f32>() + std::mem::size_of::<i8>();
+        if compact_navigation {
             lease.use_streaming_buffer()?;
         }
         // Resident metadata owned by the external adjacency sidecar.
@@ -2289,7 +2450,11 @@ impl Database {
             .rows()
             // Final reachability validation retains VecIds, a seen byte and
             // a worst-case pending VecId per node after link scratch is freed.
-            .saturating_mul(BUILD_NODE_METADATA_BYTES + 17)
+            .saturating_mul(if compact_navigation {
+                BUILD_NODE_METADATA_BYTES + 17
+            } else {
+                17
+            })
             .saturating_add(2 * 1024 * 1024);
         let usable_bytes = scratch_bytes.checked_sub(sidecar_meta_bytes).ok_or_else(|| {
             error(

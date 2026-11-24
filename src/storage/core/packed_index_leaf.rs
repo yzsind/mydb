@@ -1310,7 +1310,7 @@ impl Frame {
     #[inline]
     fn read_materialized_index_bytes(
         &self,
-    ) -> Result<std::sync::RwLockReadGuard<'_, Vec<u8>>, QueryError> {
+    ) -> Result<std::sync::RwLockReadGuard<'_, RawPageBytes>, QueryError> {
         let bytes = self.bytes.read().map_err(|_| {
             error(
                 crate::error::catalog::ER_GET_ERRNO,

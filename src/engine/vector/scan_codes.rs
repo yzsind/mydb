@@ -184,6 +184,61 @@ impl ScanCodec {
         RECORD_HEADER + self.dimension()
     }
 
+    /// Symmetric construction distance between decoded navigation rows. Codes
+    /// guide ANN topology only; callers retain exact rows for coarse residuals.
+    pub(crate) fn construction_distance(&self, a: &[u8], b: &[u8]) -> f64 {
+        let a = &a[RECORD_HEADER..];
+        let b = &b[RECORD_HEADER..];
+        debug_assert_eq!(a.len(), self.dimension());
+        debug_assert_eq!(b.len(), self.dimension());
+        let dot = self.metric == Metric::Dot;
+        let value = match Isa::detected() {
+            #[cfg(target_arch = "x86_64")]
+            Isa::Avx512 => unsafe {
+                construction_distance_avx512(a, b, &self.low, &self.scale, dot)
+            },
+            #[cfg(target_arch = "x86_64")]
+            Isa::Avx2
+                if std::is_x86_feature_detected!("avx2")
+                    && std::is_x86_feature_detected!("fma") =>
+            unsafe { construction_distance_avx2(a, b, &self.low, &self.scale, dot) },
+            #[cfg(target_arch = "aarch64")]
+            Isa::Neon => unsafe { construction_distance_neon(a, b, &self.low, &self.scale, dot) },
+            _ => return self.construction_distance_scalar(a, b),
+        };
+        let value = f64::from(value);
+        if !value.is_finite() || value.abs() < 1e-30 {
+            return self.construction_distance_scalar(a, b);
+        }
+        match self.metric {
+            Metric::Dot => -value,
+            Metric::Cosine => value * 0.5,
+            _ => value,
+        }
+    }
+
+    fn construction_distance_scalar(&self, a: &[u8], b: &[u8]) -> f64 {
+        let value: f64 = a
+            .iter()
+            .zip(b)
+            .zip(self.low.iter().zip(&self.scale))
+            .map(|((&a, &b), (&low, &scale))| {
+                let (a, b, low, scale) =
+                    (f64::from(a), f64::from(b), f64::from(low), f64::from(scale));
+                if self.metric == Metric::Dot {
+                    (low + scale * a) * (low + scale * b)
+                } else {
+                    ((a - b) * scale).powi(2)
+                }
+            })
+            .sum();
+        match self.metric {
+            Metric::Dot => -value,
+            Metric::Cosine => value * 0.5,
+            _ => value,
+        }
+    }
+
     pub(crate) fn allocated_bytes(&self) -> usize {
         self.dimension() * 8 + std::mem::size_of::<Self>()
     }
@@ -264,6 +319,54 @@ impl ScanCodec {
     }
 }
 
+/// Prepared decoded-code scorer for construction only. COSINE codes use
+/// half squared Euclidean distance, matching construction_distance
+/// in scale. Original payloads remain the fallback for coarse residuals.
+#[derive(Debug)]
+pub(crate) struct ScanConstructionQuery {
+    query: ScanQuery,
+    multiplier: f64,
+}
+impl ScanConstructionQuery {
+    pub(crate) fn new(codec: &ScanCodec, record: &[u8]) -> Option<Self> {
+        if record.len() != codec.record_len() || !ScanCodec::record_residual(record).is_finite() {
+            return None;
+        }
+        let q: Vec<f64> = record[RECORD_HEADER..]
+            .iter()
+            .enumerate()
+            .map(|(i, &code)| f64::from(codec.low[i]) + f64::from(codec.scale[i]) * f64::from(code))
+            .collect();
+        let metric = if codec.metric == Metric::Cosine {
+            Metric::L2
+        } else {
+            codec.metric
+        };
+        Some(Self {
+            query: ScanQuery::from_coded_space(codec, &q, CodeKernel::detected(), metric)?,
+            multiplier: if codec.metric == Metric::Cosine {
+                0.5
+            } else {
+                1.0
+            },
+        })
+    }
+    #[inline]
+    pub(crate) fn estimate(&self, record: &[u8]) -> Option<f64> {
+        let distance = self.query.estimate(record) * self.multiplier;
+        let norm = f64::from(f32::from_le_bytes(record[4..8].try_into().ok()?));
+        let error = if self.query.metric == Metric::Dot {
+            self.query.estimate_error
+        } else {
+            2.0 * self.query.estimate_error
+                + 8.0 * ROUNDING * norm * norm
+                + 1e-12 * (self.query.squared + norm * norm + 1.0)
+        } * self.multiplier;
+        (distance.is_finite() && error.is_finite() && distance.abs() > 4.0 * error)
+            .then_some(distance)
+    }
+}
+
 /// One query prepared against a codec: `q·ŷ ≈ bias + Σ weights[i]·code[i]`.
 #[derive(Debug)]
 pub(crate) struct ScanQuery {
@@ -292,9 +395,19 @@ impl ScanQuery {
             return None;
         }
         let q = coded_space(query, codec.metric)?;
+        Self::from_coded_space(codec, &q, kernel, codec.metric)
+    }
+
+    fn from_coded_space(
+        codec: &ScanCodec,
+        q: &[f64],
+        kernel: CodeKernel,
+        metric: Metric,
+    ) -> Option<Self> {
+        let dim = codec.dimension();
         let squared: f64 = q.iter().map(|v| v * v).sum();
         let norm = squared.sqrt();
-        if !squared.is_finite() || (codec.metric != Metric::Dot && !squared.is_normal()) {
+        if !squared.is_finite() || (metric != Metric::Dot && !squared.is_normal()) {
             return None;
         }
         let (mut bias, mut bias_magnitude) = (0.0f64, 0.0f64);
@@ -313,7 +426,7 @@ impl ScanQuery {
             return None;
         }
         Some(Self {
-            metric: codec.metric,
+            metric,
             weights,
             bias,
             estimate_error,
@@ -674,6 +787,162 @@ unsafe fn integer_codes_vnni(codes: *const u8, weights: *const i16, len: usize) 
     total
 }
 
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn construction_distance_avx512(
+    a: &[u8],
+    b: &[u8],
+    low: &[f32],
+    scale: &[f32],
+    dot: bool,
+) -> f32 {
+    use std::arch::x86_64::*;
+    let mut sums = [_mm512_setzero_ps(); 4];
+    let mut i = 0;
+    while i + 16 <= a.len() {
+        let av = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(_mm_loadu_si128(
+            a.as_ptr().add(i).cast(),
+        )));
+        let bv = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(_mm_loadu_si128(
+            b.as_ptr().add(i).cast(),
+        )));
+        let s = _mm512_loadu_ps(scale.as_ptr().add(i));
+        let lane = (i / 16) % 4;
+        if dot {
+            let l = _mm512_loadu_ps(low.as_ptr().add(i));
+            sums[lane] = _mm512_fmadd_ps(
+                _mm512_fmadd_ps(av, s, l),
+                _mm512_fmadd_ps(bv, s, l),
+                sums[lane],
+            );
+        } else {
+            let d = _mm512_mul_ps(_mm512_sub_ps(av, bv), s);
+            sums[lane] = _mm512_fmadd_ps(d, d, sums[lane]);
+        }
+        i += 16;
+    }
+    let mut value = _mm512_reduce_add_ps(_mm512_add_ps(
+        _mm512_add_ps(sums[0], sums[1]),
+        _mm512_add_ps(sums[2], sums[3]),
+    ));
+    while i < a.len() {
+        let (av, bv) = (f32::from(a[i]), f32::from(b[i]));
+        value += if dot {
+            (low[i] + scale[i] * av) * (low[i] + scale[i] * bv)
+        } else {
+            ((av - bv) * scale[i]).powi(2)
+        };
+        i += 1;
+    }
+    value
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn construction_distance_avx2(
+    a: &[u8],
+    b: &[u8],
+    low: &[f32],
+    scale: &[f32],
+    dot: bool,
+) -> f32 {
+    use std::arch::x86_64::*;
+    let mut sums = [_mm256_setzero_ps(); 4];
+    let mut i = 0;
+    while i + 8 <= a.len() {
+        let av = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_loadl_epi64(
+            a.as_ptr().add(i).cast(),
+        )));
+        let bv = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_loadl_epi64(
+            b.as_ptr().add(i).cast(),
+        )));
+        let s = _mm256_loadu_ps(scale.as_ptr().add(i));
+        let lane = (i / 8) % 4;
+        if dot {
+            let l = _mm256_loadu_ps(low.as_ptr().add(i));
+            sums[lane] = _mm256_fmadd_ps(
+                _mm256_fmadd_ps(av, s, l),
+                _mm256_fmadd_ps(bv, s, l),
+                sums[lane],
+            );
+        } else {
+            let d = _mm256_mul_ps(_mm256_sub_ps(av, bv), s);
+            sums[lane] = _mm256_fmadd_ps(d, d, sums[lane]);
+        }
+        i += 8;
+    }
+    let sum = _mm256_add_ps(
+        _mm256_add_ps(sums[0], sums[1]),
+        _mm256_add_ps(sums[2], sums[3]),
+    );
+    let half = _mm_add_ps(_mm256_castps256_ps128(sum), _mm256_extractf128_ps(sum, 1));
+    let pair = _mm_add_ps(half, _mm_movehl_ps(half, half));
+    let mut value = _mm_cvtss_f32(_mm_add_ss(pair, _mm_shuffle_ps(pair, pair, 1)));
+    while i < a.len() {
+        let (av, bv) = (f32::from(a[i]), f32::from(b[i]));
+        value += if dot {
+            (low[i] + scale[i] * av) * (low[i] + scale[i] * bv)
+        } else {
+            ((av - bv) * scale[i]).powi(2)
+        };
+        i += 1;
+    }
+    value
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn construction_distance_neon(
+    a: &[u8],
+    b: &[u8],
+    low: &[f32],
+    scale: &[f32],
+    dot: bool,
+) -> f32 {
+    use std::arch::aarch64::*;
+    let mut sums = [vdupq_n_f32(0.0); 4];
+    let mut i = 0;
+    while i + 8 <= a.len() {
+        let av = vmovl_u8(vld1_u8(a.as_ptr().add(i)));
+        let bv = vmovl_u8(vld1_u8(b.as_ptr().add(i)));
+        for (part, (av, bv)) in [
+            (vget_low_u16(av), vget_low_u16(bv)),
+            (vget_high_u16(av), vget_high_u16(bv)),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let j = i + part * 4;
+            let av = vcvtq_f32_u32(vmovl_u16(av));
+            let bv = vcvtq_f32_u32(vmovl_u16(bv));
+            let s = vld1q_f32(scale.as_ptr().add(j));
+            let lane = (j / 4) % 4;
+            if dot {
+                let l = vld1q_f32(low.as_ptr().add(j));
+                sums[lane] = vfmaq_f32(sums[lane], vfmaq_f32(l, av, s), vfmaq_f32(l, bv, s));
+            } else {
+                let d = vmulq_f32(vsubq_f32(av, bv), s);
+                sums[lane] = vfmaq_f32(sums[lane], d, d);
+            }
+        }
+        i += 8;
+    }
+    let mut value = vaddvq_f32(vaddq_f32(
+        vaddq_f32(sums[0], sums[1]),
+        vaddq_f32(sums[2], sums[3]),
+    ));
+    while i < a.len() {
+        let (av, bv) = (f32::from(a[i]), f32::from(b[i]));
+        value += if dot {
+            (low[i] + scale[i] * av) * (low[i] + scale[i] * bv)
+        } else {
+            ((av - bv) * scale[i]).powi(2)
+        };
+        i += 1;
+    }
+    value
+}
+
 fn weighted_codes_scalar(codes: &[u8], weights: &[f32]) -> f32 {
     let mut lanes = [0.0f32; 8];
     let mut blocks = codes.chunks_exact(8).zip(weights.chunks_exact(8));
@@ -760,6 +1029,51 @@ mod tests {
     use super::*;
     use crate::engine::vector::distance::{typed_ordering_distance, PreparedF32Distance};
     use crate::vector::VectorValue;
+
+    #[test]
+    fn construction_codes_preserve_axis_weights_and_metric_on_simd_tails() {
+        for metric in [Metric::L2, Metric::Cosine, Metric::Dot] {
+            for dim in [1, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 129, 768] {
+                let lows: Vec<_> = (0..dim).map(|i| -0.1 * (i % 5 + 1) as f64).collect();
+                let highs: Vec<_> = lows
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &x)| x + 0.01 * (i % 11 + 1) as f64)
+                    .collect();
+                let codec = ScanCodec::from_ranges(metric, &lows, &highs).unwrap();
+                let mut a = vec![0; codec.record_len()];
+                let mut b = a.clone();
+                for i in 0..dim {
+                    a[RECORD_HEADER + i] = (i * 71 % 256) as u8;
+                    b[RECORD_HEADER + i] = (i * 37 + 19) as u8;
+                }
+                let expected =
+                    codec.construction_distance_scalar(&a[RECORD_HEADER..], &b[RECORD_HEADER..]);
+                let actual = codec.construction_distance(&a, &b);
+                assert!(
+                    (actual - expected).abs() <= 1e-5 * expected.abs().max(1e-10),
+                    "metric={metric:?} dim={dim} actual={actual} expected={expected}"
+                );
+                assert_eq!(actual, codec.construction_distance(&b, &a));
+            }
+        }
+    }
+
+    #[test]
+    fn construction_extreme_scales_use_wide_arithmetic() {
+        for scale in [1e-25, 1e25] {
+            let codec = ScanCodec::from_ranges(Metric::L2, &[0.0], &[scale]).unwrap();
+            let mut a = vec![0; codec.record_len()];
+            let mut b = a.clone();
+            a[RECORD_HEADER] = 1;
+            b[RECORD_HEADER] = 255;
+            let actual = codec.construction_distance(&a, &b);
+            let expected =
+                codec.construction_distance_scalar(&a[RECORD_HEADER..], &b[RECORD_HEADER..]);
+            assert_eq!(actual, expected);
+            assert!(actual.is_finite() && actual > 0.0);
+        }
+    }
 
     struct Rng(u64);
     impl Rng {

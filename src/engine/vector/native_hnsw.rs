@@ -234,6 +234,8 @@ pub(crate) struct NativeHnsw {
     candidates_returned: std::sync::atomic::AtomicU64,
     heap_reranks: std::sync::atomic::AtomicU64,
     exact_fallbacks: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
+    csr_build_failure: Mutex<Option<QueryError>>,
 }
 
 impl NativeHnsw {
@@ -282,6 +284,8 @@ impl NativeHnsw {
             candidates_returned: std::sync::atomic::AtomicU64::new(0),
             heap_reranks: std::sync::atomic::AtomicU64::new(0),
             exact_fallbacks: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            csr_build_failure: Mutex::new(None),
         })
     }
     fn definition_bytes(&self) -> Result<Vec<u8>, QueryError> {
@@ -1039,6 +1043,22 @@ impl NativeHnsw {
             state.by_vid.insert(vid, id);
         }
         state.entry = topology.entry().map(|(id, _)| id as usize);
+        if self.quantizer().is_none() {
+            self.restore_coordinate_heads(&mut state)?;
+        }
+        Ok(())
+    }
+
+    fn restore_coordinate_heads(&self, state: &mut State) -> Result<(), QueryError> {
+        state.group_heads.clear();
+        for group in 0..state.groups.len() {
+            if group % 256 == 0 {
+                crate::engine::cancel::check_cancelled()?;
+            }
+            let value = self.value(state, state.groups[group].representative)?;
+            let hash = self.coordinate_hash(state, &value);
+            state.groups[group].next_collision = state.group_heads.insert(hash, group);
+        }
         Ok(())
     }
     pub(crate) fn file(&self) -> Option<&Arc<VectorIndexFile>> {
@@ -1146,6 +1166,20 @@ impl NativeHnsw {
         }
     }
     fn prepare_csr(&self) -> Result<(), QueryError> {
+        match self.try_prepare_csr() {
+            Err(err) if err.code() == 1037 => {
+                // CSR is derived acceleration. A physical-pressure race while
+                // scanning pages must not invalidate a durable paged index.
+                if std::env::var_os("MYDB_HNSW_BUILD_TIMING").is_some() {
+                    eprintln!("[hnsw] optional query navigator declined: {err}");
+                }
+                Ok(())
+            }
+            result => result,
+        }
+    }
+
+    fn try_prepare_csr(&self) -> Result<(), QueryError> {
         if self.state.read().csr.is_some() {
             return Ok(());
         }
@@ -1170,7 +1204,10 @@ impl NativeHnsw {
         let stride = self.quantizer().map_or(0, |quant| quant.record_len());
         let payload_bytes = state.nodes.len().saturating_mul(stride);
         let combined = bytes.saturating_add(payload_bytes);
-        let reserve = |bytes| {
+        let headroom = (crate::engine::executor::mem_budget::memory_target_bytes() / 32)
+            .clamp(4 * 1024 * 1024, 32 * 1024 * 1024);
+        let reserve = |bytes: usize| {
+            let bytes = bytes.saturating_add(headroom);
             self.file.as_ref().map_or_else(
                 || {
                     ControlledMemoryCharge::try_new_optional(
@@ -1198,12 +1235,19 @@ impl NativeHnsw {
             return Ok(());
         };
         let mut state = parking_lot::RwLockUpgradableReadGuard::upgrade(state);
-        let reserved = if reserve_payloads { combined } else { bytes };
+        let reserved = (if reserve_payloads { combined } else { bytes }).saturating_add(headroom);
+        #[cfg(test)]
+        if let Some(err) = self.csr_build_failure.lock().take() {
+            return Err(err);
+        }
         let mut payloads = if reserve_payloads {
             let mut payloads = Vec::new();
-            payloads
-                .try_reserve_exact(payload_bytes)
-                .map_err(|_| codec::vector_err("native HNSW payload cache allocation failed"))?;
+            payloads.try_reserve_exact(payload_bytes).map_err(|_| {
+                crate::storage::error(
+                    crate::error::catalog::ER_OUTOFMEMORY,
+                    "native HNSW payload cache allocation failed",
+                )
+            })?;
             Some(payloads)
         } else {
             None
@@ -1563,6 +1607,7 @@ impl NativeHnsw {
             self.explore_query_ties(query),
             |id| self.navigation_score(state, id, query, query_code, exact),
             |ids| self.navigation_scores4(state, ids, query, query_code, exact),
+            |_| {},
         )
     }
 
@@ -1582,6 +1627,7 @@ impl NativeHnsw {
         explore_ties: bool,
         mut score_node: impl FnMut(usize) -> Result<f64, QueryError>,
         mut score_nodes4: impl FnMut([usize; 4]) -> Result<[f64; 4], QueryError>,
+        prefetch_nodes: impl Fn(&[usize]),
     ) -> Result<Vec<Scored<usize>>, QueryError> {
         let ef = ef.max(1).min(state.nodes.len());
         if ef == 0 {
@@ -1648,8 +1694,13 @@ impl NativeHnsw {
                     for &id in scratch.unseen.iter().take(8) {
                         Self::prefetch_candidate(state, id);
                     }
+                    prefetch_nodes(&scratch.unseen[..scratch.unseen.len().min(8)]);
                     let mut position = 0;
                     while position + 4 <= scratch.unseen.len() {
+                        let ahead = (position + 8).min(scratch.unseen.len());
+                        prefetch_nodes(
+                            &scratch.unseen[ahead..(ahead + 4).min(scratch.unseen.len())],
+                        );
                         for &id in scratch.unseen.iter().skip(position + 8).take(4) {
                             Self::prefetch_candidate(state, id);
                         }
@@ -2374,6 +2425,7 @@ impl NativeHnsw {
         let mapped = if state.csr.as_ref().is_some_and(|csr| csr.payloads.is_none()) {
             if let (Some(file), Some(quant)) = (&self.file, self.quantizer()) {
                 file.with_navigation_mapping(|view| {
+                    view.refresh_prefetch();
                     let score_node = |id: usize| {
                         quant.score_payload(
                             view.native_payload(state.nodes[id].vid)?,
@@ -2405,6 +2457,11 @@ impl NativeHnsw {
                                 query,
                                 query_code.as_ref(),
                             )
+                        },
+                        |ids| {
+                            for &id in ids {
+                                view.prefetch_record(state.nodes[id].vid);
+                            }
                         },
                     )
                 })
@@ -2457,6 +2514,91 @@ impl NativeHnsw {
 #[cfg(test)]
 mod duplicate_regressions {
     use super::*;
+
+    #[test]
+    fn optional_csr_pressure_releases_its_charge_and_preserves_paged_fallback() {
+        let graph = NativeHnsw::new(VectorDataType::Float32, 2, Metric::L2, 4, 16, None).unwrap();
+        let value = codec::parse_text("[1,2]").unwrap();
+        graph
+            .insert(
+                RowId {
+                    page_id: 1,
+                    slot_id: 0,
+                },
+                value.clone(),
+            )
+            .unwrap();
+        let before = crate::engine::executor::mem_budget::controlled_memory_snapshot().0;
+        *graph.csr_build_failure.lock() = Some(crate::storage::error(
+            crate::error::catalog::ER_OUTOFMEMORY,
+            "injected CSR page-read pressure",
+        ));
+        graph.prepare_csr().unwrap();
+        assert!(graph.state.read().csr.is_none());
+        assert!(
+            graph.csr_build_failure.lock().is_none(),
+            "failure must occur after cache admission"
+        );
+        assert_eq!(
+            crate::engine::executor::mem_budget::controlled_memory_snapshot().0,
+            before
+        );
+        let request = VectorSearchRequest {
+            candidate_limit: 1,
+            rerank_limit: 1,
+            effort: super::super::VectorSearchEffort::Hnsw { ef: 16 },
+        };
+        assert_eq!(
+            graph.search(&value, request).unwrap().candidates[0].0,
+            RowId {
+                page_id: 1,
+                slot_id: 0
+            }
+        );
+        for spec in [
+            crate::error::catalog::ER_QUERY_INTERRUPTED,
+            crate::error::catalog::ER_GET_ERRNO,
+        ] {
+            *graph.csr_build_failure.lock() =
+                Some(crate::storage::error(spec, "injected non-memory failure"));
+            assert_eq!(graph.prepare_csr().unwrap_err().code(), spec.code());
+            assert!(graph.state.read().csr.is_none());
+        }
+    }
+
+    #[test]
+    fn rebuilt_bulk_coordinate_heads_keep_later_duplicates_in_the_original_group() {
+        let graph = NativeHnsw::new(VectorDataType::Int8, 2, Metric::L2, 4, 16, None).unwrap();
+        let value = codec::from_build_f32(&[1.0, 2.0], VectorDataType::Int8).unwrap();
+        graph
+            .insert(
+                RowId {
+                    page_id: 1,
+                    slot_id: 0,
+                },
+                value.clone(),
+            )
+            .unwrap();
+        {
+            let mut state = graph.state.write();
+            state.group_heads.clear();
+            graph.restore_coordinate_heads(&mut state).unwrap();
+        }
+        for id in 2..=33 {
+            graph
+                .insert(
+                    RowId {
+                        page_id: id,
+                        slot_id: 0,
+                    },
+                    value.clone(),
+                )
+                .unwrap();
+        }
+        let state = graph.state.read();
+        assert_eq!(state.groups.len(), 1);
+        assert_eq!(state.groups[0].members.len(), 33);
+    }
 
     #[test]
     fn pending_quantization_repeated_coordinates_remain_reachable() {

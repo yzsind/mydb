@@ -3276,11 +3276,15 @@ impl Hash for PageKey {
     }
 }
 
+mod raw_page_bytes;
+use raw_page_bytes::RawPageBytes;
+
 #[derive(Debug)]
 struct Frame {
     key: PageKey,
+    // Drop physical bytes before releasing their governed residency.
+    bytes: RwLock<RawPageBytes>,
     raw_memory_charge: Mutex<Option<crate::engine::executor::mem_budget::ControlledMemoryCharge>>,
-    bytes: RwLock<Vec<u8>>,
     root_routing: parking_lot::Mutex<Option<Arc<RootRoutingCache>>>,
     has_root_routing: AtomicBool,
     /// Number of logical SmallScan demands observed for this frame. Unlike a
@@ -3417,12 +3421,12 @@ pub(crate) struct BufferPageDiagnostic {
 }
 
 /// One governed raw page allocation that can move between an evicted frame and
-/// its replacement without returning the 16 KiB block to the system allocator.
+/// its replacement without releasing the 16 KiB physical storage.
 /// The charge follows the allocation, including while it is parked in a shard's
 /// recycle list, so managed-resident accounting never under-reports memory.
 #[derive(Debug)]
 struct RawPageLease {
-    bytes: Vec<u8>,
+    bytes: RawPageBytes,
     charge: crate::engine::executor::mem_budget::ControlledMemoryCharge,
     /// Replacement hint carried by the allocation across concurrent admissions.
     scan_file_hash: Option<u64>,
@@ -3900,6 +3904,10 @@ struct BufferPool {
     /// every IO thread out of bed at the same time.
     worker_lock: Mutex<()>,
     worker_cv: Condvar,
+    #[cfg(feature = "fast-alloc")]
+    allocator_reclaim_epoch: AtomicU64,
+    #[cfg(feature = "fast-alloc")]
+    allocator_reclaim_completed: AtomicU64,
     /// Q-1 - resident page counts split by file kind
     /// (heap / index / overflow-LOB), maintained alongside `used_pages`.
     /// Drives the per-kind soft-quota eviction bias and the

@@ -26,7 +26,7 @@ impl Frame {
         self.has_root_routing.store(false, Ordering::Release);
     }
 
-    fn write_bytes(&self) -> std::sync::LockResult<RwLockWriteGuard<'_, Vec<u8>>> {
+    fn write_bytes(&self) -> std::sync::LockResult<RwLockWriteGuard<'_, RawPageBytes>> {
         let bytes = self.bytes.write()?;
         // Invalidate before exposing writable bytes, including failed raw
         // mutations, physical replay and checksum/materialization boundaries.

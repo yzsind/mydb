@@ -135,7 +135,7 @@ fn check_sql_restart(index_page: bool) {
             .unwrap();
         let frame = db.buffer_pool.lookup_frame(&key).unwrap().unwrap();
         if index_page {
-            let bytes = frame.bytes.read().unwrap().clone();
+            let bytes = frame.bytes.read().unwrap().to_vec();
             db.buffer_pool.store_page(key.clone(), bytes, 0).unwrap();
         }
         let writer = Arc::clone(&engine);
