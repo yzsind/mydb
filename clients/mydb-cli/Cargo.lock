@@ -646,7 +646,7 @@ dependencies = [
 
 [[package]]
 name = "mydb-cli"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "clap",
  "ctrlc",

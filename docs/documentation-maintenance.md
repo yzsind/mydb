@@ -2,7 +2,7 @@
 
 This page is for documentation contributors. Documentation in this checkout
 describes its source revision; use the matching release tag for
-release-specific instructions and physical formats. MyDB 1.0.1 is a
+release-specific instructions and physical formats. MyDB 1.0.3 is a
 public-preview release (see the [Feature Overview](feature-overview.md) for
 the release-maturity statement). The feature and compatibility references
 describe supported behavior; listing a MySQL-shaped object does not promise an

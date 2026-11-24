@@ -16,7 +16,7 @@ the same engine and business data. Applications can evolve schemas, combine
 keyword and vector retrieval, and call external generation and embedding
 services through a familiar SQL interface.
 
-MyDB 1.0.2 is a public-preview release for feature validation and evaluation in
+MyDB 1.0.3 is a public-preview release for feature validation and evaluation in
 controlled environments. It is not yet a production-grade MySQL replacement,
 and on-disk formats are not guaranteed to be backward compatible.
 

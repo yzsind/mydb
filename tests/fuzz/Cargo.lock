@@ -1601,7 +1601,7 @@ dependencies = [
 
 [[package]]
 name = "mydb"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "aes",
  "aes-gcm",
