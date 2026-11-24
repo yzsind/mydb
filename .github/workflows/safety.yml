@@ -2,7 +2,7 @@ name: Safety tests
 
 on:
   pull_request:
-    paths: ['src/**', 'vendor/**', 'tests/fuzz/**', 'tests/jepsen/**', 'tests/fixtures/**', 'scripts/**', 'Cargo.*', '.github/workflows/**', '.gitignore']
+    paths: ['src/**', 'vendor/**', 'tests/fuzz/**', 'tests/jepsen/**', 'tests/fixtures/**', 'scripts/**', 'Cargo.*', '.github/workflows/**', '.github/actions/**', '.gitignore']
   push:
     branches: [main]
   schedule:
@@ -104,13 +104,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: safety-fuzz-regressions
-          # This job rebuilds the mydb crate on every pull request; keeping the
-          # incremental state turns that from a full recompile into an
-          # incremental one once a warm cache entry exists.
-          cache-incremental: true
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-nextest@0.9.151
+      - uses: ./.github/actions/install-nextest
       - run: cargo nextest run --locked --features fuzzing fuzz --no-fail-fast
 
   jepsen:

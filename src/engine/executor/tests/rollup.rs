@@ -792,7 +792,7 @@ fn grouping_argument_must_match_group_by_expression() {
              GROUP BY region WITH ROLLUP",
         )
         .unwrap_err();
-    assert_eq!(err.code(), 3580);
+    assert_eq!(err.code(), 3602);
 }
 
 #[test]
@@ -1285,5 +1285,175 @@ fn ordered_rollup_exact_cascade_matches_independent_prefixes() {
         got.sort_by_key(|r| rollup_multiset_key(r));
         expected.sort_by_key(|r| rollup_multiset_key(r));
         assert_eq!(got, expected, "{aggs}");
+    }
+}
+
+#[test]
+fn audit1123_rollup_nested_emission() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = open_test_engine(dir.path());
+    engine
+        .execute("CREATE TABLE t (a INT,b INT,c INT)")
+        .unwrap();
+    engine
+        .execute("INSERT INTO t VALUES (1,1,10),(1,2,20),(2,1,30)")
+        .unwrap();
+    for mode in [
+        crate::engine::executor::vec::config::VecMode::Off,
+        crate::engine::executor::vec::config::VecMode::On,
+    ] {
+        let rows = crate::engine::executor::vec::config::with_vec_mode(mode, || {
+            query_rows(
+                &engine,
+                "SELECT a,b,COUNT(*) FROM t GROUP BY a,b WITH ROLLUP",
+            )
+        });
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::Int(1), Value::Int(1), Value::Int(1)],
+                vec![Value::Int(1), Value::Int(2), Value::Int(1)],
+                vec![Value::Int(1), Value::Null, Value::Int(2)],
+                vec![Value::Int(2), Value::Int(1), Value::Int(1)],
+                vec![Value::Int(2), Value::Null, Value::Int(1)],
+                vec![Value::Null, Value::Null, Value::Int(3)],
+            ],
+            "{mode:?}"
+        );
+    }
+}
+
+#[test]
+fn audit1123_grouped_wildcards_validate_and_preserve_shape() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = open_test_engine(dir.path());
+    engine.execute("CREATE TABLE t (a INT,b INT)").unwrap();
+    engine
+        .execute("INSERT INTO t VALUES (1,10),(1,20)")
+        .unwrap();
+    for sql in [
+        "SELECT * FROM t GROUP BY a",
+        "SELECT t.* FROM t GROUP BY a WITH ROLLUP",
+        "SELECT d.* FROM (SELECT * FROM t) d GROUP BY d.a WITH ROLLUP",
+        "WITH d AS (SELECT t.* FROM t GROUP BY a WITH ROLLUP) SELECT * FROM d",
+    ] {
+        assert_eq!(engine.execute(sql).unwrap_err().code(), 1055, "{sql}");
+    }
+    assert_eq!(
+        query_rows(&engine, "SELECT t.* FROM t GROUP BY a,b WITH ROLLUP")
+            .iter()
+            .map(Vec::len)
+            .collect::<Vec<_>>(),
+        vec![2; 4]
+    );
+    let mut session = SessionContext::default();
+    engine
+        .execute_with_session(&mut session, "SET sql_mode=''")
+        .unwrap();
+    let QueryResponse::ResultSet(result) = engine
+        .execute_with_session(&mut session, "SELECT t.* FROM t GROUP BY a WITH ROLLUP")
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(result.columns.len(), 2);
+    assert!(result
+        .rows
+        .iter()
+        .all(|row| row.len() == result.columns.len()));
+}
+
+#[test]
+fn audit1123_rollup_constant_ordinal_and_grouping_errno() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = open_test_engine(dir.path());
+    engine.execute("CREATE TABLE t (a INT,b INT)").unwrap();
+    engine
+        .execute("INSERT INTO t VALUES (1,10),(1,20)")
+        .unwrap();
+    assert_eq!(
+        query_rows(
+            &engine,
+            "SELECT 1 AS x,COUNT(*) FROM t GROUP BY 1 WITH ROLLUP"
+        ),
+        vec![
+            vec![Value::Int(1), Value::Int(2)],
+            vec![Value::Null, Value::Int(2)]
+        ]
+    );
+    assert_eq!(
+        engine
+            .execute("SELECT a,GROUPING(b) FROM t GROUP BY a WITH ROLLUP")
+            .unwrap_err()
+            .code(),
+        3602
+    );
+}
+
+#[test]
+fn audit1123_rollup_collation_representative() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = open_test_engine(dir.path());
+    engine.execute("CREATE TABLE t (s VARCHAR(10))").unwrap();
+    engine
+        .execute("INSERT INTO t VALUES ('a'),('a '),('A')")
+        .unwrap();
+    let rows = query_rows(
+        &engine,
+        "SELECT s,HEX(s),COUNT(*) FROM t GROUP BY s WITH ROLLUP",
+    );
+    assert_eq!(rows.len(), 3);
+    let expected_hex = match &rows[0][0] {
+        Value::String(s) if s == "a" => "61",
+        Value::String(s) if s == "A" => "41",
+        other => panic!("invalid representative: {other:?}"),
+    };
+    assert_eq!(rows[0][1], Value::String(expected_hex.into()));
+    assert_eq!(rows[0][2], Value::Int(2));
+}
+
+#[test]
+fn audit1123_group_concat_cut_row_warning_survives_materialization() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = open_test_engine(dir.path());
+    let mut session = SessionContext::default();
+    engine
+        .execute_with_session(&mut session, "CREATE TABLE t (s VARCHAR(10))")
+        .unwrap();
+    engine
+        .execute_with_session(
+            &mut session,
+            "INSERT INTO t VALUES('a'),('bb'),('ccc'),('dddd')",
+        )
+        .unwrap();
+    engine
+        .execute_with_session(&mut session, "SET group_concat_max_len=5")
+        .unwrap();
+    for aggregate in [
+        "GROUP_CONCAT(s)",
+        "GROUP_CONCAT(s ORDER BY s)",
+        "GROUP_CONCAT(DISTINCT s ORDER BY s)",
+    ] {
+        let result = super::support::execute_materialized(
+            &engine,
+            &mut session,
+            &format!("SELECT {aggregate} FROM t"),
+        )
+        .unwrap();
+        let QueryResponse::ResultSet(result) = result else {
+            panic!()
+        };
+        assert_eq!(result.rows, vec![vec![Value::String("a,bb,".into())]]);
+        let QueryResponse::ResultSet(warnings) = engine
+            .execute_with_session(&mut session, "SHOW WARNINGS")
+            .unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(warnings.rows[0][1], Value::Int(1260));
+        assert_eq!(
+            warnings.rows[0][2],
+            Value::String("Row 3 was cut by GROUP_CONCAT()".into())
+        );
     }
 }

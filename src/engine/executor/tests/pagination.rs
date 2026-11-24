@@ -659,7 +659,8 @@ fn pagination_reordered_join_wildcards_keep_sql_column_order_and_metadata() {
                         assert_eq!(actual.rows, expected.rows, "{mode} {sql}");
                         assert_eq!(actual.columns, expected.columns, "{mode} {sql}");
                     }
-                    let derived = format!("SELECT * FROM ({sql}) q");
+                    let derived =
+                        format!("SELECT * FROM ({sql}) q(aid,label,bid,a_id,stamp,payload)");
                     assert_eq!(
                         query_rows(&engine, &derived),
                         expected.rows,

@@ -1005,6 +1005,13 @@ impl Database {
                     lsn,
                 };
             }
+            // The WAL overlay must reach DD before a checkpoint folds it away.
+            if !physical_replica {
+                if let Some(state) = db.auto_increment.get(table_id) {
+                    db.auto_increment_dirty.lock().map_err(|_| error(
+                        crate::error::catalog::ER_GET_ERRNO, "AUTO_INCREMENT dirty queue poisoned"))?.enqueue(state)?;
+                }
+            }
             if physical_replica {
                 db.replica_restartpoint_tracker
                     .lock()

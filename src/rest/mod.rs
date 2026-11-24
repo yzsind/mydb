@@ -456,8 +456,7 @@ async fn endpoint<E: QueryEngine>(
     if parts.get(2) == Some(&"sessions") && parts.len() >= 4 {
         let session = state.session(parts[3], &identity)?;
         if method == axum::http::Method::DELETE {
-            session.close().await;
-            state.sessions.lock().remove(&session.id);
+            session.close().await?;
             return Ok(StatusCode::NO_CONTENT.into_response());
         }
         if parts.len() == 4 {
@@ -717,8 +716,7 @@ async fn sql<E: QueryEngine>(
     )
     .await;
     if temporary && response.is_err() {
-        session.close().await;
-        state.sessions.lock().remove(&session.id);
+        let _ = session.close().await;
     }
     response.map_err(|error| error.with_request_id(id))
 }
@@ -771,7 +769,7 @@ async fn execute<E: QueryEngine>(
                 if let Some(connection) = &connection {
                     connection.close();
                 }
-                delivery_session.close().await;
+                let _ = delivery_session.close().await;
                 break;
             }
         }

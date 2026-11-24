@@ -1,0 +1,95 @@
+=========== DIFF #4 ===========
+SQL: SELECT 1, COUNT(*) FROM t1 GROUP BY 1 WITH ROLLUP
+--- mydb ---
+1	COUNT(*)
+1	9
+1	9
+--- mysql ---
+1	COUNT(*)
+1	9
+NULL	9
+
+=========== DIFF #7 ===========
+SQL: SELECT * FROM t1 JOIN t2 ON t1.a = t2.k GROUP BY t1.a, t2.v WITH ROLLUP
+--- mydb ---
+group_0	group_1
+1	p
+1	q
+2	r
+3	NULL
+1	NULL
+2	NULL
+3	NULL
+NULL	NULL
+--- mysql ---
+ERROR 1055 (42000) at line 1: Expression #2 of SELECT list is not in GROUP BY clause and contains nonaggregated column 'agg_audit.t1.b' which is not functionally dependent on columns in GROUP BY clause; this is incompatible with sql_mode=only_full_group_by
+
+=========== DIFF #8 ===========
+SQL: SELECT t1.*, t2.v FROM t1 JOIN t2 ON t1.a = t2.k GROUP BY t1.a, t2.v WITH ROLLUP
+--- mydb ---
+v
+p
+q
+r
+NULL
+NULL
+NULL
+NULL
+NULL
+--- mysql ---
+ERROR 1055 (42000) at line 1: Expression #2 of SELECT list is not in GROUP BY clause and contains nonaggregated column 'agg_audit.t1.b' which is not functionally dependent on columns in GROUP BY clause; this is incompatible with sql_mode=only_full_group_by
+
+=========== DIFF #9 ===========
+SQL: SELECT a, SUM(c) FROM t1 GROUP BY a WITH ROLLUP HAVING c > 0
+--- mydb ---
+ERROR 1055 (42000) at line 1: Expression of SELECT list is not in GROUP BY clause and contains nonaggregated column 'c' which is not functionally dependent on columns in GROUP BY clause; this is incompatible with sql_mode=only_full_group_by
+--- mysql ---
+ERROR 1054 (42S22) at line 1: Unknown column 'c' in 'having clause'
+
+=========== DIFF #19 ===========
+SQL: SELECT a, GROUPING(a+0) FROM t1 GROUP BY a WITH ROLLUP
+--- mydb ---
+ERROR 3580 (HY000) at line 1: argument '(`a` + 0)' of GROUPING function is not in GROUP BY
+--- mysql ---
+ERROR 3602 (HY000) at line 1: Argument #1 of GROUPING function is not in GROUP BY
+
+=========== DIFF #20 ===========
+SQL: SELECT a, GROUPING('x') FROM t1 GROUP BY a WITH ROLLUP
+--- mydb ---
+ERROR 3580 (HY000) at line 1: argument ''x'' of GROUPING function is not in GROUP BY
+--- mysql ---
+ERROR 3602 (HY000) at line 1: Argument #1 of GROUPING function is not in GROUP BY
+
+=========== DIFF #21 ===========
+SQL: SELECT a, GROUPING(b) FROM t1 GROUP BY a WITH ROLLUP
+--- mydb ---
+ERROR 3580 (HY000) at line 1: argument '`b`' of GROUPING function is not in GROUP BY
+--- mysql ---
+ERROR 3602 (HY000) at line 1: Argument #1 of GROUPING function is not in GROUP BY
+
+=========== DIFF #22 ===========
+SQL: SELECT a, GROUPING(a, b) FROM t1 GROUP BY a, b WITH ROLLUP ORDER BY 3 DESC
+--- mydb ---
+ERROR 1054 (42S22) at line 1: Unknown column '3' in 'order clause' at line 1, column 1
+--- mysql ---
+ERROR 1054 (42S22) at line 1: Unknown column '3' in 'order clause'
+
+=========== DIFF #28 ===========
+SQL: EXPLAIN SELECT g, h, COUNT(*) FROM tbig GROUP BY g, h WITH ROLLUP
+--- mydb ---
+id	select_type	table	partitions	type	possible_keys	key	key_len	ref	rows	filtered	Extra
+1	SIMPLE	tbig	NULL	ALL	NULL	NULL	NULL	NULL	20000	100	Using temporary; Using rollup; Accumulators: 1 agg, 2 group-key
+--- mysql ---
+id	select_type	table	partitions	type	possible_keys	key	key_len	ref	rows	filtered	Extra
+1	SIMPLE	tbig	NULL	ALL	NULL	NULL	NULL	NULL	19927	100.00	Using filesort
+
+=========== DIFF #29 ===========
+SQL: EXPLAIN SELECT a, SUM(c) FROM t1 GROUP BY a WITH ROLLUP
+--- mydb ---
+id	select_type	table	partitions	type	possible_keys	key	key_len	ref	rows	filtered	Extra
+1	SIMPLE	t1	NULL	ALL	NULL	NULL	NULL	NULL	9	100	Using temporary; Using rollup; Accumulators: 1 agg, 1 group-key
+--- mysql ---
+id	select_type	table	partitions	type	possible_keys	key	key_len	ref	rows	filtered	Extra
+1	SIMPLE	t1	NULL	ALL	NULL	NULL	NULL	NULL	9	100.00	Using filesort
+
+RESULT: PASS=19 FAIL=10

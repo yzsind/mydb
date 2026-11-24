@@ -19,7 +19,7 @@ TRUNCATE(number, decimals)
 
 ## Return Value
 
-Returns the number with digits discarded toward zero at the requested decimal position. Negative decimals discard digits to the left of the decimal point. SQL NULL returns NULL; this operation does not round a half value upward.
+Returns the number with digits discarded toward zero at the requested decimal position. Negative decimals discard digits to the left of the decimal point. SQL NULL returns NULL; this operation does not round a half value upward. A non-integer `decimals` follows MySQL's integer conversion: exact DECIMAL values round half away from zero, approximate values round to the nearest even integer, and strings truncate toward zero.
 
 ## Examples
 

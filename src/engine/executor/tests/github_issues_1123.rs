@@ -146,6 +146,7 @@ fn issue81_collate_validates_binary_sources_before_execution() {
         .execute("INSERT INTO binary_sources(b,c) VALUES(X'61','a')")
         .unwrap();
     for sql in [
+        "SELECT x'61' COLLATE utf8mb4_bin",
         "SELECT UPPER(x'c3bf' COLLATE utf8mb4_bin)",
         "SELECT _binary 'a' COLLATE utf8mb4_bin",
         "SELECT CAST('a' AS BINARY) COLLATE utf8mb4_bin",
@@ -197,6 +198,20 @@ fn issue81_collate_validates_binary_sources_before_execution() {
         ),
         vec![vec!["a"]]
     );
+    for (value, expected) in [("'a'", "a"), ("NULL", "NULL"), ("1", "1"), ("X'61'", "a")] {
+        engine
+            .execute_with_session(&mut session, &format!("SET @binary_value={value}"))
+            .unwrap();
+        assert_eq!(
+            rows(
+                &engine,
+                &mut session,
+                "EXECUTE bound_collate USING @binary_value"
+            ),
+            vec![vec![expected]],
+            "{value}"
+        );
+    }
 }
 
 #[test]
@@ -379,17 +394,44 @@ fn issue76_show_tables_like_metadata_matches_execution_and_prepare() {
     let (_dir, engine, mut session) = setup();
     engine.execute("CREATE TABLE issue_table(id INT)").unwrap();
     for full in ["", "FULL "] {
-        let sql = format!("SHOW {full}TABLES LIKE 'issue_%'");
-        let result = engine
-            .execute_with_session(&mut session, &sql)
-            .unwrap()
-            .materialize()
-            .unwrap();
-        let QueryResponse::ResultSet(result) = result else {
-            panic!("{sql}")
-        };
-        assert_eq!(result.columns[0].name, "Tables_in_test (issue_%)");
-        assert_eq!(result.rows.len(), 1);
+        for (database, pattern, heading) in [
+            ("", "issue_%", "Tables_in_test"),
+            (
+                " FROM INFORMATION_SCHEMA",
+                "TABLES",
+                "Tables_in_information_schema",
+            ),
+            (
+                " FROM PERFORMANCE_SCHEMA",
+                "threads",
+                "Tables_in_performance_schema",
+            ),
+        ] {
+            let sql = format!("SHOW {full}TABLES{database} LIKE '{pattern}'");
+            let prepared = engine
+                .describe_prepared_statement(&mut session, &sql)
+                .unwrap();
+            let result = engine
+                .execute_with_session(&mut session, &sql)
+                .unwrap()
+                .materialize()
+                .unwrap();
+            let QueryResponse::ResultSet(result) = result else {
+                panic!("{sql}")
+            };
+            assert_eq!(
+                result.columns[0].name,
+                format!("{heading} ({pattern})"),
+                "{sql}"
+            );
+            assert_eq!(prepared, result.columns, "{sql}");
+            assert_eq!(
+                result.columns.len(),
+                if full.is_empty() { 1 } else { 7 },
+                "{sql}"
+            );
+            assert_eq!(result.rows.len(), 1, "{sql}");
+        }
     }
     engine
         .execute_with_session(

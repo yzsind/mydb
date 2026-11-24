@@ -3400,7 +3400,9 @@ fn base_table_row(db: &Database, table: &TableSchema) -> Result<Vec<Value>, Quer
         Value::Int(saturating_i64(stats.data_free)),
         auto_increment,
         mysql_time_value(table.created_ms),
-        Value::Null,
+        db.table_update_time_ms(table.id)
+            .map(mysql_time_value)
+            .unwrap_or(Value::Null),
         Value::Null,
         s(&table.collation),
         Value::Null,
@@ -3460,7 +3462,11 @@ fn system_table_row(def: &SystemTableDef) -> Vec<Value> {
         pfs.and_then(|metadata| metadata.row_format)
             .map(s)
             .unwrap_or(Value::Null),
-        number(pfs.and_then(|metadata| metadata.table_rows)),
+        if def.schema.eq_ignore_ascii_case("information_schema") {
+            Value::Int(0)
+        } else {
+            number(pfs.and_then(|metadata| metadata.table_rows))
+        },
         number(pfs.and_then(|metadata| metadata.avg_row_length)),
         number(pfs.and_then(|metadata| metadata.data_length)),
         number(pfs.and_then(|metadata| metadata.max_data_length)),
@@ -3547,7 +3553,7 @@ fn append_view_column_rows(
     request: &SystemScanRequest,
     view: &crate::storage::ViewSchema,
 ) {
-    if !vis.table_visible(&view.database, &view.name) {
+    if view.invalid || !vis.table_visible(&view.database, &view.name) {
         return;
     }
     let mut privilege_checker = vis.column_privilege_checker(&view.database, &view.name);
@@ -3767,7 +3773,7 @@ fn view_column_row(
         } else {
             Value::Null
         },
-        s(&mysql_type_name_with_unsigned(data_type, column.unsigned)),
+        s(&crate::engine::show::mysql_view_column_type_name(column)),
         s(""),
         s(""),
         s(privileges),
@@ -4029,6 +4035,9 @@ fn key_column_usage_rows(db: &Database) -> Vec<Vec<Value>> {
         }
         for index in table.iter_public_indexes().filter(|index| index.unique) {
             for (idx, column) in index.columns.iter().enumerate() {
+                if index.key_expression(idx).is_some() {
+                    continue;
+                }
                 rows.push(vec![
                     s("def"),
                     s(&table.database),
@@ -5114,15 +5123,14 @@ fn column_privileges_rows(db: &Database) -> Vec<Vec<Value>> {
         .collect()
 }
 
-fn current_privilege_grantees(auth: &AuthCatalog) -> std::collections::BTreeSet<AccountKey> {
-    let Some((ctx, system)) = crate::engine::expr::current_authorization_context() else {
-        return std::collections::BTreeSet::new();
-    };
-    // MySQL exposes all grantees to a reader of the mysql schema. A grant
-    // on mysql.user alone does not broaden these I_S privilege projections.
-    if system
+fn can_read_all_accounts(
+    auth: &AuthCatalog,
+    ctx: &crate::engine::auth::AuthorizationContext,
+    system: bool,
+) -> bool {
+    system
         || auth.account_has_privilege(
-            &ctx,
+            ctx,
             &RequiredPrivilege {
                 privilege: Privilege::Select,
                 scope: PrivilegeScope::Database {
@@ -5131,7 +5139,15 @@ fn current_privilege_grantees(auth: &AuthCatalog) -> std::collections::BTreeSet<
             },
             false,
         )
-    {
+}
+
+fn current_privilege_grantees(auth: &AuthCatalog) -> std::collections::BTreeSet<AccountKey> {
+    let Some((ctx, system)) = crate::engine::expr::current_authorization_context() else {
+        return std::collections::BTreeSet::new();
+    };
+    // MySQL exposes all grantees to a reader of the mysql schema. A grant
+    // on mysql.user alone does not broaden these I_S privilege projections.
+    if can_read_all_accounts(auth, &ctx, system) {
         return auth
             .accounts
             .values()
@@ -5510,20 +5526,24 @@ fn columns_extensions_rows(db: &Database) -> Vec<Vec<Value>> {
 }
 
 fn table_constraints_extensions_rows(db: &Database) -> Vec<Vec<Value>> {
-    table_constraints_rows(db)
-        .into_iter()
-        .filter(|row| row.len() >= 5)
-        .map(|row| {
-            vec![
-                row[0].clone(),
-                row[1].clone(),
-                row[2].clone(),
-                row[4].clone(),
+    let vis = Visibility::compute(db);
+    let mut rows = Vec::new();
+    for table in db.catalog().tables.values() {
+        if !vis.table_visible(&table.database, &table.name) {
+            continue;
+        }
+        for index in table.iter_public_indexes() {
+            rows.push(vec![
+                s("def"),
+                s(&table.database),
+                s(&index.name),
+                s(&table.name),
                 Value::Null,
                 Value::Null,
-            ]
-        })
-        .collect()
+            ]);
+        }
+    }
+    rows
 }
 
 fn user_attributes_rows(db: &Database) -> Vec<Vec<Value>> {
@@ -5531,10 +5551,11 @@ fn user_attributes_rows(db: &Database) -> Vec<Vec<Value>> {
     let Some((ctx, system)) = crate::engine::expr::current_authorization_context() else {
         return Vec::new();
     };
+    let all_accounts = can_read_all_accounts(&auth, &ctx, system);
     let mut rows = auth
         .accounts
         .values()
-        .filter(|account| system || account.key == ctx.authenticated_as)
+        .filter(|account| all_accounts || account.key == ctx.authenticated_as)
         .map(|account| {
             vec![
                 s(&account.key.user),
@@ -5632,9 +5653,9 @@ fn st_units_of_measure_rows() -> Vec<Vec<Value>> {
         .map(|unit| {
             vec![
                 s(unit.name),
-                s(unit.unit_type),
+                s(&unit.unit_type.to_ascii_uppercase()),
                 Value::Double(unit.conversion_factor),
-                unit.description.map(s).unwrap_or(Value::Null),
+                s(unit.description.unwrap_or("")),
             ]
         })
         .collect()
@@ -6346,7 +6367,12 @@ fn innodb_tablespaces_brief_rows(db: &Database) -> Vec<Vec<Value>> {
                             "{}/{}#p#{}#sp#{}",
                             table.database, table.name, partition.name, sub.name
                         )),
-                        s(&path.to_string_lossy()),
+                        s(&format!(
+                            "./{}",
+                            path.strip_prefix(db.data_dir())
+                                .unwrap_or(&path)
+                                .to_string_lossy()
+                        )),
                         Value::Null,
                         s("Single"),
                     ]);
@@ -6364,7 +6390,12 @@ fn innodb_tablespaces_brief_rows(db: &Database) -> Vec<Vec<Value>> {
                             "{}/{}#p#{}",
                             table.database, table.name, partition.name
                         )),
-                        s(&path.to_string_lossy()),
+                        s(&format!(
+                            "./{}",
+                            path.strip_prefix(db.data_dir())
+                                .unwrap_or(&path)
+                                .to_string_lossy()
+                        )),
                         Value::Null,
                         s("Single"),
                     ]);
@@ -6381,7 +6412,12 @@ fn innodb_tablespaces_brief_rows(db: &Database) -> Vec<Vec<Value>> {
         rows.push(vec![
             Value::Int(saturating_i64(table.id)),
             s(&innodb_qualified_name(table)),
-            s(&path.to_string_lossy()),
+            s(&format!(
+                "./{}",
+                path.strip_prefix(db.data_dir())
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+            )),
             Value::Null,
             s("Single"),
         ]);
@@ -6408,7 +6444,12 @@ fn innodb_datafiles_rows(db: &Database) -> Vec<Vec<Value>> {
                     );
                     rows.push(vec![
                         s(&sub.storage_id.to_string()),
-                        s(&path.to_string_lossy()),
+                        s(&format!(
+                            "./{}",
+                            path.strip_prefix(db.data_dir())
+                                .unwrap_or(&path)
+                                .to_string_lossy()
+                        )),
                     ]);
                 }
                 if partition.subpartitions.is_empty() {
@@ -6420,7 +6461,12 @@ fn innodb_datafiles_rows(db: &Database) -> Vec<Vec<Value>> {
                     );
                     rows.push(vec![
                         s(&partition.storage_id.to_string()),
-                        s(&path.to_string_lossy()),
+                        s(&format!(
+                            "./{}",
+                            path.strip_prefix(db.data_dir())
+                                .unwrap_or(&path)
+                                .to_string_lossy()
+                        )),
                     ]);
                 }
             }
@@ -6432,7 +6478,15 @@ fn innodb_datafiles_rows(db: &Database) -> Vec<Vec<Value>> {
             table.active_generation.max(1),
             "heap",
         );
-        rows.push(vec![s(&table.id.to_string()), s(&path.to_string_lossy())]);
+        rows.push(vec![
+            s(&table.id.to_string()),
+            s(&format!(
+                "./{}",
+                path.strip_prefix(db.data_dir())
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+            )),
+        ]);
     }
 
     rows
@@ -6559,7 +6613,12 @@ fn files_row(
     );
     vec![
         Value::Int(saturating_i64(storage_id)),
-        s(&path.to_string_lossy()),
+        s(&format!(
+            "./{}",
+            path.strip_prefix(db.data_dir())
+                .unwrap_or(&path)
+                .to_string_lossy()
+        )),
         s("TABLESPACE"),
         s(tablespace_name),
         s("def"),
@@ -6591,7 +6650,9 @@ fn files_row(
         Value::Int(saturating_i64(stats.index_length)),
         Value::Int(saturating_i64(stats.data_free)),
         mysql_time_value(table.created_ms),
-        Value::Null,
+        db.table_update_time_ms(table.id)
+            .map(mysql_time_value)
+            .unwrap_or(Value::Null),
         Value::Null,
         Value::Null,
         s("NORMAL"),

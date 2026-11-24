@@ -39,7 +39,7 @@ async fn open(h: &Harness) -> Arc<sql::Session<StorageQueryEngine>> {
 async fn audit_closed_session_execution_is_rejected_without_panic() {
     let h = Harness::new(McpConfig::default());
     let session = open(&h).await;
-    session.close().await;
+    session.close().await.unwrap();
     let state = h.sql.clone();
     let survived = tokio::spawn(async move {
         sql::start(

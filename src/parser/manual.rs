@@ -2169,8 +2169,12 @@ pub(super) fn parse_manual_mysql_admin_statement(sql: &str) -> Option<Statement>
         "ALTER SYSTEM RELOAD HTTP CONFIG" => return Some(Statement::AlterSystemReloadHttpConfig),
         "SHOW HTTP STATUS" => return Some(Statement::ShowHttpStatus),
         "ALTER SYSTEM CHECKPOINT" => return Some(Statement::AlterSystemCheckpoint),
-        "ALTER SYSTEM FLUSH DATA_CACHE" => return Some(Statement::AlterSystemFlushDataCache),
-        "ALTER SYSTEM FLUSH SQL_CACHE" => return Some(Statement::AlterSystemFlushSqlCache),
+        "ALTER SYSTEM FLUSH DATA_CACHE" | "ALTER SYSTEM FLUSH DATA CACHE" => {
+            return Some(Statement::AlterSystemFlushDataCache)
+        }
+        "ALTER SYSTEM FLUSH SQL_CACHE" | "ALTER SYSTEM FLUSH SQL CACHE" => {
+            return Some(Statement::AlterSystemFlushSqlCache)
+        }
         _ => {}
     }
 
@@ -3020,6 +3024,17 @@ fn parse_optional_show_limit(
                 row_count,
             }),
             after_row_count,
+        ));
+    }
+    if let Some(after_offset) = consume_keyword_at(sql, idx, "OFFSET") {
+        let (offset, end) = parse_usize_literal_at(sql, after_offset)
+            .ok_or_else(|| parse_error_at_zero("SHOW diagnostics OFFSET requires a row offset"))?;
+        return Ok((
+            Some(ShowLimit {
+                offset,
+                row_count: first,
+            }),
+            end,
         ));
     }
     Ok((

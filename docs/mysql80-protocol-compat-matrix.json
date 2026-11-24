@@ -50,10 +50,10 @@
   "evidence": {
     "review_scope": "Source and documentation contract review; focused regression and local protocol rehearsal. This fingerprint is a review trigger, not proof all combinations are supported.",
     "source_sha256": {
-      "src/mysql/protocol.rs": "b6ad38173b082ceca2dd9160457405b8d70feb43310c48c43644b1b1fade3854",
+      "src/mysql/protocol.rs": "e8f7dce21b31122c1bb68cc1ff1d0a7ae3524170574791804c9d220fe7c2a547",
       "src/mysql/server.rs": "80499aca67183a4f19e3f04dd5394fefec0dc7167fa703ba359e08a53aee107b",
-      "src/mysql/session.rs": "729d3ffa61a45b291e5d3ad77024c4c0ad89cae49437bea3db5413e49e640542",
-      "src/binlog.rs": "ee172caeea7dedb9def047f8ee354b76ec9770a0a33cfcc1b372e04e09518301",
+      "src/mysql/session.rs": "1fc8dea25e38d1d977b716addd510fdc377b363fffcd344097110bfe16e0da50",
+      "src/binlog.rs": "bae185c6e1673051e888b91919355df32b3827dc7cfb6111f79984ac75e1eadd",
       "src/mysql/peer_monitor.rs": "2664258b1e0b97bdd36da7735f24a32826af97f9ffbbd63987d8152fd1e104f6"
     },
     "test_sources": [
@@ -69,6 +69,9 @@
       "src/mysql/session/disconnect_tests.rs",
       "src/mysql/peer_monitor.rs",
       "src/mysql/session.rs",
+      "src/mysql/protocol.rs",
+      "src/engine/executor/tests/binlog_admin_metadata.rs",
+      "src/engine/executor/tests/release_audit_1123.rs",
       "src/engine/executor/tests/github_release_audit.rs"
     ],
     "update_policy": "Review changed capability/command behavior, run relevant regressions, then refresh source hashes and reviewed_at together."

@@ -14,6 +14,9 @@
 //!   7. `avx512-batch`: exact FP32 query batching with shared database loads.
 //!   8. `f16c`, `bf16`, `avx-vnni`, `avx512-vnni256`, `avx512-vnni`: compressed input experiments.
 //!      Database encoding is reported separately; query conversion is timed.
+//!   9. `gpu`: bounded GPU filtering with exact FP32 NEON refinement.
+//!      Small batches use FP16 storage/FP32 accumulation with conversion-aware bounds.
+//!      Database upload is setup; query upload, GPU completion and CPU top-k are timed.
 //!
 //! Find L2 top-k neighbors for batches of queries against `DB` vectors of dimension `DIM`.
 //! Each worker processes its own query batch; measure wall-clock throughput with 1/2/4/8/16 threads.
@@ -32,7 +35,9 @@
 //!   VS_SME_BATCH_ROWS: SME batch rows (default 512, matching production).
 //!   VS_DIM_SWEEP=1: additionally sweep {128,384,768,1536} dimensions with one thread.
 //!   VS_METHODS: comma-separated method keys, including avx512-batch, f16c,
-//!      bf16, avx-vnni, avx512-vnni256, avx512-vnni. Compressed methods report FP32 recall.
+//!      bf16, avx-vnni, avx512-vnni256, avx512-vnni, gpu. Compressed methods report FP32 recall.
+//!   VS_GPU_KERNEL: auto (default), filter, tiled or mps; all use original FP32 NEON refinement.
+//!   VS_GPU_PROFILE=1: emit allocation/encoding/wait/GPU/refinement timings to stderr.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -40,6 +45,10 @@ use std::time::Instant;
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
 #[path = "vector_search_bench/sme.rs"]
 mod sme;
+
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+#[path = "vector_search_bench/gpu.rs"]
+mod gpu;
 
 #[cfg(target_arch = "x86_64")]
 #[path = "vector_search_bench/x86.rs"]
@@ -533,6 +542,7 @@ enum Method {
     Sme,
     SmeMatrix,
     Amx,
+    Gpu,
     Avx2,
     Avx512,
     Avx512Batch,
@@ -550,6 +560,7 @@ impl Method {
             Method::Sme => "sme(streaming)",
             Method::SmeMatrix => "sme(matrix)",
             Method::Amx => "amx(accelerate)",
+            Method::Gpu => "gpu(metal,refined)",
             Method::Avx2 => "avx2(fma)",
             Method::Avx512 => "avx512(fma)",
             Method::Avx512Batch => "avx512-batch(fp32)",
@@ -568,6 +579,7 @@ impl Method {
             Self::Sme => "sme-streaming",
             Self::SmeMatrix => "sme",
             Self::Amx => "amx",
+            Self::Gpu => "gpu",
             Self::Avx2 => "avx2",
             Self::Avx512 => "avx512",
             Self::Avx512Batch => "avx512-batch",
@@ -595,6 +607,16 @@ impl Method {
                 }
             }
             Self::Amx => cfg!(target_os = "macos"),
+            Self::Gpu => {
+                #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+                {
+                    gpu::available()
+                }
+                #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
+                {
+                    false
+                }
+            }
             Self::Avx2 => {
                 #[cfg(target_arch = "x86_64")]
                 {
@@ -643,6 +665,8 @@ impl Method {
 
 struct Shared {
     db: Vec<f32>,
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    gpu: Option<gpu::Prepared>,
     #[cfg(target_os = "macos")]
     xnorm: Vec<f32>,
     queries: Vec<f32>, // All queries needed at maximum concurrency.
@@ -686,6 +710,14 @@ fn run_config(sh: &Arc<Shared>, method: Method, threads: usize) -> (f64, f64) {
                 }
                 #[cfg(not(target_os = "macos"))]
                 Method::Amx => unreachable!("Accelerate is unavailable"),
+                #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+                Method::Gpu => sh
+                    .gpu
+                    .as_ref()
+                    .expect("GPU database not prepared")
+                    .search(q, &sh.db, sh.k, &sh.xnorm),
+                #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
+                Method::Gpu => unreachable!("Apple GPU mode is unavailable"),
                 #[cfg(target_arch = "x86_64")]
                 Method::Avx2 => x86::search_avx2(q, &sh.db, sh.dim, sh.n, sh.k),
                 #[cfg(target_arch = "x86_64")]
@@ -770,6 +802,7 @@ fn main() {
         Method::Sme,
         Method::SmeMatrix,
         Method::Amx,
+        Method::Gpu,
     ];
     if let Ok(filter) = std::env::var("VS_METHODS") {
         let requested: Vec<_> = filter.split(',').map(str::trim).collect();
@@ -838,7 +871,13 @@ fn main() {
     )
     .expect("database encoding failed");
 
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    let gpu = methods
+        .contains(&Method::Gpu)
+        .then(|| gpu::Prepared::new(&db, dim).expect("GPU setup failed"));
     let sh = Arc::new(Shared {
+        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+        gpu,
         db,
         #[cfg(target_os = "macos")]
         xnorm,
@@ -889,9 +928,26 @@ fn main() {
     }
 
     #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-    if methods.contains(&Method::SmeMatrix) {
-        let actual =
-            search_sme_matrix_topk(&sh.queries, &sh.db, dim, n, k, sme_batch_rows, &sh.xnorm);
+    for method in [Method::SmeMatrix, Method::Gpu] {
+        if !methods.contains(&method) {
+            continue;
+        }
+        let actual = if method == Method::Gpu {
+            // Validate the actual per-worker batch size and backend selection,
+            // rather than a merged batch that can select a different GPU path.
+            sh.queries
+                .chunks_exact(qpt * dim)
+                .flat_map(|queries| {
+                    sh.gpu
+                        .as_ref()
+                        .unwrap()
+                        .topk(queries, &sh.db, k, &sh.xnorm)
+                        .expect("GPU validation failed")
+                })
+                .collect()
+        } else {
+            search_sme_matrix_topk(&sh.queries, &sh.db, dim, n, k, sme_batch_rows, &sh.xnorm)
+        };
         for (qi, got) in actual.iter().enumerate() {
             let q = &sh.queries[qi * dim..(qi + 1) * dim];
             let mut reference = TopK::new(k);
@@ -900,12 +956,15 @@ fn main() {
                 reference.push(unsafe { l2_neon(q, row) }, j as u32);
             }
             assert_eq!(
-                got.buf, reference.buf,
-                "SME matrix top-k mismatch, query {qi}"
+                got.buf,
+                reference.buf,
+                "{} top-k mismatch, query {qi}",
+                method.name()
             );
         }
         println!(
-            "  sme(matrix): all {} queries match direct NEON top-k IDs, order, and distance bits",
+            "  {}: all {} queries match direct NEON top-k IDs, order, and distance bits",
+            method.name(),
             actual.len()
         );
     }
@@ -1001,7 +1060,13 @@ fn main() {
                 .chunks_exact(d)
                 .map(|r| r.iter().map(|v| v * v).sum())
                 .collect();
+            #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+            let gpu = methods
+                .contains(&Method::Gpu)
+                .then(|| gpu::Prepared::new(&db, d).expect("GPU sweep setup failed"));
             let sweep = Arc::new(Shared {
+                #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+                gpu,
                 db,
                 #[cfg(target_os = "macos")]
                 xnorm,

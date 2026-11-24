@@ -1,0 +1,251 @@
+=========== DIFF #2 ===========
+SQL: SELECT c, COUNT(*) FROM t1 GROUP BY a WITH ROLLUP
+--- mydb ---
+ERROR 1055 (42000) at line 1: Expression of SELECT list is not in GROUP BY clause and contains nonaggregated column 'c' which is not functionally dependent on columns in GROUP BY clause; this is incompatible with sql_mode=only_full_group_by
+--- mysql ---
+ERROR 1055 (42000) at line 1: Expression #1 of SELECT list is not in GROUP BY clause and contains nonaggregated column 'agg_audit.t1.c' which is not functionally dependent on columns in GROUP BY clause; this is incompatible with sql_mode=only_full_group_by
+
+=========== DIFF #4 ===========
+SQL: SELECT SUM(SUM(a)) FROM t1
+--- mydb ---
+ERROR 1111 (HY000) at line 1: invalid use of group function 'SUM'
+--- mysql ---
+ERROR 1111 (HY000) at line 1: Invalid use of group function
+
+=========== DIFF #5 ===========
+SQL: SELECT SUM(a) FROM t1 GROUP BY a WITH ROLLUP GROUP BY b
+--- mydb ---
+ERROR 1064 (42000) at line 1: sql parser error: Expected: end of statement, found: GROUP at line 1, column 46
+--- mysql ---
+ERROR 1064 (42000) at line 1: You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near 'GROUP BY b' at line 1
+
+=========== DIFF #6 ===========
+SQL: SELECT SUM(c) FROM t1 GROUP BY b WITH ROLLUP ORDER BY SUM(c) DESC, 3
+--- mydb ---
+ERROR 1054 (42S22) at line 1: Unknown column '3' in 'order clause' at line 1, column 1
+--- mysql ---
+ERROR 1054 (42S22) at line 1: Unknown column '3' in 'order clause'
+
+=========== DIFF #7 ===========
+SQL: SELECT GROUPING(a) FROM t1
+--- mydb ---
+ERROR 1111 (HY000) at line 1: GROUPING requires ROLLUP or grouping sets
+--- mysql ---
+ERROR 1111 (HY000) at line 1: Invalid use of group function
+
+=========== DIFF #8 ===========
+SQL: SELECT GROUPING(c), COUNT(*) FROM t1 GROUP BY a, c WITH ROLLUP
+--- mydb ---
+GROUPING(c)	COUNT(*)
+0	1
+0	1
+0	1
+0	1
+0	1
+0	1
+0	1
+0	1
+0	1
+1	2
+1	3
+1	2
+1	2
+1	9
+--- mysql ---
+GROUPING(c)	COUNT(*)
+0	1
+0	1
+1	2
+0	1
+0	1
+0	1
+1	3
+0	1
+0	1
+1	2
+0	1
+0	1
+1	2
+1	9
+
+=========== DIFF #9 ===========
+SQL: SELECT a, GROUPING(a) FROM t1 GROUP BY a, b WITH ROLLUP
+--- mydb ---
+a	GROUPING(a)
+NULL	0
+NULL	0
+1	0
+1	0
+1	0
+2	0
+2	0
+3	0
+3	0
+NULL	0
+1	0
+2	0
+3	0
+NULL	1
+--- mysql ---
+a	GROUPING(a)
+NULL	0
+NULL	0
+NULL	0
+1	0
+1	0
+1	0
+1	0
+2	0
+2	0
+2	0
+3	0
+3	0
+3	0
+NULL	1
+
+=========== DIFF #10 ===========
+SQL: SELECT COUNT(a, b) FROM t1
+--- mydb ---
+ERROR 1064 (42000) at line 1: incorrect parameter count in the call to native function 'COUNT' at line 1, column 1
+--- mysql ---
+ERROR 1064 (42000) at line 1: You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near ', b) FROM t1' at line 1
+
+=========== DIFF #12 ===========
+SQL: SELECT * FROM t1 GROUP BY a WITH ROLLUP
+--- mydb ---
+group_0
+NULL
+1
+2
+3
+NULL
+--- mysql ---
+ERROR 1055 (42000) at line 1: Expression #2 of SELECT list is not in GROUP BY clause and contains nonaggregated column 'agg_audit.t1.b' which is not functionally dependent on columns in GROUP BY clause; this is incompatible with sql_mode=only_full_group_by
+
+=========== DIFF #13 ===========
+SQL: SELECT a, b, MAX(c) FROM t1 GROUP BY a WITH ROLLUP
+--- mydb ---
+ERROR 1055 (42000) at line 1: Expression of SELECT list is not in GROUP BY clause and contains nonaggregated column 'b' which is not functionally dependent on columns in GROUP BY clause; this is incompatible with sql_mode=only_full_group_by
+--- mysql ---
+ERROR 1055 (42000) at line 1: Expression #2 of SELECT list is not in GROUP BY clause and contains nonaggregated column 'agg_audit.t1.b' which is not functionally dependent on columns in GROUP BY clause; this is incompatible with sql_mode=only_full_group_by
+
+=========== DIFF #14 ===========
+SQL: SELECT a, SUM(c) FROM t1 GROUP BY a WITH ROLLUP ORDER BY b
+--- mydb ---
+ERROR 1055 (42000) at line 1: Expression of SELECT list is not in GROUP BY clause and contains nonaggregated column 'b' which is not functionally dependent on columns in GROUP BY clause; this is incompatible with sql_mode=only_full_group_by
+--- mysql ---
+ERROR 1055 (42000) at line 1: Expression #1 of ORDER BY clause is not in GROUP BY clause and contains nonaggregated column 'agg_audit.t1.b' which is not functionally dependent on columns in GROUP BY clause; this is incompatible with sql_mode=only_full_group_by
+
+=========== DIFF #16 ===========
+SQL: SELECT AVG(x) FROM tagg GROUP BY id WITH ROLLUP ORDER BY x
+--- mydb ---
+ERROR 1055 (42000) at line 1: Expression of SELECT list is not in GROUP BY clause and contains nonaggregated column 'x' which is not functionally dependent on columns in GROUP BY clause; this is incompatible with sql_mode=only_full_group_by
+--- mysql ---
+ERROR 1055 (42000) at line 1: Expression #1 of ORDER BY clause is not in GROUP BY clause and contains nonaggregated column 'agg_audit.tagg.x' which is not functionally dependent on columns in GROUP BY clause; this is incompatible with sql_mode=only_full_group_by
+
+=========== DIFF #17 ===========
+SQL: SELECT a, b, SUM(c) FROM t1 GROUP BY a, b WITH ROLLUP
+--- mydb ---
+a	b	SUM(c)
+NULL	NULL	70
+NULL	y	60
+1	NULL	30
+1	x	10
+1	y	20
+2	NULL	50
+2	x	40
+3	x	-10
+3	y	NULL
+NULL	NULL	130
+1	NULL	60
+2	NULL	90
+3	NULL	-10
+NULL	NULL	270
+--- mysql ---
+a	b	SUM(c)
+NULL	NULL	70
+NULL	y	60
+NULL	NULL	130
+1	NULL	30
+1	x	10
+1	y	20
+1	NULL	60
+2	NULL	50
+2	x	40
+2	NULL	90
+3	x	-10
+3	y	NULL
+3	NULL	-10
+NULL	NULL	270
+
+=========== DIFF #18 ===========
+SQL: SELECT a, b, SUM(c) FROM t1 GROUP BY a, b WITH ROLLUP
+--- mydb ---
+a	b	SUM(c)
+NULL	NULL	70
+NULL	y	60
+1	NULL	30
+1	x	10
+1	y	20
+2	NULL	50
+2	x	40
+3	x	-10
+3	y	NULL
+NULL	NULL	130
+1	NULL	60
+2	NULL	90
+3	NULL	-10
+NULL	NULL	270
+--- mysql ---
+a	b	SUM(c)
+NULL	NULL	70
+NULL	y	60
+NULL	NULL	130
+1	NULL	30
+1	x	10
+1	y	20
+1	NULL	60
+2	NULL	50
+2	x	40
+2	NULL	90
+3	x	-10
+3	y	NULL
+3	NULL	-10
+NULL	NULL	270
+
+=========== DIFF #19 ===========
+SQL: SELECT COUNT(*), count(*), CoUnT(*) FROM t1 GROUP BY a, b WITH ROLLUP
+--- mydb ---
+COUNT(*)	count(*)	CoUnT(*)
+1	1	1
+1	1	1
+1	1	1
+1	1	1
+1	1	1
+1	1	1
+1	1	1
+1	1	1
+1	1	1
+2	2	2
+3	3	3
+2	2	2
+2	2	2
+9	9	9
+--- mysql ---
+COUNT(*)	count(*)	CoUnT(*)
+1	1	1
+1	1	1
+2	2	2
+1	1	1
+1	1	1
+1	1	1
+3	3	3
+1	1	1
+1	1	1
+2	2	2
+1	1	1
+1	1	1
+2	2	2
+9	9	9
+
+RESULT: PASS=13 FAIL=15

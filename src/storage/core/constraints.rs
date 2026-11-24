@@ -4160,7 +4160,24 @@ fn next_auto_increment_after(current: u64, step: u64, offset: u64) -> Result<u64
     })
 }
 
+fn copied_auto_increment_id(table: &TableSchema, row: &[Value]) -> u64 {
+    match table.auto_increment_column_index().and_then(|idx| row.get(idx)) {
+        Some(Value::UInt(value)) => *value,
+        Some(Value::Int(value)) => *value as u64,
+        _ => 0,
+    }
+}
+
+fn normalize_auto_increment_input(value: &mut Value, column: &ColumnSchema) -> Result<(), QueryError> {
+    if !matches!(value, Value::Null | Value::Int(_) | Value::UInt(_)) {
+        *value = coerce_value_with_unsigned(value.clone(), &column.data_type, column.unsigned, &column.name)?;
+    }
+    Ok(())
+}
+
 fn should_assign_auto_increment(value: &Value) -> bool {
+    // ROW images contain the authoritative value, including explicit zero.
+    if crate::replication::replication_applier_active() { return false; }
     match value {
         Value::Null => true,
         Value::Int(0) | Value::UInt(0) => {

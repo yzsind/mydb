@@ -244,8 +244,27 @@ pub fn build_fk_runtime(catalog: &mut Catalog) {
         }
         child_idx.insert(child_key.clone(), per_fk);
     }
+    // Cold headers have unknown outbound edges. Preserve their previously
+    // resolved inbound edges on warm parents until the child is loaded.
+    for (key, table) in &catalog.tables {
+        if table.columns.is_empty() {
+            continue;
+        }
+        for edge in &table.fk_referenced_by {
+            if catalog
+                .tables
+                .get(&edge.child_table_key)
+                .is_some_and(|child| child.id == edge.child_table_id && child.columns.is_empty())
+            {
+                inbound.entry(key.clone()).or_default().push(edge.clone());
+            }
+        }
+    }
     // Mutation pass.
     for (key, table) in &mut catalog.tables {
+        if table.columns.is_empty() {
+            continue;
+        }
         let needs_child = child_idx.contains_key(key);
         let needs_inbound = inbound.contains_key(key);
         if !needs_child && !needs_inbound && table.fk_referenced_by.is_empty() {
@@ -351,6 +370,10 @@ pub struct ViewColumnDef {
     pub collation: Option<String>,
     #[serde(default)]
     pub unsigned: bool,
+    #[serde(default)]
+    pub zerofill: bool,
+    #[serde(default)]
+    pub display_width: Option<u16>,
     #[serde(default)]
     pub default_value: Option<String>,
 }
@@ -1528,7 +1551,22 @@ impl TableSchema {
                 .indexes
                 .iter()
                 .find(|index| index.name.eq_ignore_ascii_case(&fk.backing_index))
+                .or_else(|| {
+                    self.indexes.iter().find(|index| {
+                        index.state == IndexState::Public
+                            && index.predicate.is_none()
+                            && !index.is_fulltext()
+                            && index.columns.len() >= fk.columns.len()
+                            && fk.columns.iter().zip(&index.columns).enumerate().all(
+                                |(pos, (a, b))| {
+                                    a.eq_ignore_ascii_case(b)
+                                        && index.column_prefix_len(pos).is_none()
+                                },
+                            )
+                    })
+                })
             {
+                fk.backing_index = index.name.clone();
                 fk.backing_index_id = index.index_id;
             }
         }

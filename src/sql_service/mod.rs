@@ -319,9 +319,9 @@ impl<E: QueryEngine> State<E> {
             s.begin_close();
         }
         for s in sessions {
-            s.close().await;
+            let _ = s.close().await;
         }
-        self.sessions.lock().clear();
+        // Failed contexts remain owned until a later sweep can clean them.
     }
     pub fn summary(&self) -> J {
         json!({"connections_limit":self.config.max_connections,"sessions":self.sessions.lock().len(),"inflight":self.config.max_inflight-self.inflight.available_permits(),"requests":self.requests.lock().len(),"memory_bytes":self.used.load(Ordering::Acquire),"executed":self.executed.load(Ordering::Acquire),"failed":self.failed.load(Ordering::Acquire),"cancelled":self.cancelled.load(Ordering::Acquire),"received_bytes":self.received_bytes.load(Ordering::Relaxed),"sent_bytes":self.sent_bytes.load(Ordering::Relaxed),"request_elapsed_us":self.elapsed_us.load(Ordering::Relaxed)})
@@ -480,6 +480,10 @@ impl<E: QueryEngine> Session<E> {
                 if result.is_ok() {
                     s.finish_cleanup(ctx.connection_id);
                 } else {
+                    crate::util::logging::log_message(&format!(
+                        "SQL service session cleanup failed: {:?}; retaining context for retry",
+                        result.as_ref().err()
+                    ));
                     *s.context.lock() = Some(ctx);
                 }
                 result
@@ -487,15 +491,27 @@ impl<E: QueryEngine> Session<E> {
             .await;
         }
     }
-    pub async fn close(self: &Arc<Self>) {
+    pub async fn close(self: &Arc<Self>) -> Result<()> {
         self.begin_close();
-        loop {
-            self.cleanup_idle().await;
-            if self.slot.lock().is_none() {
-                break;
+        let cleanup = async {
+            loop {
+                self.cleanup_idle().await;
+                if self.slot.lock().is_none() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        };
+        tokio::time::timeout(Duration::from_millis(500), cleanup)
+            .await
+            .map_err(|_| {
+                Failure::new(
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    "SESSION_CLEANUP_FAILED",
+                    "Session cleanup did not complete; retained for background retry",
+                )
+                .with_outcome("unknown")
+            })
     }
     fn release(self: &Arc<Self>, delivered: bool) {
         if !delivered {

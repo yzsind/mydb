@@ -1691,6 +1691,7 @@ pub fn plan_select(db: &Database, select: &Select) -> Result<PlannedSelect, Quer
     let mut select_owned = select.clone();
     resolve_wildcard_order_ordinals(db, &mut select_owned)?;
     resolve_join_using_natural(db, &mut select_owned)?;
+    expand_grouped_select_wildcards(db, &mut select_owned)?;
     resolve_group_by_refs(db, &mut select_owned);
     prune_redundant_constant_group_keys(&mut select_owned);
     prune_redundant_functional_group_keys(db, &mut select_owned);
@@ -2996,24 +2997,67 @@ pub(crate) fn resolve_order_by_output_refs(
     if select.order_by.iter().all(|order| order.names_bound) {
         return Ok(());
     }
-    let mut output: HashMap<String, Option<&Expr>> = HashMap::new();
+    let wildcard_scope = if !select.joins.is_empty()
+        && select
+            .order_by
+            .iter()
+            .any(|order| !order.names_bound && matches!(order.expr, Expr::Identifier(_)))
+        && select.projection.iter().any(|item| {
+            matches!(
+                item,
+                SelectItem::Wildcard | SelectItem::QualifiedWildcard(_)
+            )
+        }) {
+        build_column_scope(db, select, None).ok()
+    } else {
+        None
+    };
+    let mut output: HashMap<String, Option<std::borrow::Cow<'_, Expr>>> = HashMap::new();
+    fn add<'a>(
+        output: &mut HashMap<String, Option<std::borrow::Cow<'a, Expr>>>,
+        name: String,
+        expr: std::borrow::Cow<'a, Expr>,
+    ) {
+        output
+            .entry(name.to_ascii_lowercase())
+            .and_modify(|slot| {
+                if slot
+                    .as_ref()
+                    .is_some_and(|old| !expr_semantically_eq(old, &expr))
+                {
+                    *slot = None;
+                }
+            })
+            .or_insert(Some(expr));
+    }
     for item in &select.projection {
         if let SelectItem::Expr { expr, alias } = item {
             let name = alias
                 .clone()
                 .unwrap_or_else(|| crate::engine::expr::expr_name(expr))
                 .to_ascii_lowercase();
-            output
-                .entry(name)
-                .and_modify(|slot| {
-                    if slot
-                        .as_ref()
-                        .is_some_and(|old| !expr_semantically_eq(old, expr))
-                    {
-                        *slot = None;
+            add(&mut output, name, std::borrow::Cow::Borrowed(expr));
+        } else if let Some(scope) = &wildcard_scope {
+            for table in scope.tables.iter().filter(|table| table.visible) {
+                if matches!(item, SelectItem::QualifiedWildcard(q) if !table.matches_name(q)) {
+                    continue;
+                }
+                for name in &table.wildcard_columns {
+                    // Bare ORDER names prefer the output. Other names keep
+                    // FROM resolution, without expanding the actual wildcard.
+                    if !select.order_by.iter().any(|order| !order.names_bound && matches!(&order.expr, Expr::Identifier(requested) if name.eq_ignore_ascii_case(requested))) {
+                        continue;
                     }
-                })
-                .or_insert(Some(expr));
+                    add(
+                        &mut output,
+                        name.clone(),
+                        std::borrow::Cow::Owned(Expr::CompoundIdentifier(vec![
+                            table.alias.as_ref().unwrap_or(&table.name).clone(),
+                            name.clone(),
+                        ])),
+                    );
+                }
+            }
         }
     }
     let needs = select.order_by.iter().filter(|order| !order.names_bound).any(|order| {
@@ -3029,7 +3073,7 @@ pub(crate) fn resolve_order_by_output_refs(
         }
         return Ok(());
     }
-    let scope = build_column_scope(db, select, None).ok();
+    let scope = wildcard_scope.or_else(|| build_column_scope(db, select, None).ok());
     let ambiguous = |name: &str| {
         error(
             crate::error::catalog::ER_NON_UNIQ_ERROR,
@@ -3689,7 +3733,7 @@ fn bind_rollup_expr(
                     .position(|group_expr| expr_semantically_eq(group_expr, &resolved))
                 else {
                     return Err(error(
-                        crate::error::catalog::ER_WINDOW_CIRCULARITY_IN_WINDOW_GRAPH,
+                        crate::error::catalog::ER_FIELD_IN_GROUPING_NOT_GROUP_BY,
                         format!(
                             "argument '{}' of GROUPING function is not in GROUP BY",
                             crate::parser::expr_to_sql(arg)
@@ -3719,7 +3763,11 @@ fn bind_rollup_expr(
     }
     if let Some(idx) = group_by
         .iter()
-        .position(|group_expr| expr_semantically_eq(group_expr, &expr))
+        .position(|group_expr| expr_semantically_eq(group_expr, &expr)
+            || matches!((group_expr, &expr),
+                (Expr::BoundValue(Value::Int(a)), Expr::Literal(crate::parser::Literal::Int(b))) if a == b)
+            || matches!((group_expr, &expr),
+                (Expr::BoundValue(Value::UInt(a)), Expr::Literal(crate::parser::Literal::UInt(b))) if a == b))
     {
         return Ok(Expr::GroupKeyRef {
             index: idx,
@@ -4588,9 +4636,14 @@ pub fn resolve_join_using_natural(db: &Database, select: &mut Select) -> Result<
         join.natural = false;
         has_coalescing_join = true;
         output = if join.join_type == JoinType::Right {
-            merge_join_output_columns(&right, &output, &using_columns)?
+            merge_join_output_columns(&right, &output, &using_columns, false)?
         } else {
-            merge_join_output_columns(&output, &right, &using_columns)?
+            merge_join_output_columns(
+                &output,
+                &right,
+                &using_columns,
+                join.join_type == JoinType::Full,
+            )?
         };
     }
 
@@ -4746,6 +4799,7 @@ fn merge_join_output_columns(
     left: &[JoinOutputColumn],
     right: &[JoinOutputColumn],
     using_columns: &[String],
+    full_join: bool,
 ) -> Result<Vec<JoinOutputColumn>, QueryError> {
     let mut common = Vec::with_capacity(using_columns.len());
     let mut using_set = HashSet::new();
@@ -4762,11 +4816,19 @@ fn merge_join_output_columns(
             .first()
             .map(|col| col.name.clone())
             .unwrap_or_else(|| column.clone());
+        // INNER/LEFT use the left key; RIGHT passes its preserved side first.
+        // Only FULL needs a value from either input. Preserve direct column
+        // provenance so merged keys remain writable through mergeable views.
+        let direct = left_matches[0].expr.clone();
         let mut all = left_matches;
         all.extend(right_matches);
         common.push(JoinOutputColumn {
             name,
-            expr: coalesce_join_columns(&all),
+            expr: if full_join {
+                coalesce_join_columns(&all)
+            } else {
+                direct
+            },
             coalesced: true,
             qualifiers: merged_qualifiers(&all),
         });
@@ -5258,6 +5320,20 @@ pub(crate) fn apply_derived_column_aliases<'a>(
     columns: impl ExactSizeIterator<Item = &'a mut String>,
 ) -> Result<(), QueryError> {
     if table.column_aliases.is_empty() {
+        // An unaliased nested join retains its independent table namespaces.
+        // Actual derived relations must publish unique output names.
+        if table.name == "$nested_join_preserve" || columns.len() < 2 {
+            return Ok(());
+        }
+        let mut seen = std::collections::HashSet::new();
+        for name in columns {
+            if !seen.insert(name.to_ascii_lowercase()) {
+                return Err(error(
+                    crate::error::catalog::ER_DUP_FIELDNAME,
+                    format!("Duplicate column name '{name}'"),
+                ));
+            }
+        }
         return Ok(());
     }
     if columns.len() != table.column_aliases.len() {
@@ -5432,11 +5508,40 @@ fn scope_table_for_ref(
     })
 }
 
+/// Expand grouped wildcards without manufacturing SELECT aliases. This keeps
+/// GROUP BY ambiguity diagnostics ahead of unrelated grouping violations.
+pub(crate) fn expand_grouped_select_wildcards(
+    db: &Database,
+    select: &mut Select,
+) -> Result<(), QueryError> {
+    if (!select.group_by.is_empty()
+        || !select.grouping_sets.is_empty()
+        || select_has_aggregate(db, select))
+        && select.projection.iter().any(|item| {
+            matches!(
+                item,
+                SelectItem::Wildcard | SelectItem::QualifiedWildcard(_)
+            )
+        })
+    {
+        expand_select_wildcards(db, select, false)?;
+    }
+    Ok(())
+}
+
 /// Freeze wildcard projection slots from the same scopes used for column binding.
 /// Source restrictions (partition, snapshot and hints) remain on their relations.
 pub(crate) fn freeze_select_wildcards(
     db: &Database,
     select: &mut Select,
+) -> Result<(), QueryError> {
+    expand_select_wildcards(db, select, true)
+}
+
+fn expand_select_wildcards(
+    db: &Database,
+    select: &mut Select,
+    freeze_names: bool,
 ) -> Result<(), QueryError> {
     if select.values.is_some() {
         return Ok(());
@@ -5452,6 +5557,9 @@ pub(crate) fn freeze_select_wildcards(
                 continue;
             }
         };
+        if let Some(qualifier) = requested_qualifier {
+            scope.resolve_qualifier(qualifier)?;
+        }
         for table in scope.tables.iter().filter(|table| {
             table.visible && requested_qualifier.is_none_or(|name| table.matches_name(name))
         }) {
@@ -5465,7 +5573,7 @@ pub(crate) fn freeze_select_wildcards(
             for name in &table.wildcard_columns {
                 projection.push(SelectItem::Expr {
                     expr: Expr::CompoundIdentifier(vec![qualifier.to_owned(), name.clone()]),
-                    alias: Some(name.clone()),
+                    alias: freeze_names.then(|| name.clone()),
                 });
             }
         }

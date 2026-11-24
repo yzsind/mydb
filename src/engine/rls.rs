@@ -694,6 +694,7 @@ pub struct SessionContext {
     local: ContextValues,
     savepoints: Vec<ContextSavepoint>,
     identity: std::cell::RefCell<Option<Arc<PlanIdentity>>>,
+    shared_identity: std::cell::RefCell<Option<Arc<PlanIdentity>>>,
 }
 impl Default for SessionContext {
     fn default() -> Self {
@@ -703,6 +704,7 @@ impl Default for SessionContext {
             local: ContextValues::new(),
             savepoints: Vec::new(),
             identity: Default::default(),
+            shared_identity: Default::default(),
         }
     }
 }
@@ -1152,13 +1154,14 @@ impl PlanIdentity {
         db: &Database,
         session: &crate::engine::api::SessionContext,
     ) -> bool {
-        self.matches_environment(session, &PlanIdentityEnvironment::capture(db))
+        self.matches_environment(session, &PlanIdentityEnvironment::capture(db), true)
     }
 
     fn matches_environment(
         &self,
         session: &crate::engine::api::SessionContext,
         environment: &PlanIdentityEnvironment,
+        include_parameters: bool,
     ) -> bool {
         self.account == session.authenticated_as
             && self.roles.iter().eq(session.active_roles.iter())
@@ -1170,33 +1173,57 @@ impl PlanIdentity {
             && self.trusted == environment.trusted
             && self.enabled == session.rls.enabled
             && self.expression_settings.matches_session(session)
-            && crate::engine::params::with_current_params(|params, _| {
-                self.parameter_domains.iter().copied().eq(params
-                    .unwrap_or_default()
-                    .iter()
-                    .map(std::mem::discriminant))
-            })
+            && (!include_parameters
+                || crate::engine::params::with_current_params(|params, _| {
+                    self.parameter_domains.iter().copied().eq(params
+                        .unwrap_or_default()
+                        .iter()
+                        .map(std::mem::discriminant))
+                }))
     }
 }
 
+/// Shared keys carry parameter types in their SQL fingerprint. Cache this
+/// identity separately so bindings do not split keys or allocate per execution.
+pub(crate) fn shared_signature(
+    db: &Database,
+    session: &crate::engine::api::SessionContext,
+) -> Arc<PlanIdentity> {
+    identity_signature(db, session, false)
+}
 pub fn session_signature(
     db: &Database,
     session: &crate::engine::api::SessionContext,
 ) -> Arc<PlanIdentity> {
+    identity_signature(db, session, true)
+}
+fn identity_signature(
+    db: &Database,
+    session: &crate::engine::api::SessionContext,
+    include_parameters: bool,
+) -> Arc<PlanIdentity> {
     let environment = PlanIdentityEnvironment::capture(db);
-    let mut cached = session.rls.identity.borrow_mut();
+    let mut cached = if include_parameters {
+        session.rls.identity.borrow_mut()
+    } else {
+        session.rls.shared_identity.borrow_mut()
+    };
     if let Some(identity) = cached.as_ref() {
-        if identity.matches_environment(session, &environment) {
+        if identity.matches_environment(session, &environment, include_parameters) {
             return identity.clone();
         }
     }
-    let parameter_domains = crate::engine::params::with_current_params(|params, _| {
-        params
-            .unwrap_or_default()
-            .iter()
-            .map(std::mem::discriminant)
-            .collect()
-    });
+    let parameter_domains = if !include_parameters {
+        Vec::new()
+    } else {
+        crate::engine::params::with_current_params(|params, _| {
+            params
+                .unwrap_or_default()
+                .iter()
+                .map(std::mem::discriminant)
+                .collect()
+        })
+    };
     let identity = Arc::new(PlanIdentity {
         account: session.authenticated_as.clone(),
         roles: session.active_roles.iter().cloned().collect(),

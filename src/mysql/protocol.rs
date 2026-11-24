@@ -891,13 +891,8 @@ pub fn encode_session_track_system_variables(buf: &mut Vec<u8>, name: &str, valu
 /// — clients use this as a single bit for "did anything change?".
 pub fn encode_session_track_state_change(buf: &mut Vec<u8>) {
     buf.push(SESSION_TRACK_STATE_CHANGE);
-    // data = lenenc("1") → 0x01 0x31. Outer length wraps that two-byte
-    // block, so the full entry on the wire is [02 02 01 31].
-    let mut inner = Vec::with_capacity(2);
-    write_lenenc_int(&mut inner, 1);
-    inner.push(b'1');
-    write_lenenc_int(buf, inner.len() as u64);
-    buf.extend_from_slice(&inner);
+    write_lenenc_int(buf, 1);
+    buf.push(b'1');
 }
 
 pub fn err_packet(err: &QueryError) -> Vec<u8> {
@@ -4616,8 +4611,8 @@ mod tests {
     fn session_track_state_change_entry_layout() {
         let mut buf = Vec::new();
         encode_session_track_state_change(&mut buf);
-        // Type byte 0x02, lenenc(2), lenenc("1") = [0x01, '1'].
-        assert_eq!(buf, vec![0x02, 0x02, 0x01, b'1']);
+        // Type byte 0x02, lenenc(1), ASCII 1.
+        assert_eq!(buf, vec![0x02, 0x01, b'1']);
     }
 
     #[test]
@@ -4663,14 +4658,14 @@ mod tests {
         //   42 00       status (LE u16) = 0x4002 = 0x4000 | 0x0002
         //   00 00       warnings (LE u16)
         //   00          info length (lenenc 0, empty info)
-        //   0b          state_info length (lenenc 11 bytes)
+        //   0a          state_info length (lenenc 10 bytes)
         //   01 05 04 't' 'e' 's' 't'       SCHEMA entry
-        //   02 02 01 '1'                   STATE_CHANGE entry
+        //   02 01 '1'                      STATE_CHANGE entry
         assert_eq!(
             packet,
             vec![
-                0x00, 0x00, 0x00, 0x02, 0x40, 0x00, 0x00, 0x00, 0x0b, 0x01, 0x05, 0x04, b't', b'e',
-                b's', b't', 0x02, 0x02, 0x01, b'1',
+                0x00, 0x00, 0x00, 0x02, 0x40, 0x00, 0x00, 0x00, 0x0a, 0x01, 0x05, 0x04, b't', b'e',
+                b's', b't', 0x02, 0x01, b'1',
             ]
         );
     }

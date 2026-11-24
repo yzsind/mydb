@@ -853,6 +853,30 @@ fn fuzz_empty_user_variable_names_roundtrip() {
 }
 
 #[test]
+fn fuzz_user_variable_dot_components_roundtrip() {
+    for bits in [
+        0,
+        0x4204,
+        crate::engine::api::SQL_MODE_ANSI_QUOTES,
+        crate::engine::api::SQL_MODE_NO_BACKSLASH_ESCAPES,
+    ] {
+        let _mode = ParserSqlModeGuard::activate(bits);
+        for sql in [
+            "@U.''", "@tU.''", "@`.u`", "@`u.`", "@`u..v`", "@`.`", "@u.v",
+        ] {
+            let expr = parse_expr_fragment(sql).unwrap();
+            let encoded = try_expr_to_sql(&expr).unwrap();
+            assert_eq!(
+                parse_expr_fragment(&encoded)
+                    .unwrap_or_else(|error| panic!("{sql:?} encoded as {encoded:?}: {error:?}")),
+                expr,
+                "{sql:?} encoded as {encoded:?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn fuzz_nul_compound_identifiers_are_rejected() {
     for bits in [0, 0x4a46, crate::engine::api::SQL_MODE_ANSI_QUOTES] {
         let _mode = ParserSqlModeGuard::activate(bits);

@@ -71,9 +71,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: default-test
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-nextest@0.9.151
+      - uses: ./.github/actions/install-nextest
       - run: mkdir -p /tmp/mydb
       - run: cargo nextest archive --locked --archive-file /tmp/mydb/tests.tar.zst
       - uses: actions/upload-artifact@v4
@@ -96,9 +94,7 @@ jobs:
         shard: [1, 2, 3]
     steps:
       - uses: actions/checkout@v4
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-nextest@0.9.151
+      - uses: ./.github/actions/install-nextest
       - uses: actions/download-artifact@v4
         with:
           name: tests-default
@@ -214,9 +210,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-nextest@0.9.151
+      - uses: ./.github/actions/install-nextest
       - uses: actions/download-artifact@v4
         with:
           name: tests-default

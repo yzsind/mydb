@@ -319,7 +319,7 @@ impl Database {
             if owners.contains_key(&id) {
                 self.table_live_row_deltas
                     .write()
-                    .insert(id, Arc::new(AtomicI64::new(n)));
+                    .insert(id, Arc::new(CommittedTableDelta::new(n)));
             }
         }
         for (id, n) in modified {

@@ -553,7 +553,7 @@ impl RetiredStatusGroups {
     }
 }
 
-fn normalize_status_host(host: &str) -> String {
+pub(super) fn normalize_status_host(host: &str) -> String {
     if let Ok(addr) = host.parse::<std::net::SocketAddr>() {
         return addr.ip().to_string();
     }
