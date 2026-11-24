@@ -29,6 +29,7 @@ Zone Maps, online schema changes, and directly queryable backups reduce the
 work needed to tune access, evolve data structures, and inspect earlier data.
 
 MyDB 1.0.3 is a public-preview release intended for feature validation and controlled-environment evaluation.
+See the [1.0.3 release notes](docs/release-notes-1.0.3.md) for changes and upgrade requirements.
 
 | Core advantage | What it gives you |
 | --- | --- |
