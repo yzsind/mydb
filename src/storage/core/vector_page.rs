@@ -4538,6 +4538,10 @@ mod vector_page_tests {
             }
             assert!(graph.file().prepare_navigation_mapping().unwrap());
             assert_eq!(graph.search(&query, 10, 64).unwrap(), expected);
+            graph.file().retire_navigation_source_cache();
+            assert!(graph.file().with_navigation_mapping(|_| ()).is_none());
+            assert!(graph.file().prepare_navigation_mapping().unwrap());
+            assert_eq!(graph.search(&query, 10, 64).unwrap(), expected);
             // Exercise an exact-query memo hit before revoking the view.
             assert_eq!(graph.search(&query, 10, 64).unwrap(), expected);
             graph

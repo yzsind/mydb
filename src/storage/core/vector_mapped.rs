@@ -167,6 +167,18 @@ impl Drop for VectorNavigationWrite<'_> {
 }
 
 impl VectorIndexFile {
+    /// A complete private navigator no longer reads the interleaved source.
+    /// Release its clean mapping/cache rather than competing for both images.
+    pub(crate) fn retire_navigation_source_cache(&self) {
+        let Some(mut view) = self.mapped_navigation.try_write() else {
+            return;
+        };
+        view.take();
+        if let Some(file) = self.file.lock().as_ref() {
+            crate::platform::file::advise_completed_read(file);
+        }
+    }
+
     /// Optional cache reclamation must not wait for a reader that may itself
     /// be requesting memory admission while holding the mapping read guard.
     pub(crate) fn evict_navigation_mapping(&self) -> bool {
