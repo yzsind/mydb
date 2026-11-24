@@ -15,6 +15,8 @@ and replication security. These notes cover source changes since
   navigation overhead, with improvements to vectorized expression evaluation.
 - **MySQL compatibility:** extend joined UPDATE/DELETE and correct function,
   metadata, prepared-statement, and diagnostic behavior.
+- **Error messages:** identify offending columns, input rows, and invalid values
+  more precisely, and preserve conversion warnings across execution paths.
 - **Operations:** strengthen replication credential protection, replica recovery,
   physical backup handling, and REST session cleanup.
 
@@ -107,6 +109,26 @@ and [vector indexes](vector-indexes.md).
 See [MySQL compatibility](mysql80-compatibility.md),
 [UPDATE](statement/dml/update.md), [DELETE](statement/dml/delete.md), and
 [optimizer and execution](optimizer-and-operators.md).
+
+## Error messages and diagnostics
+
+- INSERT validation errors identify the offending column and input row for
+  out-of-range values, oversized strings, and invalid ENUM values. For example,
+  an invalid TINYINT value in the second input row reports
+  `Out of range value for column 'ti' at row 2`. Column/value count mismatches
+  also report the failing input row.
+- Assigning a non-DEFAULT value to a generated column names both the column
+  and table. ALTER TABLE conversion errors retain the original invalid value,
+  column name, and source row, making failed schema changes easier to diagnose.
+- Integer assignment distinguishes truncated numeric input from invalid input.
+  Conversion warnings preserve repeated expression occurrences, and cached
+  expressions replay DECIMAL overflow warnings instead of losing diagnostics.
+- Statement information follows MySQL's `Records`, `Duplicates`, and `Warnings`
+  formatting and respects intentionally empty trailers. Protocol responses no
+  longer reuse information left by a previous statement on the execution worker.
+
+See [error codes](error-codes.md) and
+[SHOW WARNINGS](statement/metadata/show-diagnostics.md).
 
 ## Recovery, replication, security, and APIs
 
