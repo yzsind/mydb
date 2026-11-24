@@ -34,6 +34,9 @@ M310
 
 ## Notes
 
+- Binary input uses byte semantics: only ASCII letters contribute to the code,
+  and the result remains binary. Arbitrary bytes are never decoded through UTF-8
+  replacement characters. Text input keeps the character-based Soundex path.
 - See [text and binary semantics](README.md#text-and-binary-semantics) for encoding, indexing and result-size limits.
 
 ## Related Functions

@@ -2755,6 +2755,30 @@ fn infer_expr_type_checked(expr: &Expr, context: &TypeContext<'_>) -> ExprType {
                     }
                     result
                 }
+                "TO_BASE64" if args.len() == 1 => {
+                    let input = infer_expr_type(&args[0], context);
+                    let width = display_octet_bound(&input).map(|n| {
+                        let encoded = n.div_ceil(3).saturating_mul(4);
+                        encoded.saturating_add(encoded.saturating_sub(1) / 76)
+                            .saturating_mul(u32::from(context.connection_mbmaxlen))
+                    });
+                    let mut result = fixed_string_result(width, input.nullable);
+                    result.collation_id = Some(context.connection_collation_id);
+                    result
+                }
+                "SOUNDEX" if args.len() == 1 => {
+                    let input = infer_expr_type(&args[0], context);
+                    let binary = input.collation_id == Some(crate::charset::BINARY_COLLATION_ID)
+                        || matches!(input.kind, String { kind: StringKind::Binary | StringKind::Blob });
+                    let mut result = fixed_string_result(
+                        display_octet_bound(&input).map(|n| n.max(4 * u32::from(context.connection_mbmaxlen))),
+                        input.nullable,
+                    );
+                    if binary { result.kind = String { kind: StringKind::Binary }; }
+                    result.collation_id = Some(if binary { crate::charset::BINARY_COLLATION_ID }
+                        else { input.collation_id.unwrap_or(context.connection_collation_id) });
+                    result
+                }
                 "HEX" if args.len() == 1 => {
                     let input = infer_expr_type(&args[0], context);
                     let width = display_octet_bound(&input).map(|n| {

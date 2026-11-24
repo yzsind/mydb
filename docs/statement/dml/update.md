@@ -19,6 +19,10 @@ Modifies rows that match the condition. Supports single-table and joined/multi-t
 
 ## Behavior and Limitations
 
+- Joined forms support INNER/CROSS/LEFT/RIGHT chains. ON clauses retain their original source scope, and NULL-padded outer rows never become writable targets.
+- Uncorrelated derived SELECTs, including column aliases, aggregates and set operations, are read-only join sources. Updating or deleting a derived result returns 1288; LATERAL DML sources remain explicitly unsupported.
+- USING/NATURAL merged columns are available to WHERE and assignment reads using the preserving side of an outer join; write targets still resolve independently.
+
 - Single-table ORDER BY/LIMIT determines the order and cap of update candidates; UPDATE LIMIT does not support an offset.
 - The multi-table form can join to filter rows and update the declared targets; RETURNING is supported only for execution forms that actually modify a single target table.
 - Assignments honor column types, sql_mode, generated columns, CHECK, foreign keys, triggers, and unique key constraints.

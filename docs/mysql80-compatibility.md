@@ -413,7 +413,11 @@ Closing the loop on MySQL 8.0 semantics:
 ### UPDATE / DELETE
 
 - **Single-table UPDATE / DELETE + ORDER BY + LIMIT**: ✅ candidates carry the partition `storage_id` throughout; sort-key errors are not demoted to NULL, and huge LIMITs are not preallocated from the user value; unordered small LIMITs stop early while streaming, and ordered paths support forward/reverse indexes, partition-local index merges, bounded TopN, and spillable sorts for large K, writing row by row in candidate order. UPDATE LIMIT counts matched rows and DELETE LIMIT counts successfully deleted rows; both OFFSET spellings are rejected with 1064.
-- **Multi-table UPDATE / DELETE**: ✅ inner/cross/comma joins + LEFT JOIN targets on both sides. Only genuinely matched rows on the non-preserving side are writable; NULL-padding virtual rows are skipped; a single two-table `a RIGHT JOIN b` is normalized by flipping to `b LEFT JOIN a` (RIGHT inside a chain still reports 1235).
+- **Multi-table UPDATE / DELETE**: ✅ inner/cross/comma joins + LEFT JOIN targets on both sides. Only genuinely matched rows on the non-preserving side are writable; NULL-padding virtual rows are skipped; a single plain two-table `a RIGHT JOIN b` may be normalized to `b LEFT JOIN a`.
+  Longer INNER/LEFT/RIGHT chains preserve each original ON scope and outer-row semantics.
+  Uncorrelated derived SELECT sources, including aliases, grouping and set operations,
+  are materialized as read-only sources; derived results cannot be UPDATE/DELETE targets.
+  LATERAL DML sources remain explicitly unsupported.
 - **DELETE in both forms**: `DELETE t1,t2 FROM refs` and `DELETE FROM t1,t2 USING refs` are both supported; the `tbl_name.*` target suffix; per-table `PARTITION(...)` pruning.
 - **`UPDATE LOW_PRIORITY [IGNORE]`**: ✅ IGNORE covers everything (unique key 1062 / NOT NULL 1048 / FK 1452·1451 / out-of-range 1264 / truncation 1265·1366 / CHECK 3819 converted row-wise to warnings and skipped).
 - **True no-op detection for UPDATE**: column-wise post-coercion comparison; no-op rows write nothing to heap/undo/binlog and do not refresh `ON UPDATE CURRENT_TIMESTAMP`.
@@ -1265,7 +1269,10 @@ degenerate into no-ops.
 - Cross-base-table UPDATE (1393) and DELETE (1395) on join views and other unimplemented shapes;
   single-target UPDATE over INNER/CROSS JOIN directly projected views is supported — see §2 for the specific limitations.
 - UPDATE/DELETE `RETURNING` that genuinely modifies multiple target tables; single-target JOIN DML is available.
-- `MATCH ... AGAINST ... WITH QUERY EXPANSION`.
+- Both `MATCH ... AGAINST (... WITH QUERY EXPANSION)` and
+  `MATCH ... AGAINST (... IN NATURAL LANGUAGE MODE WITH QUERY EXPANSION)` return
+  1064. Query expansion is an unimplemented two-pass search feature; it is never
+  ignored or substituted with ordinary natural-language mode. See [full-text search](fulltext-search.md).
 - The non-standard spelling `GROUP BY ... WITH CUBE`; use the mydb extension
   `GROUP BY CUBE(...)` instead. `ROLLUP(...)`, CUBE, and row constructors themselves are already supported.
 - MERGE, PostgreSQL `ON CONFLICT`, UPDATE FROM, and data-modifying CTEs.

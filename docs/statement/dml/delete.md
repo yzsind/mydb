@@ -24,6 +24,10 @@ Deletes rows that match the condition. Supports single-table deletes, MySQL mult
 
 ## Behavior and Limitations
 
+- Joined forms support INNER/CROSS/LEFT/RIGHT chains. ON clauses retain their original source scope, and NULL-padded outer rows never become writable targets.
+- Uncorrelated derived SELECTs, including column aliases, aggregates and set operations, are read-only join sources. Updating or deleting a derived result returns 1288; LATERAL DML sources remain explicitly unsupported.
+- USING/NATURAL merged columns are available to WHERE and assignment reads using the preserving side of an outer join; write targets still resolve independently.
+
 - Single-table ORDER BY/LIMIT deletes can run in batches; DELETE LIMIT does not accept an offset.
 - A multi-table DELETE may declare one or more delete targets; RETURNING is not supported when more than one target is actually deleted.
 - RETURNING observes OLD by default; NEW column values are SQL NULL because the deleted row has no new image.

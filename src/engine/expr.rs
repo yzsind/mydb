@@ -6231,7 +6231,7 @@ where
         "REGEXP_LIKE" => {
             expect_arg_range(name, args, 2, 3)?;
             let values = eval_args(args, &mut eval_arg)?;
-            null_if_any(values, |values| eval_regexp_like_values(&values))
+            eval_regexp_like_values(&values)
         }
         "LOCATE" => {
             // String search is directional: MySQL coerces the needle into
@@ -9131,7 +9131,12 @@ where
         "SOUNDEX" => {
             let value = eval_one(name, args, eval_arg)?;
             null_or(value, |value| {
-                Ok(Value::String(soundex_mysql(&string_value(&value))))
+                Ok(match value {
+                    Value::Bytes(bytes) => Value::Bytes(soundex_letters(
+                        bytes.into_iter().filter(u8::is_ascii_alphabetic).map(char::from)
+                    ).into_bytes()),
+                    value => Value::String(soundex_mysql(&string_value(&value))),
+                })
             })
         }
         // REGEXP_LIKE previously appeared twice in this match: the first
@@ -9142,7 +9147,7 @@ where
         "REGEXP_INSTR" => {
             expect_arg_range(name, args, 2, 6)?;
             let values = eval_args(args, eval_arg)?;
-            null_if_any(values, |values| {
+            regexp_null_if_any(values, 5, |values| {
                 if regexp_binary::binary_operands(&values, 2)? {
                     return regexp_binary::evaluate("REGEXP_INSTR", &values);
                 }
@@ -9200,7 +9205,7 @@ where
         "REGEXP_SUBSTR" => {
             expect_arg_range(name, args, 2, 5)?;
             let values = eval_args(args, eval_arg)?;
-            null_if_any(values, |values| {
+            regexp_null_if_any(values, 4, |values| {
                 if regexp_binary::binary_operands(&values, 2)? {
                     return regexp_binary::evaluate("REGEXP_SUBSTR", &values);
                 }
@@ -16379,7 +16384,58 @@ fn function_arg_with_table_octets(
     crate::charset::encode_string(charset, &text).map(Value::Bytes)
 }
 
+// Pattern and match-type validation precedes nullable search operands, but
+// a NULL pattern or match_type itself still determines a NULL result. Run
+// this only during value evaluation so invisible rows/branches stay lazy.
+fn regexp_has_null(values: &[Value], flags_index: usize) -> Result<bool, QueryError> {
+    if !values.iter().any(|value| matches!(value, Value::Null)) {
+        return Ok(false);
+    }
+    if !matches!(values[1], Value::Null)
+        && !matches!(values.get(flags_index), Some(Value::Null))
+    {
+        match &values[1] {
+            Value::Bytes(bytes) => validate_null_binary_regexp_pattern(bytes, values.get(flags_index))?,
+            pattern => {
+                mysql_regex_for_operand(&string_value(pattern), values.get(flags_index), false)?;
+            }
+        }
+    }
+    Ok(true)
+}
+
+// Keep governed binary decoding out of the common non-NULL/text callsite.
+// Inlining its allocation/error machinery makes every REGEXP_LIKE row pay
+// for a branch that only nullable binary operands can reach.
+#[cold]
+#[inline(never)]
+fn validate_null_binary_regexp_pattern(bytes: &[u8], flags: Option<&Value>) -> Result<(), QueryError> {
+    // Keep the binary evaluator's resource contract on this NULL
+    // path as well; validation must not bypass its decode budget.
+    if bytes.len() > 8192 {
+        return Err(crate::error::catalog::ER_REGEXP_INTERNAL_ERROR
+            .error("regular expression exceeded the implementation resource limit"));
+    }
+    let _scratch = crate::engine::executor::mem_budget::ControlledMemoryCharge::try_new(
+        crate::engine::executor::mem_budget::ControlledMemoryCategory::Executor,
+        if bytes.is_ascii() { 0 } else { bytes.len().saturating_mul(3) },
+    )?;
+    let pattern = encoding_rs::WINDOWS_1252.decode_without_bom_handling(bytes).0;
+    mysql_regex_for_operand(&pattern, flags, true)?;
+    Ok(())
+}
+
+fn regexp_null_if_any(
+    values: Vec<Value>, flags_index: usize,
+    evaluate: impl FnOnce(Vec<Value>) -> Result<Value, QueryError>,
+) -> Result<Value, QueryError> {
+    if regexp_has_null(&values, flags_index)? { Ok(Value::Null) } else { evaluate(values) }
+}
+
 pub(crate) fn eval_regexp_like_values(values: &[Value]) -> Result<Value, QueryError> {
+    if regexp_has_null(values, 2)? {
+        return Ok(Value::Null);
+    }
     if regexp_binary::binary_operands(values, 2)? {
         return regexp_binary::evaluate("REGEXP_LIKE", values);
     }
@@ -16793,7 +16849,7 @@ pub(crate) fn regexp_replace_single_into(
 /// Value-level REGEXP_REPLACE implementation shared by the legacy evaluator
 /// and the compiled expression kernel. Arity is checked by the callers.
 pub(crate) fn eval_regexp_replace_values(values: Vec<Value>) -> Result<Value, QueryError> {
-    null_if_any(values, |values| {
+    regexp_null_if_any(values, 5, |values| {
         if regexp_binary::binary_operands(&values, 3)? {
             return regexp_binary::evaluate("REGEXP_REPLACE", &values);
         }
@@ -16881,6 +16937,10 @@ pub(crate) fn eval_char_values(values: &[Value]) -> Value {
 }
 
 pub(crate) fn soundex_mysql(input: &str) -> String {
+    soundex_letters(input.chars().filter(|c| c.is_ascii_alphabetic() || *c > '\u{00c0}'))
+}
+
+fn soundex_letters(mut letters: impl Iterator<Item = char>) -> String {
     fn code(ch: char) -> char {
         match ch.to_ascii_uppercase() {
             'B' | 'F' | 'P' | 'V' => '1',
@@ -16892,9 +16952,6 @@ pub(crate) fn soundex_mysql(input: &str) -> String {
             _ => '0',
         }
     }
-    let mut letters = input
-        .chars()
-        .filter(|c| c.is_ascii_alphabetic() || *c > '\u{00c0}');
     let Some(first) = letters.next() else {
         return String::new();
     };
@@ -20297,6 +20354,10 @@ fn expr_collation_checked(
                 coercibility: ty.coercibility,
             });
         }
+        if name.eq_ignore_ascii_case("TO_BASE64") {
+            let info = connection_collation_info();
+            return Some(ExprCollation { charset: info.charset, collation_id: info.id, coercibility: 4 });
+        }
         let result_type = function_result_type(name);
         if result_type == ColumnType::Geometry {
             return Some(ExprCollation {
@@ -22597,7 +22658,7 @@ fn fold_constant_subexprs_inner_checked(expr: &mut Expr) {
         // is NULL, without disabling value folding and repeating JSON work
         // for every source row.
         let preserve_json_type = match expr {
-            Expr::Function { name, .. } if name.eq_ignore_ascii_case("JSON_QUOTE") => true,
+            Expr::Function { name, .. } if matches!(name.to_ascii_uppercase().as_str(), "JSON_QUOTE" | "TO_BASE64" | "SOUNDEX") => true,
             Expr::Function { name, args, .. } if name.eq_ignore_ascii_case("JSON_VALUE") => {
                 matches!(args.get(2), Some(Expr::Literal(Literal::String(target)))
                     if target.eq_ignore_ascii_case("JSON"))

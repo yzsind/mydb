@@ -9192,13 +9192,7 @@ fn eval_regexp_like(
     }
     let text = args[0].eval(row, scratch)?;
     let pattern = args[1].eval(row, scratch)?;
-    if matches!(text, Value::Null) || matches!(pattern, Value::Null) {
-        return Ok(Value::Null);
-    }
     let match_type = args.get(2).map(|arg| arg.eval(row, scratch)).transpose()?;
-    if matches!(match_type, Some(Value::Null)) {
-        return Ok(Value::Null);
-    }
     let mut values = vec![text, pattern];
     if let Some(flags) = match_type {
         values.push(flags);

@@ -1520,5 +1520,8 @@ fn copy_test_seed_tree(source: &Path, destination: &Path) -> Result<(), QueryErr
             crate::util::file::copy_fixture_file(&entry.path(), &target).map_err(io_err)?;
         }
     }
+    // Match clonefile's directory modes, including private credential parents.
+    let permissions = fs::metadata(source).map_err(io_err)?.permissions();
+    fs::set_permissions(destination, permissions).map_err(io_err)?;
     Ok(())
 }

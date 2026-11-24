@@ -6704,12 +6704,12 @@ fn unsupported_dml_join(kind: DmlKind, target: &TableRef, joins: &[Join]) -> Opt
     let (temporal, derived, unsupported) = match kind {
         DmlKind::Update => (
             "FOR SYSTEM_TIME AS OF on an UPDATE target or source",
-            "UPDATE join with derived table",
+            "UPDATE with LATERAL source",
             "UPDATE SEMI/ANTI/FULL join",
         ),
         DmlKind::Delete => (
             "FOR SYSTEM_TIME AS OF on a DELETE target or source",
-            "DELETE join with derived table",
+            "DELETE with LATERAL source",
             "DELETE supports only INNER / CROSS / LEFT / RIGHT joins",
         ),
     };
@@ -6717,7 +6717,7 @@ fn unsupported_dml_join(kind: DmlKind, target: &TableRef, joins: &[Join]) -> Opt
         return Some(temporal);
     }
     for join in joins {
-        if join.derived.is_some() {
+        if join.lateral {
             return Some(derived);
         }
         if !matches!(

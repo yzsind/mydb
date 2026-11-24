@@ -3545,7 +3545,16 @@ fn regexp_columns_keep_collation_flags_unicode_offsets_occurrences_and_nulls() {
         "REGEXP_INSTR(x,'[')",
         "REGEXP_SUBSTR(x,'[')",
     ] {
-        checked_legacy_column(expr, schema.clone(), vec![ColumnVector::Null { len: 3 }]);
+        let (program, schema) = compile(expr, ColumnType::VarString);
+        let batch = Batch::new(schema.clone(), vec![ColumnVector::Null { len: 3 }]);
+        assert_eq!(oracle(&program, &batch).unwrap_err().code(), 3696, "{expr}");
+        // A rejected native kernel must fall back to the same visible-row
+        // error, rather than synthesizing NULLs for a malformed pattern.
+        assert!(program.try_eval_column(&batch).is_none(), "{expr}");
+        let ast = crate::parser::parse_expr_fragment(expr).unwrap();
+        let input = crate::engine::executor::vec::expr_batch::batch_schema_to_input(&schema);
+        let legacy = ExprCompiler::compile_legacy_oracle(&ast, &input).unwrap();
+        assert_eq!(oracle(&legacy, &batch).unwrap_err().code(), 3696, "{expr}");
     }
     // An invisible out-of-range position must not abort a selected row.
     let (program, schema) = compile("REGEXP_SUBSTR(x,'a',2)", ColumnType::VarString);
