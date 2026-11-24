@@ -18,6 +18,12 @@ fn main() {
 
     let target_os = required_env("CARGO_CFG_TARGET_OS");
     let target_arch = required_env("CARGO_CFG_TARGET_ARCH");
+    if target_os == "macos"
+        && target_arch == "aarch64"
+        && env::var_os("CARGO_FEATURE_TOOLS").is_some()
+    {
+        build_vector_gpu();
+    }
     let pointer_width = required_env("CARGO_CFG_TARGET_POINTER_WIDTH");
 
     let compile_os = build_override(OS_OVERRIDE).unwrap_or_else(|| {
@@ -39,6 +45,55 @@ fn main() {
         "cargo:rustc-env=MYDB_BUILD_DATE={}",
         chrono::Local::now().format("%Y%m%d")
     );
+}
+
+fn build_vector_gpu() {
+    let source = "src/bin/vector_search_bench/gpu.m";
+    println!("cargo:rerun-if-changed={source}");
+    let out = std::path::PathBuf::from(required_env("OUT_DIR"));
+    let object = out.join("vector_gpu.o");
+    let archive = out.join("libvector_gpu.a");
+    let status = Command::new("xcrun")
+        .args([
+            "clang",
+            "-c",
+            "-O3",
+            "-fobjc-arc",
+            "-arch",
+            "arm64",
+            source,
+            "-o",
+        ])
+        .arg(&object)
+        .status()
+        .expect("failed to run clang for the Metal benchmark bridge");
+    assert!(
+        status.success(),
+        "failed to compile the Metal benchmark bridge"
+    );
+    let status = Command::new("xcrun")
+        .args(["ar", "crs"])
+        .arg(&archive)
+        .arg(&object)
+        .status()
+        .expect("failed to archive the Metal benchmark bridge");
+    assert!(
+        status.success(),
+        "failed to archive the Metal benchmark bridge"
+    );
+    println!("cargo:rustc-link-search=native={}", out.display());
+    // Only this tools binary links the bridge and Apple GPU frameworks.
+    for arg in [
+        "-lvector_gpu",
+        "-framework",
+        "Foundation",
+        "-framework",
+        "Metal",
+        "-framework",
+        "MetalPerformanceShaders",
+    ] {
+        println!("cargo:rustc-link-arg-bin=vector_search_bench={arg}");
+    }
 }
 
 fn required_env(name: &str) -> String {

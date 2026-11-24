@@ -259,6 +259,7 @@ pub struct Session<E: QueryEngine> {
     prepared_memory_bytes: u64,
     connection_attrs_charge_bytes: usize,
     prepared_execute_failed: bool,
+    prepared_metadata_changed: bool,
     next_statement_id: u32,
     /// Database explicitly selected by the client. Execution retains mydb's
     /// internal `test` fallback, but MySQL PROCESSLIST must report NULL until
@@ -1133,6 +1134,40 @@ where
 
     fn server_status(&self) -> u16 {
         server_status_for_context(&self.context)
+            | if self.prepared_metadata_changed {
+                0x0400
+            } else {
+                0
+            }
+    }
+
+    fn refresh_prepared_metadata(&mut self, statement_id: u32, columns: &[Column]) {
+        let fallback = self.result_fallback_collation_id();
+        if let Some(prepared) = self.prepared.get_mut(&statement_id) {
+            let changed = prepared
+                .result_metadata
+                .as_ref()
+                .is_some_and(|old| !old.matches_columns(columns));
+            if changed {
+                self.prepared_metadata_changed = true;
+                // Reprepare invalidates an optional memo. Admit replacement
+                // metadata, including old/new overlap, or use the uncached writer.
+                if let Some(replacement) = TextResultMetadata::try_new(columns, fallback) {
+                    let admitted = replacement._charge.bytes();
+                    if prepared
+                        .memory_charge
+                        .try_grow_recoverable(admitted)
+                        .is_ok()
+                    {
+                        prepared.result_metadata = Some(replacement.metadata);
+                        let retained = prepared.estimated_memory_bytes() as usize;
+                        prepared
+                            .memory_charge
+                            .shrink(prepared.memory_charge.bytes().saturating_sub(retained));
+                    }
+                }
+            }
+        }
     }
 
     /// Drop every prepared statement for this session, keeping the global
@@ -1538,6 +1573,7 @@ where
             prepared_memory_bytes: 0,
             connection_attrs_charge_bytes: 0,
             prepared_execute_failed: false,
+            prepared_metadata_changed: false,
             next_statement_id: 1,
             process_database: None,
             command_response_sequence: 1,
@@ -2506,6 +2542,9 @@ where
             // idle). The value is the session's own copy, seeded at connect
             // from `wait_timeout` or `interactive_timeout` per the
             // CLIENT_INTERACTIVE capability.
+            self.codec
+                .set_packet_limit(self.context.sysvars.max_allowed_packet as usize);
+            self.prepared_metadata_changed = false;
             let idle_timeout = self.idle_command_timeout();
             let read_span = crate::util::lock_diagnostics::Span::enter(
                 crate::util::lock_diagnostics::READ_BEGIN,
@@ -3604,6 +3643,15 @@ where
         non_blocking: bool,
         excluded_gtids: String,
     ) -> io::Result<()> {
+        if self.semi_sync_replica_requested && self.codec.is_compressed() {
+            self.registered_replica_guard.take();
+            self.dump_server_id = None;
+            let err = crate::error::catalog::ER_NOT_SUPPORTED_YET
+                .error("Semi-sync binlog dumps require an uncompressed connection");
+            return self
+                .write_error_packet(self.command_response_sequence, &err)
+                .await;
+        }
         let handle = self.handle.as_ref().map(Arc::clone);
         let cancel = self.context.current_cancel_token().cloned();
         let replaced = self
@@ -6004,6 +6052,20 @@ where
             .handle
             .as_ref()
             .map(|handle| handle.enter_stage(ProcessState::SendingToClient));
+        if let Some(id) = statement_id {
+            match &result {
+                Ok(QueryResponse::ResultSet(result)) => {
+                    self.refresh_prepared_metadata(id, &result.columns)
+                }
+                Ok(QueryResponse::SharedResultSet(result)) => {
+                    self.refresh_prepared_metadata(id, &result.columns)
+                }
+                Ok(QueryResponse::StreamingResultSet(result)) => {
+                    self.refresh_prepared_metadata(id, &result.columns)
+                }
+                _ => {}
+            }
+        }
         let fallback_collation = self.result_fallback_collation_id();
         let metadata = statement_id
             .and_then(|id| self.prepared.get_mut(&id))
@@ -6958,6 +7020,7 @@ where
         columns: Vec<Column>,
         mut cursor: Box<dyn crate::engine::api::ResultCursor>,
     ) -> io::Result<()> {
+        self.refresh_prepared_metadata(statement_id, &columns);
         let sql_for_registry = self
             .prepared
             .get(&statement_id)
@@ -7112,7 +7175,11 @@ where
         )
         .await?;
 
-        if client_capabilities & CLIENT_DEPRECATE_EOF != 0 {
+        if client_capabilities & CLIENT_DEPRECATE_EOF != 0
+            || (client_capabilities & crate::mysql::protocol::CLIENT_OPTIONAL_RESULTSET_METADATA
+                != 0
+                && !self.context.resultset_metadata_full)
+        {
             write_result_set_terminator_batched(
                 &mut batch,
                 sequence_id,
@@ -7160,7 +7227,12 @@ where
                 crate::mysql::errors::ER_WRONG_ARGUMENTS,
                 format!("prepared parameter index {param_id} is out of range"),
             ));
-        } else if let Err(err) = append_prepared_long_data(entry, param_id, &payload[6..]) {
+        } else if let Err(err) = append_prepared_long_data(
+            entry,
+            param_id,
+            &payload[6..],
+            self.context.sysvars.max_allowed_packet as usize,
+        ) {
             entry.long_data_error = Some(err);
         }
         Ok(())
@@ -9087,6 +9159,7 @@ fn append_prepared_long_data(
     entry: &mut PreparedStatement,
     param_id: usize,
     incoming: &[u8],
+    packet_limit: usize,
 ) -> Result<(), QueryError> {
     let (old_capacity, old_len) = entry.long_data[param_id]
         .as_ref()
@@ -9104,7 +9177,6 @@ fn append_prepared_long_data(
                 sum.saturating_add(value.as_ref().map_or(0, Vec::len))
             }
         });
-    let packet_limit = crate::mysql::packet::max_allowed_packet_bytes();
     if combined > packet_limit {
         let err = error(
             crate::error::catalog::ER_NET_PACKET_TOO_LARGE,
@@ -12314,7 +12386,13 @@ mod tests {
                 Arc::new(SessionRegistry::new()),
             );
             let mut prepared = empty_prepared_statement();
-            append_prepared_long_data(&mut prepared, 0, b"payload").unwrap();
+            append_prepared_long_data(
+                &mut prepared,
+                0,
+                b"payload",
+                crate::mysql::packet::max_allowed_packet_bytes(),
+            )
+            .unwrap();
             session.prepared.insert(1, prepared);
             session.kill_flag.store(killed, Ordering::Release);
             if write_error {
@@ -12415,7 +12493,13 @@ mod tests {
             Arc::new(SessionRegistry::new()),
         );
         let mut prepared = empty_prepared_statement();
-        append_prepared_long_data(&mut prepared, 0, b"AAA").unwrap();
+        append_prepared_long_data(
+            &mut prepared,
+            0,
+            b"AAA",
+            crate::mysql::packet::max_allowed_packet_bytes(),
+        )
+        .unwrap();
         session.prepared.insert(1, prepared);
         let mut payload = 1u32.to_le_bytes().to_vec();
         payload.push(2);
@@ -12437,7 +12521,13 @@ mod tests {
         prepared.memory_charge.try_grow(slot.capacity()).unwrap();
         prepared.long_data[0] = Some(slot);
         for size in [70, 1, 200, 33] {
-            append_prepared_long_data(&mut prepared, 0, &vec![b'x'; size]).unwrap();
+            append_prepared_long_data(
+                &mut prepared,
+                0,
+                &vec![b'x'; size],
+                crate::mysql::packet::max_allowed_packet_bytes(),
+            )
+            .unwrap();
             let slot = prepared.long_data[0].as_ref().unwrap();
             assert_eq!(prepared.memory_charge.bytes(), slot.capacity());
         }

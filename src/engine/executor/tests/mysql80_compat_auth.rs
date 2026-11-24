@@ -2194,6 +2194,7 @@ fn b3_show_triggers_filtered_by_trigger_privilege() {
         "CREATE TABLE t (id INT PRIMARY KEY, v INT)",
         "CREATE TRIGGER trg BEFORE INSERT ON t FOR EACH ROW SET NEW.v = 1",
         "CREATE USER 'alice'@'%' IDENTIFIED BY 'pw'",
+        "GRANT SELECT ON test.t TO 'alice'@'%'",
     ] {
         engine.execute_with_session(&mut root, stmt).unwrap();
     }

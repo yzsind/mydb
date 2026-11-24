@@ -1151,6 +1151,9 @@ pub(crate) fn function_has_external_effect(name: &str) -> bool {
 /// sees the generic `Expr::Function` shape, so it must consult this context
 /// before treating an unknown zero/constant-argument function as pure.
 fn is_stored_function_name(name: &str) -> bool {
+    if crate::parser::IntrinsicFunction::from_name(name).is_some() {
+        return false;
+    }
     if RESOLVED_STORED_FUNCTIONS
         .with(|functions| functions.borrow().contains_key(&name.to_ascii_lowercase()))
     {
@@ -4327,6 +4330,12 @@ pub(crate) fn eval_scalar_context(
 
 #[inline]
 pub(crate) fn eval_const(expr: &Expr) -> Result<Value, QueryError> {
+    if let Expr::Function { name, args, .. } = expr {
+        if name.eq_ignore_ascii_case("__TYPED_CONST") {
+            let _depth = ExpressionDepthGuard::enter()?;
+            return eval_const(crate::engine::expr_type::typed_constant_payload(args)?);
+        }
+    }
     eval_scalar_context(expr, || eval_const_inner(expr))
 }
 
@@ -4526,11 +4535,22 @@ fn eval_const_inner(expr: &Expr) -> Result<Value, QueryError> {
                 empty_expr_schema(),
                 "in",
             )?;
-            let value = eval_const(expr)?;
+            let value = bind_binary_comparison_value(
+                expr,
+                empty_expr_schema(),
+                collation_id,
+                eval_const(expr)?,
+            )?;
             let mut iter = list.iter();
             with_compare_collation(collation_id, || {
                 eval_in_list(value, *negated, || match iter.next() {
-                    Some(item) => Ok(Some(eval_const(item)?)),
+                    Some(item) => bind_binary_comparison_value(
+                        item,
+                        empty_expr_schema(),
+                        collation_id,
+                        eval_const(item)?,
+                    )
+                    .map(Some),
                     None => Ok(None),
                 })
             })
@@ -4691,6 +4711,16 @@ pub(crate) fn eval_expr_legacy(
     table: &TableSchema,
     values: &[Value],
 ) -> Result<Value, QueryError> {
+    if let Expr::Function { name, args, .. } = expr {
+        if name.eq_ignore_ascii_case("__TYPED_CONST") {
+            let _depth = ExpressionDepthGuard::enter()?;
+            return eval_expr_legacy(
+                crate::engine::expr_type::typed_constant_payload(args)?,
+                table,
+                values,
+            );
+        }
+    }
     eval_scalar_context(expr, || eval_expr_legacy_inner(expr, table, values))
 }
 
@@ -6066,6 +6096,7 @@ where
         // but retains its charset/collation/coercibility metadata for binding
         // and comparison. Runtime evaluation is therefore just the normal
         // bound-value clone, with no per-row charset conversion.
+        "__TYPED_CONST" => eval_arg(crate::engine::expr_type::typed_constant_payload(args)?),
         "__COLLATED_CONST" => {
             if args.len() < 3 {
                 expect_arg_count(name, args, 3)?;
@@ -7460,11 +7491,10 @@ where
                 values[2] = Value::String("en_US".into());
             }
             null_if_any(values, |values| {
-                // MySQL 8.0: D is clamped to [0, 30]; negative D is 0
-                // and D > 30 is 30. Without this clamp the exact decimal
-                // kernel would raise 1690 for scale > 38, which MySQL
-                // itself never does for FORMAT.
-                let raw_d = int_value(&values[1])?;
+                // MySQL narrows D to a signed 32-bit integer before
+                // clamping it to [0, 30]. Preserve that order even when
+                // integer conversion saturated an overflowing DECIMAL.
+                let raw_d = integer_arg_value(&values[1])? as i32;
                 let decimals = raw_d.clamp(0, 30) as usize;
                 let locale = values
                     .get(2)
@@ -7665,8 +7695,8 @@ where
             let values = eval_args(args, &mut eval_arg)?;
             null_if_any(values, |values| {
                 let n_str = string_value(&values[0]);
-                let from_base = int_value(&values[1])?;
-                let to_base = int_value(&values[2])?;
+                let from_base = integer_arg_value(&values[1])?;
+                let to_base = integer_arg_value(&values[2])?;
                 if !(2..=36).contains(&from_base.unsigned_abs())
                     || !(2..=36).contains(&to_base.unsigned_abs())
                 {
@@ -8221,7 +8251,10 @@ where
                     crate::engine::api::push_statement_warning(
                         crate::error::ConditionLevel::Warning,
                         crate::error::catalog::ER_TRUNCATED_WRONG_VALUE,
-                        format!("Truncated incorrect time value: '{}'", diagnostic_value(&str_value(&value))),
+                        format!(
+                            "Truncated incorrect time value: '{}'",
+                            diagnostic_value(&str_value(&value))
+                        ),
                     );
                 }
                 let micros = (seconds * 1_000_000.0).round().clamp(
@@ -10592,13 +10625,135 @@ pub(crate) fn clamp_round_decimals(d: i64) -> i32 {
     d.clamp(i32::MIN as i64, i32::MAX as i64) as i32
 }
 
+/// MySQL evaluates the integer arguments of `ROUND`/`TRUNCATE` (`D`),
+/// `FORMAT` (`D`) and `CONV` (both bases) through `Item::val_int()`: exact
+/// DECIMAL values round half away from zero (`0.5` -> 1, `2.5` -> 3),
+/// approximate FLOAT/DOUBLE values round ties to even (`2.5e0` -> 2), and
+/// strings keep the lenient truncating prefix (`'1.5'` -> 1, warning 1292).
+/// `int_value` only implements the truncating paths, so these call sites
+/// must not share it; functions such as `BIN`/`OCT` deliberately truncate
+/// and keep using `int_value`.
+fn integer_arg_value(value: &Value) -> Result<i64, QueryError> {
+    use crate::util::decimal::ExactDecimal;
+    use num_traits::{Signed, ToPrimitive};
+
+    match value {
+        Value::Float(number) => Ok((*number as f64).round_ties_even() as i64),
+        Value::Double(number) => Ok(number.round_ties_even() as i64),
+        Value::DecimalCompact(..)
+        | Value::Decimal128(..)
+        | Value::DecimalWide(..)
+        | Value::Decimal(_) => {
+            let exact = value.exact_decimal().ok_or_else(|| {
+                error(
+                    crate::error::catalog::ER_TRUNCATED_WRONG_VALUE,
+                    "incorrect DECIMAL value",
+                )
+            })?;
+            let rounded = crate::util::decimal::rescale_exact(exact, 0, true);
+            // Keep fixed-width coefficients allocation-free. Formatting
+            // the original argument is only necessary on overflow.
+            Ok(match rounded {
+                ExactDecimal::I64(magnitude, _) => magnitude,
+                ExactDecimal::I128(magnitude, _) => i64::try_from(magnitude)
+                    .unwrap_or_else(|_| decimal_integer_arg_overflow(value, magnitude < 0)),
+                ExactDecimal::Big(magnitude, _) => magnitude.to_i64().unwrap_or_else(|| {
+                    decimal_integer_arg_overflow(value, magnitude.is_negative())
+                }),
+            })
+        }
+        _ => int_value(value),
+    }
+}
+
+#[cold]
+fn decimal_integer_arg_overflow(value: &Value, negative: bool) -> i64 {
+    crate::engine::api::push_statement_warning(
+        crate::error::ConditionLevel::Warning,
+        crate::error::catalog::ER_TRUNCATED_WRONG_VALUE,
+        format!(
+            "Truncated incorrect DECIMAL value: '{}'",
+            value.to_display_string()
+        ),
+    );
+    if negative {
+        i64::MIN
+    } else {
+        i64::MAX
+    }
+}
+
+#[cfg(test)]
+mod integer_argument_tests {
+    use super::*;
+
+    #[test]
+    fn decimal_lanes_round_before_checking_signed_integer_bounds() {
+        for (magnitude, scale, expected, overflow) in [
+            (5i128, 1, 1, false),
+            (25, 1, 3, false),
+            (-25, 1, -3, false),
+            (2, 0, 2, false),
+            (1, 72, 0, false),
+            (92_233_720_368_547_758_074, 1, i64::MAX, false),
+            (92_233_720_368_547_758_075, 1, i64::MAX, true),
+            (-92_233_720_368_547_758_084, 1, i64::MIN, false),
+            (-92_233_720_368_547_758_085, 1, i64::MIN, true),
+            (i128::MAX, 0, i64::MAX, true),
+            (i128::MIN, 0, i64::MIN, true),
+        ] {
+            let text = crate::util::decimal::format_decimal_parts(magnitude, scale);
+            let mut values = vec![
+                Value::Decimal128(magnitude, scale),
+                Value::DecimalWide(Box::new(crate::types::DecimalWide {
+                    magnitude: magnitude.into(),
+                    scale,
+                })),
+                Value::Decimal(text.clone()),
+            ];
+            if let Ok(compact) = i64::try_from(magnitude) {
+                values.push(Value::DecimalCompact(compact, scale));
+            }
+            for value in values {
+                crate::engine::api::clear_statement_warnings();
+                assert_eq!(integer_arg_value(&value).unwrap(), expected, "{value:?}");
+                let warnings = crate::engine::api::take_statement_warnings();
+                assert_eq!(warnings.len(), usize::from(overflow), "{value:?}");
+                if overflow {
+                    assert!(warnings[0].is(crate::error::catalog::ER_TRUNCATED_WRONG_VALUE));
+                    assert_eq!(
+                        warnings[0].message(),
+                        format!("Truncated incorrect DECIMAL value: '{text}'")
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn approximate_arguments_round_ties_to_even_and_strings_still_truncate() {
+        crate::engine::api::clear_statement_warnings();
+        for (number, expected) in [(0.5, 0), (1.5, 2), (2.5, 2), (-1.5, -2), (-2.5, -2)] {
+            for value in [Value::Float(number as f32), Value::Double(number)] {
+                assert_eq!(integer_arg_value(&value).unwrap(), expected);
+                assert_eq!(int_value(&value).unwrap(), number as i64);
+            }
+        }
+        assert!(crate::engine::api::take_statement_warnings().is_empty());
+        assert_eq!(integer_arg_value(&Value::String("1.5".into())).unwrap(), 1);
+        let warnings = crate::engine::api::take_statement_warnings();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].is(crate::error::catalog::ER_TRUNCATED_WRONG_VALUE));
+    }
+}
+
 /// Coerce ROUND/TRUNCATE's D argument without routing an unsigned BIGINT
 /// through i64. Values above i64::MAX are still positive and therefore mean
 /// "keep all available fractional digits", not a huge negative scale.
 pub(crate) fn round_decimals_value(value: &Value) -> Result<i32, QueryError> {
     match value {
         Value::UInt(value) => Ok((*value).min(i32::MAX as u64) as i32),
-        _ => Ok(clamp_round_decimals(int_value(value)?)),
+        _ => Ok(clamp_round_decimals(integer_arg_value(value)?)),
     }
 }
 
@@ -11531,7 +11686,9 @@ where
             } else {
                 compare_values(&value, &best)?
             };
-            if (greatest && (ordering == Ordering::Greater || (string_context && ordering == Ordering::Equal)))
+            if (greatest
+                && (ordering == Ordering::Greater
+                    || (string_context && ordering == Ordering::Equal)))
                 || (!greatest && ordering == Ordering::Less)
             {
                 best = value;
@@ -13977,7 +14134,9 @@ pub(crate) fn parse_datetime(value: &Value) -> Result<NaiveDateTime, QueryError>
     // instant in the current session time zone (unlike a naive datetime
     // string, whose fields are preserved verbatim).
     if let Some(with_offset) = chrono::DateTime::parse_from_str(trimmed, "%Y-%m-%d %H:%M:%S%.f%:z")
-        .ok().filter(|dt| dt.nanosecond() < 1_000_000_000) {
+        .ok()
+        .filter(|dt| dt.nanosecond() < 1_000_000_000)
+    {
         let utc_micros = with_offset.timestamp_micros();
         let local_micros = session_utc_timestamp_to_local_datetime_micros(utc_micros)?;
         if let Some(local) = chrono::DateTime::from_timestamp_micros(local_micros) {
@@ -14007,7 +14166,9 @@ pub(crate) fn parse_datetime(value: &Value) -> Result<NaiveDateTime, QueryError>
         "%Y-%m-%dT%H:%M:%S",
     ] {
         if let Some(dt) = NaiveDateTime::parse_from_str(trimmed, fmt)
-            .ok().filter(|dt| dt.nanosecond() < 1_000_000_000) {
+            .ok()
+            .filter(|dt| dt.nanosecond() < 1_000_000_000)
+        {
             return Ok(dt);
         }
     }
@@ -14019,11 +14180,15 @@ pub(crate) fn parse_datetime(value: &Value) -> Result<NaiveDateTime, QueryError>
     // time functions accept sub-second precision like MySQL. The fractional
     // form is tried first; `%H:%M:%S` remains for the no-fraction case.
     if let Some(time) = NaiveTime::parse_from_str(trimmed, "%H:%M:%S%.f")
-        .ok().filter(|time| time.nanosecond() < 1_000_000_000) {
+        .ok()
+        .filter(|time| time.nanosecond() < 1_000_000_000)
+    {
         return Ok(NaiveDate::from_ymd_opt(1970, 1, 1).unwrap().and_time(time));
     }
     if let Some(time) = NaiveTime::parse_from_str(trimmed, "%H:%M:%S")
-        .ok().filter(|time| time.nanosecond() < 1_000_000_000) {
+        .ok()
+        .filter(|time| time.nanosecond() < 1_000_000_000)
+    {
         return Ok(NaiveDate::from_ymd_opt(1970, 1, 1).unwrap().and_time(time));
     }
     // MySQL compact numeric date/datetime forms: `20200101`, `991231`,
@@ -14058,7 +14223,11 @@ pub(crate) fn warn_superfluous_datetime_delimiter(text: &str) {
     let Some(separator) = text.bytes().position(|byte| matches!(byte, b' ' | b'T')) else {
         return;
     };
-    let Some(&delimiter) = text.as_bytes().get(separator + 1).filter(|byte| byte.is_ascii_punctuation()) else {
+    let Some(&delimiter) = text
+        .as_bytes()
+        .get(separator + 1)
+        .filter(|byte| byte.is_ascii_punctuation())
+    else {
         return;
     };
     crate::engine::api::push_statement_warning(
@@ -20003,6 +20172,15 @@ fn expr_collation_checked(
     memo: Option<&CollationValidationMemo>,
 ) -> Option<ExprCollation> {
     if let Expr::Function { name, args, .. } = expr {
+        if name.eq_ignore_ascii_case("__TYPED_CONST") {
+            let ty = crate::engine::expr_type::typed_constant_descriptor(args)?;
+            let info = crate::charset::resolve_collation_id(ty.collation_id?)?;
+            return Some(ExprCollation {
+                charset: info.charset,
+                collation_id: info.id,
+                coercibility: ty.coercibility,
+            });
+        }
         let result_type = function_result_type(name);
         if result_type == ColumnType::Geometry {
             return Some(ExprCollation {
@@ -20201,6 +20379,24 @@ fn expr_collation_checked(
     }
 
     match expr {
+        Expr::Placeholder(index) => crate::engine::params::with_current_param(*index, |value| {
+            // Cached text shapes replace literals with parameters. Keep the
+            // same string/binary derivation as their bound literal values.
+            let (info, coercibility) = match value? {
+                Value::String(_) | Value::SmallString(_) => (connection_collation_info(), 4),
+                Value::Bytes(_) | Value::Geometry(_) => (
+                    crate::charset::resolve_collation_id(crate::charset::BINARY_COLLATION_ID)?,
+                    4,
+                ),
+                Value::Null => return None,
+                _ => (connection_collation_info(), 5),
+            };
+            Some(ExprCollation {
+                charset: info.charset,
+                collation_id: info.id,
+                coercibility,
+            })
+        }),
         Expr::Literal(Literal::String(_))
         | Expr::UserVariable(_)
         | Expr::BoundValue(Value::String(_) | Value::SmallString(_)) => {
@@ -21976,8 +22172,20 @@ fn prune_lazy_constant_branches_checked(expr: &mut Expr) {
 /// Pre-evaluate constant sub-expressions so they are not recomputed per row.
 pub(crate) fn fold_constant_subexprs(expr: &mut Expr) {
     let _memo = StoredFunctionNameMemo::enter();
-    prune_lazy_constant_branches(expr);
+    // Correlated values are constant for this binding, but pruning a branch
+    // based on that value must not narrow the declared output domain.
+    if !contains_typed_constant(expr) {
+        prune_lazy_constant_branches(expr);
+    }
     fold_constant_subexprs_inner(expr);
+}
+
+fn contains_typed_constant(expr: &Expr) -> bool {
+    crate::parser::visit::any_expr_matching(
+        expr,
+        |node| matches!(node, Expr::Function { name, .. } if name.eq_ignore_ascii_case("__TYPED_CONST")),
+        |_| true,
+    )
 }
 
 /// Fold deterministic temporal arithmetic when it appears as a predicate
@@ -22049,6 +22257,9 @@ fn fold_constant_subexprs_inner_checked(expr: &mut Expr) {
     if matches!(expr, Expr::Literal(_) | Expr::BoundValue(_)) {
         return;
     }
+    if matches!(expr, Expr::Function { name, .. } if name.eq_ignore_ascii_case("__TYPED_CONST")) {
+        return;
+    }
     // A unary minus around an overwide exact DECIMAL carries the source
     // magnitude needed by comparison. Folding it independently would first
     // clamp the child to DECIMAL(65), then replace the subtree with that
@@ -22081,6 +22292,11 @@ fn fold_constant_subexprs_inner_checked(expr: &mut Expr) {
     // evaluated. Folding its children independently would execute unreachable
     // expressions and leak their conversion warnings before the parent gets a
     // chance to short-circuit.
+    if matches!(expr, Expr::Function { name, .. } if name.eq_ignore_ascii_case("MAKE_SET"))
+        && contains_typed_constant(expr)
+    {
+        return;
+    }
     if let Expr::Function { name, args, .. } = expr {
         if name.eq_ignore_ascii_case("MAKE_SET") {
             if args.first().is_some_and(expr_is_constant) {
@@ -22244,8 +22460,25 @@ fn fold_constant_subexprs_inner_checked(expr: &mut Expr) {
     }
     // If the whole subtree is constant, evaluate once.
     if is_constant {
+        let typed_domain = contains_typed_constant(expr).then(|| {
+            let no_column = |_: &Expr| None;
+            let no_placeholder = |_: usize| None;
+            crate::engine::expr_type::infer_expr_type(
+                expr,
+                &crate::engine::expr_type::TypeContext::context_free(&no_column, &no_placeholder),
+            )
+        });
         if let Ok(value) = eval_const(expr) {
-            *expr = if expr_is_boolean_typed(expr) && !matches!(value, Value::Null) {
+            *expr = if let Some(descriptor) = typed_domain {
+                let mut source = crate::types::ColumnSource::default();
+                descriptor.apply_to_source(&mut source);
+                source.collation_coercibility = Some(descriptor.coercibility);
+                crate::engine::expr_type::typed_constant(
+                    Expr::BoundValue(value),
+                    descriptor.column_type(),
+                    &source,
+                )
+            } else if expr_is_boolean_typed(expr) && !matches!(value, Value::Null) {
                 Expr::Literal(Literal::Bool(truthy(&value)))
             } else {
                 Expr::BoundValue(value)
@@ -23500,19 +23733,37 @@ pub(crate) fn validate_expr_collations(expr: &Expr, table: &TableSchema) -> Resu
                         let binary_variable = match &args[0] {
                             Expr::UserVariable(name) => {
                                 let key = crate::engine::api::normalize_user_variable_name(name);
-                                with_session_view(|view| view.is_none_or(|view| view.user_variable_is_binary_or_null(&key)))
+                                with_session_view(|view| {
+                                    view.is_none_or(|view| {
+                                        view.user_variable_is_binary_or_null(&key)
+                                    })
+                                })
                             }
                             _ => false,
                         };
                         let bit_string = expr_column_index(&args[0], table)
                             .and_then(|index| table.columns.get(index))
-                            .is_some_and(|column| matches!(column.data_type, DataTypeKind::Bit { .. }));
-                        let source_charset = if binary_variable || bit_string {
+                            .is_some_and(|column| {
+                                matches!(column.data_type, DataTypeKind::Bit { .. })
+                            });
+                        let source_charset = if matches!(
+                            &args[0],
+                            Expr::Placeholder(index)
+                                if crate::engine::params::user_parameter_active(*index)
+                        ) {
+                            // COLLATE derives a genuine parameter's character
+                            // domain from its target, not the bound value.
+                            // Auto-parameterized literals keep their charset.
+                            Some(target.charset)
+                        } else if binary_variable || bit_string {
                             Some("binary")
                         } else {
                             source.map(|source| source.charset).or_else(|| {
-                                matches!(expr_type_descriptor(&args[0], table).class,
-                                    ExprTypeClass::Null).then_some("binary")
+                                matches!(
+                                    expr_type_descriptor(&args[0], table).class,
+                                    ExprTypeClass::Null
+                                )
+                                .then_some("binary")
                             })
                         };
                         if let Some(source_charset) = source_charset {

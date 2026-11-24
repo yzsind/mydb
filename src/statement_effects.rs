@@ -92,6 +92,14 @@ pub(crate) fn statement_effects(statement: &Statement) -> StatementEffects {
                 CATALOG_NONDISPATCH
             }
         }
+        S::BinlogAdmin { sql }
+            if sql
+                .trim_start()
+                .get(..5)
+                .is_some_and(|s| s.eq_ignore_ascii_case("RESET")) =>
+        {
+            MAINTENANCE_NONDISPATCH
+        }
         S::AlterSystemReloadHttpConfig => READ_ONLY,
         S::ShowHttpStatus => READ_ONLY,
         S::RowSecurity(command) => match command {

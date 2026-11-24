@@ -570,6 +570,9 @@ fn execute_parameter_insert(
     let _ignore_coercion = crate::storage::DmlIgnoreCoercionGuard::new(false);
     let inserted = db.insert_rows_detailed(txn, &stmt.table, rows)?;
     crate::engine::api::set_statement_insert_id(inserted.first_insert_id);
+    if inserted.first_insert_id == 0 {
+        crate::engine::api::set_statement_ok_insert_id(inserted.last_copied_insert_id);
+    }
     finalize_insert_info(binding.row_count as u64, false);
     Ok(QueryResponse::OkAffected {
         affected_rows: inserted.row_ids.len() as u64,
@@ -1970,7 +1973,10 @@ where
         if expressions.len() != column_indexes.len() {
             return Err(error(
                 crate::error::catalog::ER_WRONG_VALUE_COUNT_ON_ROW,
-                format!("Column count doesn't match value count at row {}", row_index + 1),
+                format!(
+                    "Column count doesn't match value count at row {}",
+                    row_index + 1
+                ),
             ));
         }
         let simple = !has_generated_target
@@ -2476,8 +2482,12 @@ fn execute_batch_odku(
 
     let matched = crate::engine::api::statement_matched_rows().unwrap_or(0);
     crate::engine::api::set_statement_matched_rows(matched + batch_inserted);
-    crate::engine::api::set_statement_insert_id(ids.last_copied);
-    crate::engine::api::set_statement_ok_insert_id(ids.last_updated);
+    crate::engine::api::set_statement_insert_id(ids.first_generated);
+    crate::engine::api::set_statement_ok_insert_id(if ids.last_copied != 0 {
+        ids.last_copied
+    } else {
+        ids.last_updated
+    });
     Ok(QueryResponse::OkAffected {
         affected_rows: affected,
     })
@@ -2645,8 +2655,12 @@ pub(super) fn execute_insert_rows<const TRIGGERS: bool>(
         rows_prepared,
         &mut ids,
     )?;
-    crate::engine::api::set_statement_insert_id(ids.last_copied);
-    crate::engine::api::set_statement_ok_insert_id(ids.last_updated);
+    crate::engine::api::set_statement_insert_id(ids.first_generated);
+    crate::engine::api::set_statement_ok_insert_id(if ids.last_copied != 0 {
+        ids.last_copied
+    } else {
+        ids.last_updated
+    });
     Ok(result)
 }
 
@@ -2811,8 +2825,18 @@ fn execute_insert_rows_with_ids<const TRIGGERS: bool>(
                 continue;
             }
         }
+        let candidate_id = if TRIGGERS
+            && on_duplicate.is_some_and(|updates| {
+                table.auto_increment_column_index().is_some_and(|idx| {
+                    duplicate_reads_auto_candidate(updates, &table, idx, alias_binding.as_ref())
+                })
+            }) {
+            db.assign_auto_increment_candidate(&table, &mut values)?
+        } else {
+            0
+        };
         let mut deleted = 0u64;
-        let inserted = loop {
+        let mut inserted = loop {
             // Preserve the existing IGNORE boundary: BEFORE INSERT failures propagate.
             let row_savepoint = if (ignore || replace || on_duplicate.is_some()) && txn.txn_id != 0
             {
@@ -2905,16 +2929,13 @@ fn execute_insert_rows_with_ids<const TRIGGERS: bool>(
             };
             break inserted;
         };
+        if candidate_id != 0 {
+            inserted.first_insert_id = candidate_id;
+        }
         if ids.first_generated == 0 {
             ids.first_generated = inserted.first_insert_id;
         }
-        if let Some(idx) = table.auto_increment_column_index() {
-            ids.last_copied = if inserted.first_insert_id != 0 {
-                inserted.first_insert_id
-            } else {
-                auto_increment_row_id(&values, Some(idx))
-            };
-        }
+        ids.last_copied = inserted.last_copied_insert_id;
         if needs_image {
             if inserted.first_insert_id != 0 {
                 if let Some(idx) = table.columns.iter().position(|c| c.auto_increment) {
@@ -2965,6 +2986,32 @@ fn execute_insert_rows_with_ids<const TRIGGERS: bool>(
     }))
 }
 
+fn duplicate_reads_auto_candidate(
+    updates: &[crate::parser::Assignment],
+    table: &TableSchema,
+    idx: usize,
+    alias: Option<&InsertAliasBinding>,
+) -> bool {
+    let auto_name = &table.columns[idx].name;
+    updates.iter().any(|assignment| {
+        crate::parser::visit::any_expr(&assignment.value, |node| match node {
+            Expr::Function { name, args, .. } if name.eq_ignore_ascii_case("VALUES") => args
+                .first()
+                .and_then(expr_column_name)
+                .is_some_and(|name| name.eq_ignore_ascii_case(auto_name)),
+            Expr::CompoundIdentifier(parts) if parts.len() >= 2 => alias.is_some_and(|a| {
+                parts[parts.len() - 2].eq_ignore_ascii_case(&a.row_alias)
+                    && a.columns.get(&parts[parts.len() - 1].to_ascii_lowercase()) == Some(&idx)
+            }),
+            Expr::Identifier(name) => {
+                alias.is_some_and(|a| a.columns.get(&name.to_ascii_lowercase()) == Some(&idx))
+                    && table.column_index(name).is_err()
+            }
+            _ => false,
+        })
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn apply_insert_duplicate<const TRIGGERS: bool>(
     db: &Arc<Database>,
@@ -2979,6 +3026,19 @@ fn apply_insert_duplicate<const TRIGGERS: bool>(
     needs_image: bool,
     returning: &mut super::returning::ReturningCollector,
 ) -> Result<(bool, u64), QueryError> {
+    // Preserve probe-first allocation for ordinary upserts. A VALUES(id) or
+    // row-alias reference needs an actual candidate, not the NULL input slot.
+    let mut candidate = None;
+    if let Some(idx) = table.auto_increment_column_index() {
+        let reads_candidate = duplicate_reads_auto_candidate(updates, table, idx, alias);
+        if reads_candidate && matches!(proposed[idx], Value::Null | Value::Int(0) | Value::UInt(0))
+        {
+            let mut values = proposed.to_vec();
+            db.assign_auto_increment_candidate(table, &mut values)?;
+            candidate = Some(values);
+        }
+    }
+    let proposed = candidate.as_deref().unwrap_or(proposed);
     let _security = crate::engine::rls::StrictOldScope::enter();
     crate::engine::rls::check_row(
         db,
@@ -3500,7 +3560,8 @@ pub(super) fn execute_insert_values(
         }
         if full_width_identity {
             if has_generated {
-                db.materialize_generated_columns_for_insert(&table, row).map_err(|err| err.with_input_row_number(row_index + 1))?;
+                db.materialize_generated_columns_for_insert(&table, row)
+                    .map_err(|err| err.with_input_row_number(row_index + 1))?;
             }
             continue;
         }
@@ -3508,7 +3569,8 @@ pub(super) fn execute_insert_values(
             expand_ordered_insert_row(&table, &column_indexes, &missing_positions, row);
             enforce_missing_required_columns(&table, row, &missing_required, false)?;
             if has_generated {
-                db.materialize_generated_columns_for_insert(&table, row).map_err(|err| err.with_input_row_number(row_index + 1))?;
+                db.materialize_generated_columns_for_insert(&table, row)
+                    .map_err(|err| err.with_input_row_number(row_index + 1))?;
             }
             continue;
         }
@@ -3537,7 +3599,8 @@ pub(super) fn execute_insert_values(
         // The plain (non-IGNORE) VALUES path: IGNORE/REPLACE/ODKU are routed to
         // `execute_insert_with_conflict`, so `ignore` is always false here.
         enforce_missing_required_columns(&table, &mut values, &missing_required, false)?;
-        db.materialize_generated_columns_for_insert(&table, &mut values).map_err(|err| err.with_input_row_number(row_index + 1))?;
+        db.materialize_generated_columns_for_insert(&table, &mut values)
+            .map_err(|err| err.with_input_row_number(row_index + 1))?;
         *row = values;
     }
     let inserted = if autoinc_fast {
@@ -3546,6 +3609,9 @@ pub(super) fn execute_insert_values(
         db.insert_rows_detailed(txn, table_name, rows)?
     };
     crate::engine::api::set_statement_insert_id(inserted.first_insert_id);
+    if inserted.first_insert_id == 0 {
+        crate::engine::api::set_statement_ok_insert_id(inserted.last_copied_insert_id);
+    }
     let affected_rows = inserted.row_ids.len() as u64;
     if returning.is_none() {
         return Ok(QueryResponse::OkAffected { affected_rows });
@@ -3621,7 +3687,9 @@ pub(super) fn insert_targets_generated(
     columns: Option<&[String]>,
 ) -> Result<Option<usize>, QueryError> {
     let column_indexes = insert_column_indexes(table, columns)?;
-    Ok(column_indexes.into_iter().find(|idx| table.columns[*idx].generated_expr.is_some()))
+    Ok(column_indexes
+        .into_iter()
+        .find(|idx| table.columns[*idx].generated_expr.is_some()))
 }
 
 fn expr_is_default_for_column(expr: &Expr, column: &str) -> bool {
@@ -3635,7 +3703,10 @@ fn expr_is_default_for_column(expr: &Expr, column: &str) -> bool {
 fn generated_column_assignment_error(table: &TableSchema, column: usize) -> QueryError {
     error(
         crate::error::catalog::ER_NON_DEFAULT_VALUE_FOR_GENERATED_COLUMN,
-        format!("The value specified for generated column '{}' in table '{}' is not allowed.", table.columns[column].name, table.name),
+        format!(
+            "The value specified for generated column '{}' in table '{}' is not allowed.",
+            table.columns[column].name, table.name
+        ),
     )
 }
 

@@ -5675,16 +5675,7 @@ pub(super) fn distinct_key_preflight(
     if projection.is_empty() {
         return None;
     }
-    if projection.iter().all(|item| {
-        matches!(
-            item,
-            SelectItem::Expr {
-                expr: Expr::GroupKeyRef { .. },
-                ..
-            }
-        )
-    }) && hash_aggregate_node(input).is_some()
-    {
+    if hash_aggregate_node(input).is_some() {
         let (template, projected, _) =
             preflight_hash_aggregate_result_projection(input, projection)?;
         let columns = projected

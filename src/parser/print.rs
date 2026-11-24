@@ -333,6 +333,8 @@ fn render_expr_options(expr: &Expr, canonical: bool, queries: bool) -> String {
             .join("."),
         Expr::UserVariable(name) => {
             if !name.is_empty()
+                // Empty dot-separated components need quoting to parse again.
+                && name.split('.').all(|part| !part.is_empty())
                 && name
                     .chars()
                     .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '$' | '.'))
@@ -452,6 +454,33 @@ fn render_expr_options(expr: &Expr, canonical: bool, queries: bool) -> String {
             }
             out.push_str(" END");
             out
+        }
+        Expr::Function {
+            name,
+            args,
+            distinct: false,
+        } if name == "__INTERVAL" && args.len() == 2 => {
+            let unit = match &args[1] {
+                Expr::Literal(Literal::String(unit)) => unit.as_str(),
+                _ => {
+                    return format!(
+                        "__INTERVAL({}, {})",
+                        expr_to_sql(&args[0]),
+                        expr_to_sql(&args[1])
+                    )
+                }
+            };
+            format!("INTERVAL {} {unit}", expr_to_sql(&args[0]))
+        }
+        Expr::Function {
+            name,
+            args,
+            distinct: false,
+        } if name == "__INTERVAL_LIST" => {
+            format!(
+                "INTERVAL({})",
+                args.iter().map(expr_to_sql).collect::<Vec<_>>().join(", ")
+            )
         }
         Expr::Function {
             name,

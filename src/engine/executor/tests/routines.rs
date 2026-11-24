@@ -1177,31 +1177,17 @@ fn routine_metadata_left_join_group_concat_keeps_group_keys_visible() {
 }
 
 #[test]
-fn show_profiles_and_binlog_events_return_empty_result_set() {
+fn profiling_is_explicitly_unsupported_and_disabled_binlog_events_are_empty() {
     let dir = tempfile::tempdir().unwrap();
     let engine = open_test_engine(dir.path());
     let mut session = SessionContext::default();
 
-    // SHOW PROFILES — deprecated in MySQL 5.7+; mydb returns empty result.
-    let QueryResponse::ResultSet(rs) = exec(&engine, &mut session, "SHOW PROFILES").unwrap() else {
-        panic!("expected result set for SHOW PROFILES");
-    };
-    assert_eq!(rs.rows.len(), 0);
-    assert_eq!(rs.columns.len(), 3);
-    assert_eq!(rs.columns[0].name, "Query_ID");
-    assert_eq!(rs.columns[1].name, "Duration");
-    assert_eq!(rs.columns[2].name, "Query");
+    // Parsing succeeds, but unimplemented profiling must report an error.
+    for sql in ["SHOW PROFILES", "SHOW PROFILE", "SHOW PROFILE CPU"] {
+        assert_eq!(exec(&engine, &mut session, sql).unwrap_err().code(), 1235);
+    }
 
-    // SHOW PROFILE — empty result with the canonical 2-column shape.
-    let QueryResponse::ResultSet(rs) = exec(&engine, &mut session, "SHOW PROFILE").unwrap() else {
-        panic!("expected result set for SHOW PROFILE");
-    };
-    assert_eq!(rs.rows.len(), 0);
-    assert_eq!(rs.columns.len(), 2);
-    assert_eq!(rs.columns[0].name, "Status");
-    assert_eq!(rs.columns[1].name, "Duration");
-
-    // SHOW BINLOG EVENTS — mydb has no MySQL binlog stream; empty result.
+    // SHOW BINLOG EVENTS has no events while binary logging is disabled.
     let QueryResponse::ResultSet(rs) = exec(&engine, &mut session, "SHOW BINLOG EVENTS").unwrap()
     else {
         panic!("expected result set for SHOW BINLOG EVENTS");

@@ -1369,8 +1369,8 @@ impl CompiledSelectPlan {
     pub(crate) fn zone_pruning_current(&self, db: &crate::storage::Database) -> bool {
         self.zone_pruning_deps.iter().all(|(table, planned)| {
             db.zone_map_mutation_epoch(table).is_some_and(|current| {
-                current.saturating_sub(*planned)
-                    < crate::planner::ZONE_PRUNED_PLAN_REVALIDATE_MUTATIONS
+                current >= *planned
+                    && current - *planned < crate::planner::ZONE_PRUNED_PLAN_REVALIDATE_MUTATIONS
             })
         })
     }

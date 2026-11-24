@@ -1853,12 +1853,27 @@ fn native_cosine_bulk_creation_rejects_existing_int8_zero_rows() {
     std::fs::create_dir_all("/tmp/mydb").unwrap();
     let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
     let engine = open_strict_hnsw_test_engine(dir.path());
-    engine.execute("CREATE TABLE items(id INT PRIMARY KEY, emb VECTOR(3,INT8) NOT NULL)").unwrap();
-    let values = (0..2048).map(|id| format!("({id},'[{}, {}, 3]')", id % 128, id / 128 + 1)).collect::<Vec<_>>().join(",");
-    engine.execute(&format!("INSERT INTO items VALUES {values},(2048,'[0,0,0]')")).unwrap();
+    engine
+        .execute("CREATE TABLE items(id INT PRIMARY KEY, emb VECTOR(3,INT8) NOT NULL)")
+        .unwrap();
+    let values = (0..2048)
+        .map(|id| format!("({id},'[{}, {}, 3]')", id % 128, id / 128 + 1))
+        .collect::<Vec<_>>()
+        .join(",");
+    engine
+        .execute(&format!(
+            "INSERT INTO items VALUES {values},(2048,'[0,0,0]')"
+        ))
+        .unwrap();
     let err = engine.execute("CREATE INDEX idx_emb ON items(emb) USING HNSW WITH(metric=COSINE,m=4,ef_construction=16)").unwrap_err();
     assert_eq!(err.code(), 50001);
-    assert!(engine.database().table("items").unwrap().indexes.iter().all(|index| index.name != "idx_emb"));
+    assert!(engine
+        .database()
+        .table("items")
+        .unwrap()
+        .indexes
+        .iter()
+        .all(|index| index.name != "idx_emb"));
     assert_eq!(cell(&engine, "SELECT SUM(1) FROM items"), "2049");
 }
 

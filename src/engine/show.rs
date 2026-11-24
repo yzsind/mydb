@@ -246,11 +246,7 @@ pub(crate) fn show_columns(
                     .is_empty()
             })
             .map(|column| {
-                let type_str = column
-                    .data_type
-                    .as_ref()
-                    .map(|kind| mysql_type_name_with_unsigned(kind, column.unsigned))
-                    .unwrap_or_else(|| "varchar(255)".to_string());
+                let type_str = mysql_view_column_type_name(column);
                 let mut row = vec![
                     Value::String(column.name.clone()),
                     Value::String(type_str),
@@ -384,12 +380,18 @@ fn column_collation_for_show(column: &crate::storage::ColumnSchema) -> Value {
     }
 }
 
+pub(crate) fn append_show_like_heading(columns: &mut [Column], filter: Option<&ShowFilter>) {
+    if let (Some(first), Some(ShowFilter::Like(pattern))) = (columns.first_mut(), filter) {
+        first.name.push_str(&format!(" ({pattern})"));
+    }
+}
+
 pub(crate) fn show_databases(
     db: &Database,
     session: &SessionContext,
     filter: Option<&ShowFilter>,
 ) -> Result<QueryResponse, QueryError> {
-    let columns = vec![col("Database", ColumnType::VarString)];
+    let mut columns = vec![col("Database", ColumnType::VarString)];
     let mut rows = db
         .catalog()
         .databases
@@ -401,6 +403,7 @@ pub(crate) fn show_databases(
         .map(|name| vec![Value::String(name.clone())])
         .collect();
     apply_show_filter(&mut rows, &columns, filter, "Database")?;
+    append_show_like_heading(&mut columns, filter);
     Ok(QueryResponse::ResultSet(ResultSet { columns, rows }))
 }
 
@@ -428,7 +431,7 @@ pub(crate) fn show_tables(
     filter: Option<&ShowFilter>,
 ) -> Result<QueryResponse, QueryError> {
     require_show_database(db, database)?;
-    let columns = show_tables_columns(database, full, filter);
+    let mut columns = show_tables_columns(database, full);
     if let Some(rows) = crate::engine::information_schema::show_tables_rows(db, database, full)? {
         let mut rows = rows;
         rows.retain(|row| {
@@ -445,8 +448,9 @@ pub(crate) fn show_tables(
             &mut rows,
             &columns,
             filter,
-            &columns[0].name,
+            &format!("Tables_in_{database}"),
         )?;
+        append_show_like_heading(&mut columns, filter);
         return Ok(QueryResponse::ResultSet(ResultSet { columns, rows }));
     }
     // Tables and views appear in a single sorted listing — MySQL clients
@@ -504,8 +508,9 @@ pub(crate) fn show_tables(
         &mut rows,
         &columns,
         filter,
-        &columns[0].name,
+        &format!("Tables_in_{database}"),
     )?;
+    append_show_like_heading(&mut columns, filter);
     Ok(QueryResponse::ResultSet(ResultSet { columns, rows }))
 }
 
@@ -513,13 +518,10 @@ pub(crate) fn show_tables(
 // after MySQL's Tables_in_<db> and Table_type columns we append TABLE_ROWS, DATA_LENGTH,
 // INDEX_LENGTH, CREATE_TIME and TABLE_COMMENT. The design covers user and system
 // databases alike and must not be dropped as a MySQL compatibility gap; plain SHOW TABLES still returns only the table-name column.
-pub(crate) fn show_tables_columns(database: &str, full: bool, filter: Option<&ShowFilter>) -> Vec<Column> {
+pub(crate) fn show_tables_columns(database: &str, full: bool) -> Vec<Column> {
     let mut columns = vec![Column {
         source: Default::default(),
-        name: match filter {
-            Some(ShowFilter::Like(pattern)) => format!("Tables_in_{database} ({pattern})"),
-            _ => format!("Tables_in_{database}"),
-        },
+        name: format!("Tables_in_{}", crate::storage::normalize_name(database)),
         column_type: ColumnType::VarString,
     }];
     if full {
@@ -584,7 +586,7 @@ pub(crate) fn show_table_status(
             .values()
             .filter(|view| view.database.eq_ignore_ascii_case(database) && visible(&view.name))
         {
-            rows.push(view_table_status_row(&view.name));
+            rows.push(view_table_status_row(view));
         }
     }
 
@@ -663,7 +665,9 @@ fn base_table_status_row(db: &Database, table: &TableSchema) -> Result<Vec<Value
         Value::Int(saturating_i64(stats.data_free)),
         auto_increment,
         mysql_time_value(table.created_ms),
-        Value::Null,
+        db.table_update_time_ms(table.id)
+            .map(mysql_time_value)
+            .unwrap_or(Value::Null),
         Value::Null,
         Value::String(table.collation.clone()),
         Value::Null,
@@ -672,9 +676,9 @@ fn base_table_status_row(db: &Database, table: &TableSchema) -> Result<Vec<Value
     ])
 }
 
-fn view_table_status_row(name: &str) -> Vec<Value> {
+fn view_table_status_row(view: &ViewSchema) -> Vec<Value> {
     vec![
-        Value::String(name.to_string()),
+        Value::String(view.name.clone()),
         Value::Null,
         Value::Null,
         Value::Null,
@@ -685,7 +689,7 @@ fn view_table_status_row(name: &str) -> Vec<Value> {
         Value::Null,
         Value::Null,
         Value::Null,
-        Value::Null,
+        mysql_time_value(view.created_ms),
         Value::Null,
         Value::Null,
         Value::Null,
@@ -1198,7 +1202,10 @@ pub(crate) fn show_routine_status(
             ]
         })
         .collect::<Vec<_>>();
-    rows.sort_by(|a, b| a[1].to_display_string().cmp(&b[1].to_display_string()));
+    rows.sort_by(|a, b| {
+        (a[0].to_display_string(), a[1].to_display_string())
+            .cmp(&(b[0].to_display_string(), b[1].to_display_string()))
+    });
     apply_show_filter(&mut rows, &columns, filter, "Name")?;
     Ok(QueryResponse::ResultSet(ResultSet { columns, rows }))
 }
@@ -1251,6 +1258,7 @@ pub(crate) fn show_triggers(
 ) -> Result<QueryResponse, QueryError> {
     let database = database.unwrap_or(&session.current_database);
     require_show_database(db, database)?;
+    super::auth::require_database_access(db, session, database)?;
     let columns = show_triggers_columns();
     let mut trigger_list = db.triggers_in_database(database);
     if database.eq_ignore_ascii_case("sys") {
@@ -1404,7 +1412,9 @@ pub(crate) fn show_events(
     filter: Option<&ShowFilter>,
 ) -> Result<QueryResponse, QueryError> {
     let database = database.unwrap_or(&session.current_database);
-    require_show_database(db, database)?;
+    if database.is_empty() {
+        require_show_database(db, database)?;
+    }
     let columns = show_events_columns();
     // G11: MySQL only lists events in schemas where the caller holds the
     // EVENT privilege; otherwise the result is empty (not an error).
@@ -1537,7 +1547,7 @@ fn show_create_event_columns() -> Vec<Column> {
     vec![
         col("Event", ColumnType::VarString),
         col("sql_mode", ColumnType::VarString),
-        col("time zone", ColumnType::VarString),
+        col("time_zone", ColumnType::VarString),
         col("Create Event", ColumnType::VarString),
         col("character_set_client", ColumnType::VarString),
         col("collation_connection", ColumnType::VarString),
@@ -1552,11 +1562,11 @@ fn show_events_columns() -> Vec<Column> {
         col("Definer", ColumnType::VarString),
         col("Time zone", ColumnType::VarString),
         col("Type", ColumnType::VarString),
-        col("Execute at", ColumnType::VarString),
+        col("Execute at", ColumnType::DateTime),
         col("Interval value", ColumnType::VarString),
         col("Interval field", ColumnType::VarString),
-        col("Starts", ColumnType::VarString),
-        col("Ends", ColumnType::VarString),
+        col("Starts", ColumnType::DateTime),
+        col("Ends", ColumnType::DateTime),
         col("Status", ColumnType::VarString),
         col("Originator", ColumnType::LongLong),
         col("character_set_client", ColumnType::VarString),
@@ -1770,6 +1780,15 @@ pub(crate) fn create_sequence_sql(seq: &SequenceSchema) -> String {
     s.push_str(&format!(" MAXVALUE {}", seq.max_value));
     s.push_str(&format!(" CACHE {}", seq.cache));
     s.push_str(if seq.cycle { " CYCLE" } else { " NO CYCLE" });
+    if let (Some(table), Some(column)) = (&seq.owned_table, &seq.owned_column) {
+        let (database, table) = crate::storage::split_table_name(&seq.database, table);
+        s.push_str(&format!(
+            " OWNED BY `{}`.`{}`.`{}`",
+            database.replace('`', "``"),
+            table.replace('`', "``"),
+            column.replace('`', "``")
+        ));
+    }
     s
 }
 
@@ -1909,9 +1928,35 @@ fn format_float_double(name: &str, precision: Option<u8>, scale: Option<u8>) -> 
 }
 
 pub(crate) fn mysql_column_type_name(column: &crate::storage::ColumnSchema) -> String {
-    let name = mysql_type_name_with_attrs(&column.data_type, column.unsigned, column.zerofill);
-    if column.zerofill && column.data_type.is_integer() {
-        if let Some(width) = column.display_width {
+    mysql_type_name_with_display_width(
+        &column.data_type,
+        column.unsigned,
+        column.zerofill,
+        column.display_width,
+    )
+}
+
+pub(crate) fn mysql_view_column_type_name(column: &crate::storage::ViewColumnDef) -> String {
+    mysql_type_name_with_display_width(
+        column
+            .data_type
+            .as_ref()
+            .unwrap_or(&DataTypeKind::VarChar { len: Some(255) }),
+        column.unsigned,
+        column.zerofill,
+        column.display_width,
+    )
+}
+
+fn mysql_type_name_with_display_width(
+    data_type: &DataTypeKind,
+    unsigned: bool,
+    zerofill: bool,
+    display_width: Option<u16>,
+) -> String {
+    let name = mysql_type_name_with_attrs(data_type, unsigned, zerofill);
+    if zerofill && data_type.is_integer() {
+        if let Some(width) = display_width {
             let end = name.find(' ').unwrap_or(name.len());
             return format!(
                 "{}({width}){}",
@@ -3036,9 +3081,7 @@ pub(crate) fn show_engine_result(
     engine: &str,
     kind: ShowEngineKind,
 ) -> Result<QueryResponse, QueryError> {
-    if !engine.eq_ignore_ascii_case("mydb")
-        && !(engine.eq_ignore_ascii_case("innodb") && kind == ShowEngineKind::Status)
-    {
+    if !engine.eq_ignore_ascii_case("mydb") && !engine.eq_ignore_ascii_case("innodb") {
         return Err(crate::storage::error(
             crate::error::catalog::ER_UNKNOWN_STORAGE_ENGINE,
             format!("Unknown storage engine '{engine}'"),
@@ -3637,15 +3680,36 @@ fn render_bucket(
 
 pub(crate) fn show_create_user_result(
     db: &Database,
+    session: &SessionContext,
     account: &AccountKey,
 ) -> Result<QueryResponse, QueryError> {
     let auth = db.auth_catalog();
-    show_create_user_from_catalog(&auth, account)
+    let reveal = session.internal_system_session
+        || auth.account_has_privilege(
+            &session.authorization_context(),
+            &RequiredPrivilege {
+                privilege: Privilege::Select,
+                scope: PrivilegeScope::Table {
+                    database: "mysql".into(),
+                    table: "user".into(),
+                },
+            },
+            false,
+        );
+    render_create_user(&auth, account, reveal)
 }
 
 pub(crate) fn show_create_user_from_catalog(
     auth: &crate::engine::auth::AuthCatalog,
     account: &AccountKey,
+) -> Result<QueryResponse, QueryError> {
+    render_create_user(auth, account, true)
+}
+
+fn render_create_user(
+    auth: &crate::engine::auth::AuthCatalog,
+    account: &AccountKey,
+    reveal: bool,
 ) -> Result<QueryResponse, QueryError> {
     let Some(user) = auth.accounts.get(&crate::engine::auth::account_id(account)) else {
         return Err(crate::storage::error(
@@ -3657,10 +3721,14 @@ pub(crate) fn show_create_user_from_catalog(
         ));
     };
     let mut sql = format!(
-        "CREATE USER {} IDENTIFIED WITH '{}' AS '{}'",
+        "CREATE USER {} IDENTIFIED WITH '{}' AS {}",
         account.display(),
         sql_quote(&user.plugin),
-        sql_quote(&user.authentication_string)
+        if reveal {
+            format!("'{}'", sql_quote(&user.authentication_string))
+        } else {
+            "<secret>".into()
+        }
     );
     match &user.ssl_type {
         SslRequirement::None => sql.push_str(" REQUIRE NONE"),

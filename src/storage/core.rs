@@ -76,6 +76,26 @@ use super::wait_events::{WaitEvent, WaitEventHistory, WaitEventSample};
 const PENDING_LIVE_ROW_DELTA_SHARDS: usize = 64;
 type PendingLiveRowDeltaShard = parking_lot::Mutex<FastHashMap<u64, HashMap<u64, i64>>>;
 
+#[derive(Debug)]
+struct CommittedTableDelta {
+    rows: AtomicI64,
+    updated_ms: AtomicU64,
+}
+impl CommittedTableDelta {
+    fn new(rows: i64) -> Self {
+        Self {
+            rows: AtomicI64::new(rows),
+            updated_ms: AtomicU64::new(0),
+        }
+    }
+}
+impl std::ops::Deref for CommittedTableDelta {
+    type Target = AtomicI64;
+    fn deref(&self) -> &AtomicI64 {
+        &self.rows
+    }
+}
+
 pub(crate) const SLOT_RECLAIM_MAX_ATTEMPTS: u8 = 8;
 pub(crate) const SLOT_RECLAIM_QUARANTINE_CAP: usize = 4096;
 pub(crate) const SLOT_RECLAIM_QUARANTINE_DRAIN_PER_RUN: usize = 256;
@@ -540,6 +560,9 @@ pub struct InsertRowsResult {
     pub row_ids: Vec<RowId>,
     pub storage_ids: Vec<u64>,
     pub first_insert_id: u64,
+    /// Last copied AUTO_INCREMENT value after assignment/coercion. Opaque
+    /// pre-encoded LOAD batches report zero; their decoder owns insert IDs.
+    pub last_copied_insert_id: u64,
 }
 
 impl RowId {
@@ -1531,7 +1554,7 @@ pub struct Database {
     /// negative. DML first accumulates in `pending_live_row_deltas`; commit
     /// publishes it here and rollback discards it, so estimates never expose
     /// uncommitted or rolled-back population changes.
-    table_live_row_deltas: parking_lot::RwLock<HashMap<u64, Arc<AtomicI64>>>,
+    table_live_row_deltas: parking_lot::RwLock<HashMap<u64, Arc<CommittedTableDelta>>>,
     pending_live_row_deltas: Box<[PendingLiveRowDeltaShard]>,
     /// Monotonic per-table data-change epoch for the CTE result cache.
     /// Unlike `table_modification_deltas` (reset by `take`/`drop` to fold

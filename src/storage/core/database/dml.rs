@@ -258,7 +258,7 @@ impl Database {
         count: u64,
         live_row_delta: i64,
     ) -> Result<(), QueryError> {
-        if !is_temp_table_id(table.id) {
+        if count != 0 && !is_temp_table_id(table.id) {
             // The caller already owns the schema-validated table id. Going
             // back through `qualified_name` + normalization + a catalog read
             // allocated and re-resolved that same identity for every changed
@@ -1193,12 +1193,14 @@ impl Database {
                 row_ids.len() as u64,
                 row_ids.len().min(i64::MAX as usize) as i64,
             )?;
+            let last_copied_insert_id = prepared_rows.last().map_or(0, |row| copied_auto_increment_id(&table, row));
             crate::binlog::record_write_rows(txn.txn_id, &table, prepared_rows)?;
             self.dml_stats.record_inserts(row_ids.len() as u64);
             Ok(InsertRowsResult {
                 storage_ids: Vec::new(),
                 row_ids,
                 first_insert_id,
+                last_copied_insert_id,
             })
         })();
         result
@@ -1480,6 +1482,7 @@ impl Database {
                 total_inserted += inserted.len();
             }
 
+            let last_copied_insert_id = snapshot_values.last().map_or(0, |row| copied_auto_increment_id(table, row));
             if mode == BulkInsertMode::User {
                 self.record_non_temp_table_modifications(
                     txn.txn_id,
@@ -1494,6 +1497,7 @@ impl Database {
                 storage_ids,
                 row_ids,
                 first_insert_id,
+                last_copied_insert_id,
             })
         })();
         result
@@ -1733,6 +1737,7 @@ impl Database {
             if !table.foreign_keys.is_empty() {
                 self.fk_check_child_references_batch(&table, txn, &prepared_rows)?;
             }
+            let last_copied_insert_id = prepared_rows.last().map_or(0, |row| copied_auto_increment_id(&table, row));
             if mode == BulkInsertMode::User {
                 self.record_alter_copy_touched_rows(
                     txn.txn_id,
@@ -1753,6 +1758,7 @@ impl Database {
                 storage_ids: Vec::new(),
                 row_ids,
                 first_insert_id,
+                last_copied_insert_id,
             })
         })();
         result
@@ -1771,6 +1777,8 @@ impl Database {
             )
         })?;
         if table.database == crate::recyclebin::DATABASE { return Err(crate::recyclebin::failure("recycle-bin objects are read only")); }
+        debug_assert!(table.foreign_keys.is_empty() || !fk_checks_enabled(),
+            "heap-only insert requires foreign-key checks disabled");
         self.check_dml_allowed_for_table(txn, table.id)?;
         // Pre-encoded row payloads can't be partition-routed without
         // decoding them first — the row bytes hide the column values
@@ -1850,6 +1858,7 @@ impl Database {
                 storage_ids: Vec::new(),
                 row_ids: inserted,
                 first_insert_id: 0,
+                last_copied_insert_id: 0,
             })
         })();
         result
@@ -1868,6 +1877,8 @@ impl Database {
             )
         })?;
         if table.database == crate::recyclebin::DATABASE { return Err(crate::recyclebin::failure("recycle-bin objects are read only")); }
+        debug_assert!(table.foreign_keys.is_empty() || !fk_checks_enabled(),
+            "heap-only insert requires foreign-key checks disabled");
         self.check_dml_allowed_for_table(txn, table.id)?;
         // Partitioned tables go through the partition-aware insert
         // path, which routes each row to the matching partition.
@@ -1946,12 +1957,14 @@ impl Database {
                 inserted.len() as u64,
                 inserted.len().min(i64::MAX as usize) as i64,
             )?;
+            let last_copied_insert_id = prepared_rows.last().map_or(0, |row| copied_auto_increment_id(&table, row));
             crate::binlog::record_write_rows(txn.txn_id, &table, prepared_rows)?;
             self.dml_stats.record_inserts(inserted.len() as u64);
             Ok(InsertRowsResult {
                 storage_ids: Vec::new(),
                 row_ids: inserted,
                 first_insert_id,
+                last_copied_insert_id,
             })
         })();
         result

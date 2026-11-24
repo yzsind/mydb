@@ -1460,10 +1460,7 @@ fn mergeable_join_view_shape(db: &Arc<Database>, database: &str, body: &Select) 
             )
         })
         && body.joins.iter().all(|j| {
-            j.derived.is_none()
-                && !j.natural
-                && j.using_columns.is_empty()
-                && matches!(j.join_type, JoinType::Inner | JoinType::Cross)
+            j.derived.is_none() && matches!(j.join_type, JoinType::Inner | JoinType::Cross)
         })
         && body
             .from
@@ -1504,6 +1501,8 @@ fn derive_view_output_columns(
             if let Ok(table) = db.table_required(&wire.source.schema, &wire.source.org_table) {
                 if let Some(index) = table.find_column_index(&wire.source.org_name) {
                     let source = &table.columns[index];
+                    column.zerofill = source.zerofill;
+                    column.display_width = source.display_width;
                     let value = crate::engine::show::column_default_value(source);
                     column.default_value = if source.auto_increment {
                         Some("0".to_string())
@@ -1564,6 +1563,8 @@ fn derive_view_output_columns_inner(
             let nullable = column.source.flags & crate::mysql::protocol::NOT_NULL_FLAG == 0;
             let definition = ctas_column_def(db, &context, &column, nullable);
             out.push(ViewColumnDef {
+                zerofill: false,
+                display_width: None,
                 unsigned: false,
                 default_value: None,
                 name: column.name,
@@ -1598,6 +1599,8 @@ fn derive_view_output_columns_inner(
                     let nullable = column.source.flags & crate::mysql::protocol::NOT_NULL_FLAG == 0;
                     let definition = ctas_column_def(db, &context, &column, nullable);
                     input.push(ViewColumnDef {
+                        zerofill: false,
+                        display_width: None,
                         unsigned: false,
                         default_value: None,
                         name: column.name,
@@ -1633,6 +1636,8 @@ fn derive_view_output_columns_inner(
                     } else {
                         let inferred = infer_view_expr_type(db, current_database, select, expr);
                         out.push(ViewColumnDef {
+                            zerofill: false,
+                            display_width: None,
                             unsigned: false,
                             default_value: None,
                             name: alias
@@ -1665,6 +1670,8 @@ fn derive_view_output_columns_inner(
                 if let Some(table) = &primary_table {
                     for (_, col) in table.iter_select_columns() {
                         out.push(ViewColumnDef {
+                            zerofill: false,
+                            display_width: None,
                             unsigned: false,
                             default_value: None,
                             name: col.name.clone(),
@@ -1685,6 +1692,8 @@ fn derive_view_output_columns_inner(
                     // by an explicit column list, otherwise MySQL would
                     // also report `Name_exp_N`).
                     out.push(ViewColumnDef {
+                        zerofill: false,
+                        display_width: None,
                         unsigned: false,
                         default_value: None,
                         name: format!("Name_exp_{}", idx + 1),
@@ -1699,6 +1708,8 @@ fn derive_view_output_columns_inner(
                 if let Some(table) = &primary_table {
                     for (_, col) in table.iter_select_columns() {
                         out.push(ViewColumnDef {
+                            zerofill: false,
+                            display_width: None,
                             unsigned: false,
                             default_value: None,
                             name: col.name.clone(),
@@ -1710,6 +1721,8 @@ fn derive_view_output_columns_inner(
                     }
                 } else {
                     out.push(ViewColumnDef {
+                        zerofill: false,
+                        display_width: None,
                         unsigned: false,
                         default_value: None,
                         name: format!("Name_exp_{}", idx + 1),
@@ -1763,6 +1776,8 @@ fn derive_view_output_columns_inner(
                     })
                     .unwrap_or((None, None));
                 out.push(ViewColumnDef {
+                    zerofill: false,
+                    display_width: None,
                     unsigned: false,
                     default_value: None,
                     name,
@@ -2450,6 +2465,14 @@ fn resolve_insert_view(
         || view.check_option.is_some()
     {
         return Err(not_insertable());
+    }
+    if stmt.replace {
+        return Err(
+            crate::error::catalog::ER_VIEW_DELETE_MERGE_VIEW.error(format!(
+                "Can not delete from join view '{}.{}'",
+                view.database, view.name
+            )),
+        );
     }
     let Some(requested) = &stmt.columns else {
         return Err(error(
@@ -3202,6 +3225,14 @@ fn rewrite_join_view_update(
     view: &ViewSchema,
     mut body: Select,
 ) -> Result<crate::parser::Update, QueryError> {
+    let mut context = session.clone();
+    context.current_database.clone_from(&view.database);
+    crate::engine::executor::qualification::qualify_select_tables(db, &context, &mut body)?;
+    crate::planner::resolve_join_using_natural(db, &mut body)?;
+    for join in &mut body.joins {
+        join.natural = false;
+        join.using_columns.clear();
+    }
     let reject = |reason| reject_view_not_updatable(view, reason);
     if view.invalid {
         return Err(error(

@@ -527,9 +527,8 @@ impl Database {
                     handles.remove(&self.data_dir.join(rel));
                 }
             }
-            if intent.had_auto_increment {
-                self.delete_auto_increment_metadata(intent.table_id)?;
-            }
+            // Includes version tombstones left after removing AUTO_INCREMENT.
+            self.delete_auto_increment_metadata(intent.table_id)?;
             self.remove_empty_object_directories(intent.files.iter().chain(&intent.vector_files)
                 .map(|rel| self.data_dir.join(rel)).chain(intent.vector_directories.iter().map(|rel| self.data_dir.join(rel).join("__empty_owner__"))))?;
             Ok(())

@@ -2286,6 +2286,9 @@ fn single_table_bound_expr_type(
         if name.eq_ignore_ascii_case("GROUP_CONCAT") {
             return crate::engine::expr_type::infer_expr_type(expr, &context);
         }
+        if name.eq_ignore_ascii_case("COUNT") {
+            return crate::engine::expr_type::aggregate_result_type(name, None, &context);
+        }
         if crate::planner::is_aggregate_function(name) {
             let resolved = args.first().map(|argument| {
                 crate::engine::expr_type::infer_expr_type(argument, &context).column_type()

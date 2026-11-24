@@ -3435,12 +3435,23 @@ impl Database {
         self.lock_row_nonblocking(txn.txn_id, table.id, row_id)?;
         self.push_undo_deferred(txn.txn_id, UndoKind::Insert, table.id, row_id, None, None)?;
         self.insert_indexes_deferred_at(txn.txn_id, table.id, table, &values, row_id, false)?;
+        self.fk_check_child_references(table, txn, &values, None)?;
         // The storage single-row API shares the same durable commit journal
         // and rollback/savepoint semantics as executor batches.
         if let Some(undo_id) = self.row_derivatives_undo_head(txn.txn_id, table)? {
             self.maintain_row_update(txn.txn_id, undo_id, table, row_id, table.id, None, &values)?;
         }
         Ok(row_id)
+    }
+
+    /// Materialize a generated candidate only when an upsert expression reads
+    /// it. Explicit conflicting values must not advance the allocator.
+    pub(crate) fn assign_auto_increment_candidate(&self, table: &TableSchema, values: &mut [Value]) -> Result<u64, QueryError> {
+        let Some(idx) = table.auto_increment_column_index() else { return Ok(0); };
+        normalize_auto_increment_input(&mut values[idx], &table.columns[idx])?;
+        if !should_assign_auto_increment(&values[idx]) {return Ok(0);}
+        self.assign_auto_increment_value(table,values)?;
+        Ok(explicit_auto_increment_value_with_unsigned(values[idx].clone(), &table.columns[idx])?.unwrap_or(0))
     }
 
     fn assign_auto_increment_value(
@@ -3453,6 +3464,7 @@ impl Database {
         };
         preflight_not_null_row_before_auto_increment(table, values)?;
         let initial_max = self.auto_increment_initial_max(table)?;
+        normalize_auto_increment_input(&mut values[idx], &table.columns[idx])?;
         if !should_assign_auto_increment(&values[idx]) {
             if let Some(explicit) = explicit_auto_increment_value_with_unsigned(
                 values[idx].clone(),
@@ -3513,13 +3525,14 @@ impl Database {
         // is viable. Explicit values require ordered mixed-batch semantics.
         let mut auto_required: usize = 0;
         let mut has_explicit = false;
-        for values in rows.iter() {
-            let current = values.get(idx).ok_or_else(|| {
+        for values in rows.iter_mut() {
+            let current = values.get_mut(idx).ok_or_else(|| {
                 error(
                     crate::error::catalog::ER_WRONG_VALUE_COUNT_ON_ROW,
                     "column count does not match value count",
                 )
             })?;
+            normalize_auto_increment_input(current, column)?;
             if should_assign_auto_increment(current) {
                 auto_required += 1;
             } else if explicit_auto_increment_value_with_unsigned(current.clone(), column)?

@@ -40,6 +40,36 @@ pub(super) fn lock_select_rows_for_update(
         return Ok(None);
     }
     validate_lock_targets(stmt)?;
+    if let Some(def) = crate::engine::information_schema::find_system_table_name(
+        stmt.table.as_deref().unwrap_or_default(),
+    ) {
+        let share = stmt
+            .lock_clause
+            .as_ref()
+            .is_some_and(|clause| clause.mode == crate::parser::LockClauseMode::ForShare);
+        if def.schema.eq_ignore_ascii_case("information_schema") && share {
+            return Err(crate::error::catalog::ER_IS_QUERY_INVALID_CLAUSE.error(
+                "Information schema queries do not support the 'LOCK IN SHARE MODE' clause.",
+            ));
+        }
+        if def.schema.eq_ignore_ascii_case("information_schema")
+            || (def.schema.eq_ignore_ascii_case("performance_schema") && !share)
+        {
+            return Err(
+                crate::error::catalog::ER_TABLEACCESS_DENIED_ERROR.error(format!(
+                    "SELECT with locking clause command denied for table '{}'",
+                    def.name
+                )),
+            );
+        }
+        if def.schema.eq_ignore_ascii_case("performance_schema") && share {
+            // Instrumentation is an immutable per-query snapshot; there are
+            // no user-writable rows requiring shared storage locks.
+            return Ok(None);
+        }
+        return Err(crate::error::catalog::ER_NOT_SUPPORTED_YET
+            .error("Row locking is not supported for virtual system catalog tables"));
+    }
     let table = db.table(stmt.table.as_deref().unwrap_or_default())?;
     let secured;
     let stmt = if crate::engine::rls::might_require_binding(db, &table)

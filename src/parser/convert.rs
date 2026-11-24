@@ -493,6 +493,9 @@ pub(super) fn convert_statement(sql: &str, stmt: SqlStatement) -> Result<Stateme
         SqlStatement::Close { cursor } => convert_session_close_cursor(sql, cursor),
         other => {
             let kind = sql_statement_kind(&other);
+            if kind == "SHOW statement" {
+                return Err(parse_error_at_zero("Invalid or incomplete SHOW syntax"));
+            }
             unsupported(kind)
         }
     }
@@ -2873,7 +2876,17 @@ fn convert_select(
             let primary_name = base.name.clone();
             for extra in &select.from[1..] {
                 let (extra_base, extra_derived, extra_lateral, extra_joins) =
-                    match convert_table_with_joins(extra) {
+                    match if extra.joins.is_empty() {
+                        convert_table_with_joins(extra)
+                    } else {
+                        // Explicit joins bind more tightly than commas. Keep
+                        // their ON scope and null-extension inside this item.
+                        convert_table_factor(&TableFactor::NestedJoin {
+                            table_with_joins: Box::new(extra.clone()),
+                            alias: None,
+                        })
+                        .map(|(table, derived, lateral)| (table, derived, lateral, Vec::new()))
+                    } {
                         Ok(t) => t,
                         Err(error) => return error.into_statement_result(sql),
                     };

@@ -124,14 +124,6 @@ pub(crate) fn with_saved_calls<R>(
     let _restore = Restore { target, previous };
     f()
 }
-pub(crate) fn with_calls<R>(
-    db: Arc<Database>,
-    session: &SessionContext,
-    f: impl FnOnce() -> Result<R, QueryError>,
-) -> Result<R, QueryError> {
-    let mut scope = Some(prepare_calls(db, session)?);
-    with_saved_calls(&mut scope, f)
-}
 pub(crate) fn authorize(
     db: &Database,
     ctx: &crate::engine::auth::AuthorizationContext,

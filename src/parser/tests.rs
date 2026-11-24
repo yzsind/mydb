@@ -7318,11 +7318,7 @@ fn show_audit_unsupported_statement_identifies_show() {
         "SHOW CHARACTERS",
         "SHOW MYDB MEMORYX",
     ] {
-        assert!(
-            matches!(parse_statement(sql).unwrap(),
-            Statement::Unsupported { kind, .. } if kind == "SHOW statement"),
-            "{sql}"
-        );
+        assert!(parse_statement(sql).is_err(), "{sql}");
     }
 }
 

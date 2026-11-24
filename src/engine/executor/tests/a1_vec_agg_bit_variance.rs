@@ -252,3 +252,26 @@ fn variance_spill_round_trip_matches_row() {
          FROM t GROUP BY g ORDER BY g",
     );
 }
+
+#[test]
+fn audit1123_decimal_variance_canonical_conversion() {
+    for ty in ["DECIMAL(9,6)", "DECIMAL(18,6)", "DECIMAL(20,6)"] {
+        let (_dir, engine) = engine_with(&[&format!("CREATE TABLE t (x {ty})")]);
+        let values = if ty == "DECIMAL(9,6)" {
+            "(100.000001),(100.000002)"
+        } else {
+            "(10000000000.000001),(10000000000.000002)"
+        };
+        engine
+            .execute(&format!("INSERT INTO t VALUES {values}"))
+            .unwrap();
+        let sql =
+            "SELECT STD(x),VARIANCE(x),STDDEV_POP(x),STDDEV_SAMP(x),VAR_POP(x),VAR_SAMP(x) FROM t";
+        let expected = with_vec_mode(VecMode::Off, || rows_of(&engine, sql));
+        assert_eq!(
+            with_vec_mode(VecMode::On, || rows_of(&engine, sql)),
+            expected,
+            "{ty}"
+        );
+    }
+}
