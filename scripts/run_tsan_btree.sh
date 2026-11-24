@@ -1,11 +1,8 @@
 #!/usr/bin/env bash
 # ThreadSanitizer (TSAN) run for the B-tree concurrency paths.
 #
-# Purpose: gate the Phase 2b "flip" (dropping the tree-global SMO write lock,
-# starting with the shared-lock in-place write fast path,
-# `MYDB_BTREE_CONCURRENT_SMO=1`). TSAN instruments every memory access and
-# flags data races that the deterministic oracle/storm/crash tests can miss
-# because they only observe *outcomes*, not the races that produced them.
+# Exercise concurrent mutations, split/merge reclamation, and cached frame
+# publication. Every selected filter must match and execute real tests.
 #
 # TSAN needs a sanitizer-instrumented std, so we build std from source with
 # `-Zbuild-std` (requires the nightly toolchain + the `rust-src` component:
@@ -15,7 +12,7 @@
 # subsequent runs are incremental.
 #
 # Usage:
-#   scripts/run_tsan_btree.sh                 # concurrent SMO + OLC + merge-race tests
+#   scripts/run_tsan_btree.sh                 # current B-tree/page-cache regressions
 #   scripts/run_tsan_btree.sh <filter>...     # custom test name filters
 #
 # Env:
@@ -29,40 +26,65 @@ cd "$(dirname "$0")/.."
 host_triple="$(rustc -vV | awk '/^host:/{print $2}')"
 TARGET="${MYDB_TSAN_TARGET:-$host_triple}"
 
-# Concurrency tests that exercise the shared-lock write path, the optimistic
-# read path, and the split/merge freed-page race. Override by passing args.
+# Keep these names aligned with the live concurrency regressions. Override by
+# passing libtest substring filters; empty selections are always errors.
 if [[ $# -gt 0 ]]; then
   FILTERS=("$@")
 else
   FILTERS=(
-    concurrent_smo
-    olc_reads_stay_consistent_under_smo_storm
-    olc_disabled_pessimistic_path_matches
-    btree_concurrent_reads_do_not_descend_into_freed_merge_pages
+    storage::core::btree_bug_audit_tests::bug8_concurrent_rw_invariants_hold
+    storage::core::tests::btree_prepared_split_revalidates_leaf_after_concurrent_delete
+    storage::core::tests::btree_concurrent_reads_do_not_descend_into_freed_merge_pages
+    storage::core::tests::atomic_frame_hint_concurrent_replacement_preserves_identity_and_pin_release
   )
 fi
 
 export RUSTFLAGS="${RUSTFLAGS:-} -Zsanitizer=thread"
 export TSAN_OPTIONS="${TSAN_OPTIONS:-halt_on_error=1}"
-# Enable the shared-lock write path so TSAN sees it; the coarse-lock oracle
-# tests still run (they just ignore the flag).
-export MYDB_BTREE_CONCURRENT_SMO="${MYDB_BTREE_CONCURRENT_SMO:-1}"
+mkdir -p /tmp/mydb
+run_dir="$(mktemp -d /tmp/mydb/tsan.XXXXXX)"
+mkdir "$run_dir/tmp"
+export TMPDIR="$run_dir/tmp"
 
 echo "== TSAN B-tree concurrency run =="
 echo "target      : $TARGET"
 echo "filters     : ${FILTERS[*]}"
 echo "TSAN_OPTIONS: $TSAN_OPTIONS"
-echo "MYDB_BTREE_CONCURRENT_SMO=$MYDB_BTREE_CONCURRENT_SMO"
+echo "output      : $run_dir"
 echo
 
-# `cargo +nightly test` (not nextest) — nextest's per-test process model does
-# not compose with -Zbuild-std as cleanly, and TSAN reports go to stderr which
-# `cargo test` streams verbatim. libtest accepts one positional filter, so run
-# every audited concurrency filter explicitly; the instrumented build is reused.
+# libtest accepts one positional filter. The first listing builds the same
+# instrumented test binary reused by every subsequent listing and execution.
+CARGO_TEST=(cargo +nightly test --locked -Zbuild-std --target "$TARGET" -p mydb --lib)
 for filter in "${FILTERS[@]}"; do
-  cargo +nightly test \
-    -Zbuild-std \
-    --target "$TARGET" \
-    -p mydb --lib \
-    -- "$filter" --nocapture
+  if [[ -z "$filter" ]]; then
+    echo "TSAN test filter must not be empty" >&2
+    exit 1
+  fi
+  listing="$("${CARGO_TEST[@]}" -- "$filter" --list)"
+  matches="$(printf '%s\n' "$listing" | awk '
+    { gsub(/\033\[[0-9;]*m/, "") }
+    /: test$/ { count++ }
+    END { print count + 0 }
+  ')"
+  if [[ "$matches" -eq 0 ]]; then
+    echo "TSAN filter '$filter' matches no tests; update the selection" >&2
+    exit 1
+  fi
+done
+
+group=0
+for filter in "${FILTERS[@]}"; do
+  group=$((group + 1))
+  log="$run_dir/group-$group.log"
+  echo "== TSAN group $group: $filter =="
+  "${CARGO_TEST[@]}" -- "$filter" --nocapture 2>&1 | tee "$log"
+  if ! awk '
+    { gsub(/\033\[[0-9;]*m/, "") }
+    /^test result: ok\. [1-9][0-9]* passed; 0 failed;/ { passed = 1 }
+    END { exit !passed }
+  ' "$log"; then
+    echo "TSAN filter '$filter' executed no successful tests; inspect $log" >&2
+    exit 1
+  fi
 done

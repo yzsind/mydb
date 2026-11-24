@@ -25,9 +25,13 @@ jobs:
   thread-sanitizer:
     name: ThreadSanitizer concurrency paths
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 120
+    env:
+      CARGO_BUILD_JOBS: 1
     steps:
       - uses: actions/checkout@v4
+      - name: Validate TSan test selection runner
+        run: python3 scripts/test_tsan_runner.py
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: rust-src
