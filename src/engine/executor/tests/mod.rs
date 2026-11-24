@@ -613,5 +613,5 @@ mod partial_index;
 mod fulltext_incremental;
 
 mod github_issues_1123;
-mod issues_87_99;
 mod issues_101_105;
+mod issues_87_99;

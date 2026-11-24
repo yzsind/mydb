@@ -212,6 +212,30 @@ fn issue81_collate_validates_binary_sources_before_execution() {
             "{value}"
         );
     }
+    for collation in ["utf8mb4_bin", "latin1_bin", "binary"] {
+        let sql = format!("SELECT ? COLLATE {collation}");
+        let planned = engine.prepare_cached(&mut session, &sql, 1).unwrap();
+        for value in [
+            Value::Bytes(b"a".to_vec()),
+            Value::String("b".into()),
+            Value::Null,
+            Value::Int(7),
+        ] {
+            let expected = value.to_display_string();
+            let response = crate::engine::params::with_params(vec![value], || {
+                engine
+                    .execute_prepared_statement(&mut session, &sql, (*planned).clone())
+                    .expect("prepared COLLATE execution")
+            })
+            .unwrap()
+            .materialize()
+            .unwrap();
+            let QueryResponse::ResultSet(result) = response else {
+                panic!("{sql}")
+            };
+            assert_eq!(result.rows[0][0].to_display_string(), expected, "{sql}");
+        }
+    }
 }
 
 #[test]

@@ -738,7 +738,9 @@ fn current_joined_candidate(
         // A preserved RIGHT row with a wholly padded prefix did not pass
         // ON; rechecking ON would incorrectly discard its outer tuple.
         let padded_prefix = join_types[p_idx] == JoinType::Right
-            && indices[..p_idx].iter().all(|&index| index == OUTER_NULL_PARTICIPANT);
+            && indices[..p_idx]
+                .iter()
+                .all(|&index| index == OUTER_NULL_PARTICIPANT);
         if !padded_prefix {
             if let Some(condition) = &conditions[p_idx] {
                 if !truthy(&eval_in_context(condition, ctx, &combined)?) {
@@ -771,7 +773,9 @@ fn current_joined_for_target(
     selection: Option<&BoundMultiExpr>,
     cache: &mut HashMap<(u64, RowId), Option<Vec<Value>>>,
 ) -> Result<Option<Vec<Value>>, QueryError> {
-    let first = current_joined_candidate(db, txn, ctx, first, conditions, join_types, selection, cache)?;
+    let first = current_joined_candidate(
+        db, txn, ctx, first, conditions, join_types, selection, cache,
+    )?;
     if first.is_some() {
         return Ok(first);
     }
@@ -787,8 +791,9 @@ fn current_joined_for_target(
             }
             let stored = &ctx.participants[target].rows[indices[target]];
             if (stored.storage_id, stored.row_id) == identity {
-                found =
-                    current_joined_candidate(db, txn, ctx, indices, conditions, join_types, selection, cache)?;
+                found = current_joined_candidate(
+                    db, txn, ctx, indices, conditions, join_types, selection, cache,
+                )?;
             }
             Ok(())
         },
@@ -818,13 +823,21 @@ where
     let mut combined = vec![Value::Null; total_width];
     let mut indices = vec![0usize; n];
     if join_types.contains(&JoinType::Right) {
-        return outer::enumerate(ctx, join_types, join_conditions, &mut combined, &mut indices,
+        return outer::enumerate(
+            ctx,
+            join_types,
+            join_conditions,
+            &mut combined,
+            &mut indices,
             &mut |combined, indices| {
                 if let Some(predicate) = where_predicate {
-                    if !truthy(&eval_in_context(predicate, ctx, combined)?) { return Ok(()); }
+                    if !truthy(&eval_in_context(predicate, ctx, combined)?) {
+                        return Ok(());
+                    }
                 }
                 visit(combined, indices)
-            });
+            },
+        );
     }
     enumerate_recursive(
         ctx,
@@ -1062,16 +1075,22 @@ pub(super) fn normalize_natural_using_joins(
         from: vec![base.clone()],
         joins: std::mem::take(joins),
         selection: selection.take(),
-        projection: assignments.iter().map(|assignment| crate::parser::SelectItem::Expr {
-            expr: assignment.value.clone(), alias: None,
-        }).collect(),
+        projection: assignments
+            .iter()
+            .map(|assignment| crate::parser::SelectItem::Expr {
+                expr: assignment.value.clone(),
+                alias: None,
+            })
+            .collect(),
         ..crate::parser::Select::default()
     };
     crate::planner::resolve_join_using_natural(db, &mut wrapper)?;
     *joins = wrapper.joins;
     *selection = wrapper.selection;
     for (assignment, item) in assignments.iter_mut().zip(wrapper.projection) {
-        if let crate::parser::SelectItem::Expr { expr, .. } = item { assignment.value = expr; }
+        if let crate::parser::SelectItem::Expr { expr, .. } = item {
+            assignment.value = expr;
+        }
     }
     Ok(())
 }
@@ -1140,8 +1159,13 @@ pub(super) fn execute_multi_update(
         column_aliases: Vec::new(),
         generate_series: None,
     };
-    normalize_natural_using_joins(db, &base_ref, &mut stmt.joins,
-        &mut stmt.selection, &mut stmt.assignments)?;
+    normalize_natural_using_joins(
+        db,
+        &base_ref,
+        &mut stmt.joins,
+        &mut stmt.selection,
+        &mut stmt.assignments,
+    )?;
     validate_join_shape(&stmt.joins, "UPDATE")?;
 
     let mut ctx = build_context(
@@ -1166,8 +1190,10 @@ pub(super) fn execute_multi_update(
         let (p_idx, col_idx) = ctx.participant_for_combined(combined_idx);
         let participant = &ctx.participants[p_idx];
         if participant.cte.is_some() {
-            return Err(crate::error::catalog::ER_NON_UPDATABLE_TABLE
-                .error(format!("The target table '{}' is not updatable", participant.alias)));
+            return Err(crate::error::catalog::ER_NON_UPDATABLE_TABLE.error(format!(
+                "The target table '{}' is not updatable",
+                participant.alias
+            )));
         }
         super::routines::check_trigger_write_target(&participant.storage_key)?;
         if col_idx >= participant.schema.columns.len() {
@@ -1596,8 +1622,7 @@ pub(super) fn execute_multi_delete(
         column_aliases: Vec::new(),
         generate_series: None,
     };
-    normalize_natural_using_joins(db, &base_ref, &mut stmt.joins,
-        &mut stmt.selection, &mut [])?;
+    normalize_natural_using_joins(db, &base_ref, &mut stmt.joins, &mut stmt.selection, &mut [])?;
     validate_join_shape(&stmt.joins, "DELETE")?;
 
     let mut ctx = build_context(
@@ -1641,7 +1666,9 @@ pub(super) fn execute_multi_delete(
     for &index in &target_participants {
         if ctx.participants[index].cte.is_some() {
             return Err(crate::error::catalog::ER_NON_UPDATABLE_TABLE.error(format!(
-                "The target table '{}' is not updatable", ctx.participants[index].alias)));
+                "The target table '{}' is not updatable",
+                ctx.participants[index].alias
+            )));
         }
         super::routines::check_trigger_write_target(&ctx.participants[index].storage_key)?;
     }

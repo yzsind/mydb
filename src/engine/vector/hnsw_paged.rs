@@ -3792,7 +3792,7 @@ impl PagedHnsw {
             let _ = store;
             return;
         }
-        if scratch.build_quant.is_none() {
+        if scratch.build_quant.is_none() && scratch.arena.is_none() {
             // Query and incremental-DML navigation rows live in these same
             // node pages. Let the shared data buffer deduplicate and schedule
             // the random probes before the scoring loop reaches them.
@@ -3837,6 +3837,7 @@ impl PagedHnsw {
         let mut cur = entry;
         let mut cur_d = self.dist_q(query, cur, scratch)?;
         loop {
+            crate::engine::cancel::check_cancelled()?;
             let mut neighbors = std::mem::take(&mut scratch.neighbor_buf);
             self.neighbors_at_into(cur, level, scratch, &mut neighbors)?;
             self.prefetch_uncached_vectors(&neighbors, scratch);
@@ -4609,6 +4610,7 @@ impl PagedHnsw {
         scratch: &mut Scratch,
     ) -> Result<(), QueryError> {
         debug_assert_eq!(node_vec.len(), self.dim());
+        crate::engine::cancel::check_cancelled()?;
         // Reset the per-insert best-first state; the vector cache persists
         // (it is shared across inserts during a bulk build).
         scratch.clear_layer();

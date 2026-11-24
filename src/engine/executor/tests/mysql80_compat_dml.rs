@@ -574,14 +574,21 @@ fn m4_multi_table_update_right_join_in_chain_preserves_targets() {
     engine
         .execute("CREATE TABLE t3 (id INT PRIMARY KEY, z INT)")
         .unwrap();
-    for sql in ["INSERT INTO t1 VALUES(1,10),(2,20)",
-        "INSERT INTO t2 VALUES(2,200)", "INSERT INTO t3 VALUES(2,2000),(3,3000)"] {
+    for sql in [
+        "INSERT INTO t1 VALUES(1,10),(2,20)",
+        "INSERT INTO t2 VALUES(2,200)",
+        "INSERT INTO t3 VALUES(2,2000),(3,3000)",
+    ] {
         engine.execute(sql).unwrap();
     }
-    engine.execute("UPDATE t1 JOIN t2 ON t1.id=t2.id RIGHT JOIN t3 ON t2.id=t3.id SET t1.v=1,t3.z=t3.z+1").unwrap();
-    assert_eq!(scalar_i64(&engine,"SELECT v FROM t1 WHERE id=1"),10);
-    assert_eq!(scalar_i64(&engine,"SELECT v FROM t1 WHERE id=2"),1);
-    assert_eq!(scalar_i64(&engine,"SELECT z FROM t3 WHERE id=3"),3001);
+    engine
+        .execute(
+            "UPDATE t1 JOIN t2 ON t1.id=t2.id RIGHT JOIN t3 ON t2.id=t3.id SET t1.v=1,t3.z=t3.z+1",
+        )
+        .unwrap();
+    assert_eq!(scalar_i64(&engine, "SELECT v FROM t1 WHERE id=1"), 10);
+    assert_eq!(scalar_i64(&engine, "SELECT v FROM t1 WHERE id=2"), 1);
+    assert_eq!(scalar_i64(&engine, "SELECT z FROM t3 WHERE id=3"), 3001);
 }
 
 #[test]

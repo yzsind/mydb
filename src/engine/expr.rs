@@ -9132,9 +9132,15 @@ where
             let value = eval_one(name, args, eval_arg)?;
             null_or(value, |value| {
                 Ok(match value {
-                    Value::Bytes(bytes) => Value::Bytes(soundex_letters(
-                        bytes.into_iter().filter(u8::is_ascii_alphabetic).map(char::from)
-                    ).into_bytes()),
+                    Value::Bytes(bytes) => Value::Bytes(
+                        soundex_letters(
+                            bytes
+                                .into_iter()
+                                .filter(u8::is_ascii_alphabetic)
+                                .map(char::from),
+                        )
+                        .into_bytes(),
+                    ),
                     value => Value::String(soundex_mysql(&string_value(&value))),
                 })
             })
@@ -16391,11 +16397,11 @@ fn regexp_has_null(values: &[Value], flags_index: usize) -> Result<bool, QueryEr
     if !values.iter().any(|value| matches!(value, Value::Null)) {
         return Ok(false);
     }
-    if !matches!(values[1], Value::Null)
-        && !matches!(values.get(flags_index), Some(Value::Null))
-    {
+    if !matches!(values[1], Value::Null) && !matches!(values.get(flags_index), Some(Value::Null)) {
         match &values[1] {
-            Value::Bytes(bytes) => validate_null_binary_regexp_pattern(bytes, values.get(flags_index))?,
+            Value::Bytes(bytes) => {
+                validate_null_binary_regexp_pattern(bytes, values.get(flags_index))?
+            }
             pattern => {
                 mysql_regex_for_operand(&string_value(pattern), values.get(flags_index), false)?;
             }
@@ -16409,7 +16415,10 @@ fn regexp_has_null(values: &[Value], flags_index: usize) -> Result<bool, QueryEr
 // for a branch that only nullable binary operands can reach.
 #[cold]
 #[inline(never)]
-fn validate_null_binary_regexp_pattern(bytes: &[u8], flags: Option<&Value>) -> Result<(), QueryError> {
+fn validate_null_binary_regexp_pattern(
+    bytes: &[u8],
+    flags: Option<&Value>,
+) -> Result<(), QueryError> {
     // Keep the binary evaluator's resource contract on this NULL
     // path as well; validation must not bypass its decode budget.
     if bytes.len() > 8192 {
@@ -16418,18 +16427,29 @@ fn validate_null_binary_regexp_pattern(bytes: &[u8], flags: Option<&Value>) -> R
     }
     let _scratch = crate::engine::executor::mem_budget::ControlledMemoryCharge::try_new(
         crate::engine::executor::mem_budget::ControlledMemoryCategory::Executor,
-        if bytes.is_ascii() { 0 } else { bytes.len().saturating_mul(3) },
+        if bytes.is_ascii() {
+            0
+        } else {
+            bytes.len().saturating_mul(3)
+        },
     )?;
-    let pattern = encoding_rs::WINDOWS_1252.decode_without_bom_handling(bytes).0;
+    let pattern = encoding_rs::WINDOWS_1252
+        .decode_without_bom_handling(bytes)
+        .0;
     mysql_regex_for_operand(&pattern, flags, true)?;
     Ok(())
 }
 
 fn regexp_null_if_any(
-    values: Vec<Value>, flags_index: usize,
+    values: Vec<Value>,
+    flags_index: usize,
     evaluate: impl FnOnce(Vec<Value>) -> Result<Value, QueryError>,
 ) -> Result<Value, QueryError> {
-    if regexp_has_null(&values, flags_index)? { Ok(Value::Null) } else { evaluate(values) }
+    if regexp_has_null(&values, flags_index)? {
+        Ok(Value::Null)
+    } else {
+        evaluate(values)
+    }
 }
 
 pub(crate) fn eval_regexp_like_values(values: &[Value]) -> Result<Value, QueryError> {
@@ -16937,7 +16957,11 @@ pub(crate) fn eval_char_values(values: &[Value]) -> Value {
 }
 
 pub(crate) fn soundex_mysql(input: &str) -> String {
-    soundex_letters(input.chars().filter(|c| c.is_ascii_alphabetic() || *c > '\u{00c0}'))
+    soundex_letters(
+        input
+            .chars()
+            .filter(|c| c.is_ascii_alphabetic() || *c > '\u{00c0}'),
+    )
 }
 
 fn soundex_letters(mut letters: impl Iterator<Item = char>) -> String {
@@ -20356,7 +20380,11 @@ fn expr_collation_checked(
         }
         if name.eq_ignore_ascii_case("TO_BASE64") {
             let info = connection_collation_info();
-            return Some(ExprCollation { charset: info.charset, collation_id: info.id, coercibility: 4 });
+            return Some(ExprCollation {
+                charset: info.charset,
+                collation_id: info.id,
+                coercibility: 4,
+            });
         }
         let result_type = function_result_type(name);
         if result_type == ColumnType::Geometry {
@@ -22658,7 +22686,14 @@ fn fold_constant_subexprs_inner_checked(expr: &mut Expr) {
         // is NULL, without disabling value folding and repeating JSON work
         // for every source row.
         let preserve_json_type = match expr {
-            Expr::Function { name, .. } if matches!(name.to_ascii_uppercase().as_str(), "JSON_QUOTE" | "TO_BASE64" | "SOUNDEX") => true,
+            Expr::Function { name, .. }
+                if matches!(
+                    name.to_ascii_uppercase().as_str(),
+                    "JSON_QUOTE" | "TO_BASE64" | "SOUNDEX"
+                ) =>
+            {
+                true
+            }
             Expr::Function { name, args, .. } if name.eq_ignore_ascii_case("JSON_VALUE") => {
                 matches!(args.get(2), Some(Expr::Literal(Literal::String(target)))
                     if target.eq_ignore_ascii_case("JSON"))
@@ -23951,7 +23986,16 @@ pub(crate) fn validate_expr_collations(expr: &Expr, table: &TableSchema) -> Resu
                             .is_some_and(|column| {
                                 matches!(column.data_type, DataTypeKind::Bit { .. })
                             });
-                        let source_charset = if binary_variable || bit_string {
+                        let source_charset = if matches!(
+                            &args[0],
+                            Expr::Placeholder(index)
+                                if crate::engine::params::user_parameter_active(*index)
+                        ) {
+                            // COLLATE derives a genuine parameter's character
+                            // domain from its target, not the bound value.
+                            // Auto-parameterized literals keep their charset.
+                            Some(target.charset)
+                        } else if binary_variable || bit_string {
                             Some("binary")
                         } else {
                             source.map(|source| source.charset).or_else(|| {

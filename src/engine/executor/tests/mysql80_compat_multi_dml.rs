@@ -363,9 +363,11 @@ fn delete_right_join_chain_skips_null_padded_targets() {
         "DELETE a FROM a JOIN b ON a.id = b.id RIGHT JOIN c ON b.id = c.id",
     )
     .unwrap();
-    let rs=exec(&engine,&mut session,"SELECT id FROM a ORDER BY id").unwrap();
-    let QueryResponse::ResultSet(rs)=rs else { panic!("expected result set"); };
-    assert_eq!(rs.rows,vec![vec![Value::Int(1)],vec![Value::Int(3)]]);
+    let rs = exec(&engine, &mut session, "SELECT id FROM a ORDER BY id").unwrap();
+    let QueryResponse::ResultSet(rs) = rs else {
+        panic!("expected result set");
+    };
+    assert_eq!(rs.rows, vec![vec![Value::Int(1)], vec![Value::Int(3)]]);
 }
 
 // ---------------------------------------------------------------------------

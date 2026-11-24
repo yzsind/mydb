@@ -158,6 +158,19 @@ fn kernel_cache_lru_requires_relief(stat: &str) -> bool {
     cold_clean < active || cold_clean < (MAX_PRESSURE_ALLOWANCE_BYTES as u64).saturating_mul(2)
 }
 
+/// A read refault is not an anonymous-allocation forecast. Ordinary kernel
+/// replacement can service a full clean cache without repeatedly evicting its
+/// hot mapped pages. Keep proactive relief for real or already-promised demand.
+#[cfg(any(test, target_os = "linux"))]
+fn kernel_cache_essential_requires_relief(
+    current: u64,
+    reclaimable: u64,
+    promised: u64,
+    ceiling: u64,
+) -> bool {
+    ceiling != 0 && current.saturating_sub(reclaimable).max(promised) >= ceiling
+}
+
 /// A full, healthy file cache is useful memory, not a reason to evict it.
 /// Only new controller limit-pressure events arm proactive relief. Counter
 /// resets are benign; older controllers retain conservative bounded relief.
@@ -189,6 +202,24 @@ pub(crate) fn kernel_cache_pressure_observed() -> bool {
         let stat = current_linux_cgroup_v2_path()
             .or_else(current_linux_cgroup_v1_path)
             .and_then(|path| std::fs::read_to_string(path.join("memory.stat")).ok());
+        if let (Some(stat), (Some(current), Some(limit))) = (
+            stat.as_deref(),
+            crate::util::system_memory::linux_cgroup_memory(),
+        ) {
+            if let Some(reclaimable) = parse_cgroup_reclaimable_bytes(stat) {
+                let promised =
+                    crate::engine::executor::mem_budget::controlled_memory_snapshot().0 as u64;
+                if !kernel_cache_essential_requires_relief(
+                    current,
+                    reclaimable,
+                    promised,
+                    (crate::engine::executor::mem_budget::operational_memory_limit_bytes() as u64)
+                        .min(limit),
+                ) {
+                    return false;
+                }
+            }
+        }
         return stat.as_deref().is_none_or(kernel_cache_lru_requires_relief);
     }
     #[cfg(not(target_os = "linux"))]
@@ -208,6 +239,44 @@ fn kernel_cache_pressure_events_preserve_a_healthy_full_cache_and_handle_resets(
     assert!(!events.observe(Some(0)));
     assert!(events.observe(Some(1)));
     assert!(events.observe(None));
+}
+
+#[cfg(test)]
+#[test]
+fn kernel_relief_preserves_clean_mapped_reads_and_covers_promised_growth() {
+    let mib = 1024 * 1024;
+    let limit = 1024 * mib;
+    let ceiling = limit * 80 / 100;
+    assert!(!kernel_cache_essential_requires_relief(
+        limit,
+        600 * mib,
+        608 * mib,
+        ceiling
+    ));
+    assert!(!kernel_cache_essential_requires_relief(
+        limit,
+        400 * mib,
+        700 * mib,
+        ceiling
+    ));
+    assert!(kernel_cache_essential_requires_relief(
+        limit,
+        600 * mib,
+        900 * mib,
+        ceiling
+    ));
+    assert!(kernel_cache_essential_requires_relief(
+        limit,
+        100 * mib,
+        600 * mib,
+        ceiling
+    ));
+    assert!(!kernel_cache_essential_requires_relief(
+        limit,
+        600 * mib,
+        608 * mib,
+        0
+    ));
 }
 
 /// Let the controller choose its cold victims instead of discarding every

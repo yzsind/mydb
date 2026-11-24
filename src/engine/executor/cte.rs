@@ -2398,21 +2398,33 @@ pub(super) fn pushdown_inline_derived_predicates<'q>(
 /// CTE producer. Internal identities keep aliases lexical and cannot shadow
 /// real SQL table names. The caller owns the temporary registry scope.
 pub(super) fn materialize_dml_join_sources(
-    db: &Arc<Database>, session: &mut SessionContext,
-    joins: &mut [crate::parser::Join], registry: &SessionRegistry,
+    db: &Arc<Database>,
+    session: &mut SessionContext,
+    joins: &mut [crate::parser::Join],
+    registry: &SessionRegistry,
 ) -> Result<(), QueryError> {
     for join in joins {
-        let Some(query) = join.derived.take() else { continue; };
+        let Some(query) = join.derived.take() else {
+            continue;
+        };
         if join.lateral {
             return Err(crate::error::catalog::ER_NOT_SUPPORTED_YET
                 .error("LATERAL sources are not supported in joined DML"));
         }
         let name = next_inline_derived_name();
-        let cte = CteDef { name: name.clone(), columns: std::mem::take(&mut join.table.column_aliases),
-            is_recursive: false, query };
-        let result = with_cte_materialization(|| materialize_non_recursive(db, session, &cte, registry, None))?;
+        let cte = CteDef {
+            name: name.clone(),
+            columns: std::mem::take(&mut join.table.column_aliases),
+            is_recursive: false,
+            query,
+        };
+        let result = with_cte_materialization(|| {
+            materialize_non_recursive(db, session, &cte, registry, None)
+        })?;
         set_cte_result(&name, Arc::new(result));
-        if join.table.alias.is_none() { join.table.alias = Some(join.table.name.clone()); }
+        if join.table.alias.is_none() {
+            join.table.alias = Some(join.table.name.clone());
+        }
         join.table.name = name;
     }
     Ok(())
