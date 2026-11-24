@@ -16,7 +16,8 @@ and replication security. These notes cover source changes since
 - **MySQL compatibility:** extend joined UPDATE/DELETE and correct function,
   metadata, prepared-statement, and diagnostic behavior.
 - **Error messages:** identify offending columns, input rows, and invalid values
-  more precisely, and preserve conversion warnings across execution paths.
+  more precisely, and preserve conversion warnings across execution paths to
+  help AI agents diagnose failures more efficiently and make targeted corrections.
 - **Operations:** strengthen replication credential protection, replica recovery,
   physical backup handling, and REST session cleanup.
 
@@ -111,6 +112,11 @@ See [MySQL compatibility](mysql80-compatibility.md),
 [optimizer and execution](optimizer-and-operators.md).
 
 ## Error messages and diagnostics
+
+Richer error context is designed to help AI agents diagnose failures more
+efficiently. Identifying the offending table, column, input row, and value helps
+an agent locate the cause and choose a targeted SQL or data correction, reducing
+guesswork and repeated diagnostic queries.
 
 - INSERT validation errors identify the offending column and input row for
   out-of-range values, oversized strings, and invalid ENUM values. For example,
