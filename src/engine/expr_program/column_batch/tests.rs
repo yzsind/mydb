@@ -704,14 +704,15 @@ fn arithmetic_reads_float_metadata_and_keeps_nonfinite_fallback() {
                 vec![0, 1],
             ));
     let actual = program.try_eval_column(&selected).unwrap();
-    let expected = oracle(&program, &batch).unwrap();
+    assert!(oracle(&program, &batch)
+        .unwrap_err()
+        .is(crate::error::catalog::ER_DATA_OUT_OF_RANGE));
+    let expected = [f64::from(1.234567890123_f32), -0.0_f64];
     for row in 0..2 {
-        let (Value::Double(actual), Value::Double(expected)) =
-            (actual.value_at(row), &expected[row])
-        else {
+        let Value::Double(actual) = actual.value_at(row) else {
             panic!("float result")
         };
-        assert_eq!(actual.to_bits(), expected.to_bits());
+        assert_eq!(actual.to_bits(), expected[row].to_bits());
     }
     assert_eq!(actual.value_at(2), Value::Null);
     assert_eq!(actual.value_at(3), Value::Null);

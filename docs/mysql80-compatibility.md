@@ -374,6 +374,15 @@ compact redo, and checkpoints merge into `mysql.innodb_dynamic_metadata`;
 recovery merges the DD baseline followed by subsequent redo. There is no
 per-table `.ai` file, and ROLLBACK does not reclaim allocated values.
 
+Exact generated-ID sequences and gap positions are not guaranteed to match
+InnoDB. `INSERT IGNORE` may consume a candidate on a duplicate, while ordinary
+`ON DUPLICATE KEY UPDATE` can probe the conflict before allocating a candidate.
+References to the proposed auto-increment value still allocate that value.
+`LAST_INSERT_ID()` describes the actual successful insert; applications must
+not infer row counts or replay identity mappings from sequence gaps.
+The compatibility variable `innodb_autoinc_lock_mode` does not select an
+InnoDB reservation algorithm in mydb. MySQL replication remains ROW/FULL only.
+
 Closing the loop on MySQL 8.0 semantics:
 
 - **sql_mode-aware numeric/string coercion**: strict out-of-range 1264 / overlong 1406 hard errors; non-strict saturating clamp/truncation + warnings 1264/1265. Numeric, string, and temporal writes follow consistent conversion rules. Session and global default `sql_mode=ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION`; an explicitly empty mode and new sessions inheriting an empty global mode both execute in non-strict mode.

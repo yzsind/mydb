@@ -1578,11 +1578,13 @@ pub fn binary_row_packet_into_with_charset(
                 ) =>
             {
                 let column = columns.get(idx);
-                write_text_value_inner(
+                write_text_value(
                     payload,
                     value,
                     result_charset_for_column(charset, column),
                     column.and_then(|column| column.source.decimals),
+                    column.map(|column| column.column_type),
+                    false,
                 );
             }
             Value::Date(d) => {
@@ -2684,6 +2686,16 @@ fn write_text_value(
     col_type: Option<ColumnType>,
     round_decimal: bool,
 ) {
+    // String-valued temporal arithmetic suppresses an all-zero fraction,
+    // while a typed TIME/DATETIME keeps its declared fractional precision.
+    let fsp = if matches!(col_type, Some(ColumnType::VarString))
+        && matches!(value, Value::Time(us) | Value::DateTime(us) | Value::Timestamp(us)
+            if us.rem_euclid(1_000_000) == 0)
+    {
+        Some(0)
+    } else {
+        fsp
+    };
     let shaped = col_type
         .filter(|_| round_decimal)
         .map(|ty| crate::engine::expr::decimal_result_value(value, ty));
@@ -2766,6 +2778,11 @@ fn write_text_value_inner(
             write_lenenc_string(payload, text.as_bytes());
         }
         Value::Double(v) => {
+            // MySQL's text conversion renders non-finite REAL results as zero.
+            if !v.is_finite() {
+                write_lenenc_string(payload, b"0");
+                return;
+            }
             if let Some(decimals) = fsp.filter(|decimals| *decimals != 0x1f) {
                 let text = format!("{v:.decimals$}", decimals = usize::from(decimals));
                 write_lenenc_string(payload, text.as_bytes());
@@ -3258,6 +3275,17 @@ impl<'a> Cursor<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn text_real_rescaling_overflow_uses_mysql_zero_fallback() {
+        for number in [f64::INFINITY, f64::NEG_INFINITY] {
+            for decimals in [None, Some(0), Some(2), Some(0x1f)] {
+                let mut payload = Vec::new();
+                write_text_value_inner(&mut payload, &Value::Double(number), None, decimals);
+                assert_eq!(payload, b"\x010");
+            }
+        }
+    }
 
     #[test]
     fn borrowed_columnar_text_matches_owned_rows_across_types_and_charsets() {

@@ -533,6 +533,7 @@ fn json_value_result_type(args: &[Expr]) -> ColumnType {
         "DATE" => ColumnType::Date,
         "TIME" => ColumnType::Time,
         "DATETIME" => ColumnType::DateTime,
+        "JSON" => ColumnType::Json,
         _ => ColumnType::VarString,
     }
 }

@@ -38,6 +38,8 @@ Result:
 
 - See [temporal inputs and precision](README.md#temporal-inputs-and-precision) for SQL mode, input conversion, fractional seconds, and range diagnostics.
 - mydb accepts Unix seconds from zero through `253402300799.999999`.
+  This is an intentional extension beyond MySQL's function upper bound near
+  year 3001; values in the extended range are valid mydb inputs, not overflow.
   Use exact decimal or text input to preserve microseconds near year 9999.
   Rounding into year 10000, or a session time-zone conversion beyond calendar
   years 0000–9999, returns `NULL`, including when a format argument is present.

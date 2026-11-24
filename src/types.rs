@@ -935,6 +935,9 @@ pub(crate) fn mysql_f32_text(v: f32) -> String {
 }
 
 fn format_f64_compact(v: f64) -> String {
+    if !v.is_finite() {
+        return "0".into();
+    }
     let mut buf = ryu::Buffer::new();
     ryu_to_mysql_text(buf.format(v), || v.to_string()).into_owned()
 }

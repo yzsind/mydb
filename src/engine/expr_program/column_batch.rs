@@ -675,7 +675,7 @@ fn contract(node: &ExprNode, schema: &BatchSchema) -> Option<Contract> {
             if matches!(kernel, FunctionKernel::LegacyDeterministic("JSON_QUOTE")) {
                 json::quote_column(node, schema)?;
                 return Some(Contract {
-                    domain: Domain::Json,
+                    domain: Domain::Text,
                     parallel: true,
                 });
             }

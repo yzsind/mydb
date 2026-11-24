@@ -636,7 +636,7 @@ pub(super) fn evaluate_quote(column: &ColumnVector) -> Option<ColumnVector> {
         return None;
     }
 
-    let mut data = Vec::new();
+    let mut data = String::new();
     let mut offsets = Vec::with_capacity(column.len() + 1);
     offsets.push(0);
     for row in 0..column.len() {
@@ -645,12 +645,12 @@ pub(super) fn evaluate_quote(column: &ColumnVector) -> Option<ColumnVector> {
         }
         if !column.is_null(row) {
             let text = std::str::from_utf8(super::bytes_at(column, row)?).ok()?;
-            crate::engine::json::append_string_node(text, &mut data);
+            crate::engine::json::append_quoted_text(text, &mut data);
         }
         offsets.push(u32::try_from(data.len()).ok()?);
     }
-    Some(ColumnVector::Json {
-        data,
+    Some(ColumnVector::Utf8 {
+        data: data.into_bytes(),
         offsets,
         nulls: super::validity(column),
     })

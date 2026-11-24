@@ -517,7 +517,8 @@ scalar_catalog! {
             [("JSON_PRETTY", "json_pretty"), ("SOUNDEX", "soundex"), ("TO_BASE64", "to_base64"), ("EXPORT_SET", "export_set")] => (RegexOrComplex, VarString, None, false);
             [("JSON_VALID", "json_valid"), ("JSON_LENGTH", "json_length"), ("JSON_CONTAINS", "json_contains"), ("JSON_CONTAINS_PATH", "json_contains_path"), ("JSON_DEPTH", "json_depth"), ("JSON_OVERLAPS", "json_overlaps")] => (RegexOrComplex, LongLong, None, false);
             [("JSON_TYPE", "json_type")] => (RegexOrComplex, VarString, ( JsonType, 1, 1, Immutable, fixed_string_result(Some(17 * 4), true)), false);
-            [("JSON_KEYS", "json_keys"), ("JSON_OBJECT", "json_object"), ("JSON_ARRAY", "json_array"), ("JSON_MERGE_PATCH", "json_merge_patch"), ("JSON_MERGE_PRESERVE", "json_merge_preserve"), ("JSON_QUOTE", "json_quote")] => (RegexOrComplex, Json, None, false);
+            [("JSON_KEYS", "json_keys"), ("JSON_OBJECT", "json_object"), ("JSON_ARRAY", "json_array"), ("JSON_MERGE_PATCH", "json_merge_patch"), ("JSON_MERGE_PRESERVE", "json_merge_preserve")] => (RegexOrComplex, Json, None, false);
+            [("JSON_QUOTE", "json_quote")] => (RegexOrComplex, VarString, None, false);
             [("JSON_STORAGE_SIZE", "json_storage_size"), ("JSON_STORAGE_FREE", "json_storage_free")] => (RegexOrComplex, VarString, ( JsonStorage, 1, 1, Immutable, fixed_integer_result(Big, false, true)), false);
             [("FROM_BASE64", "from_base64")] => (RegexOrComplex, Blob, None, false);
             [("BIT_COUNT", "bit_count"), ("JSON_SCHEMA_VALID", "json_schema_valid"), ("INET_ATON", "inet_aton"), ("IS_IPV4", "is_ipv4"), ("IS_IPV6", "is_ipv6")] => (Unknown, LongLong, None, false);
@@ -556,7 +557,8 @@ scalar_catalog! {
             [("SYSTEM_USER", "system_user"), ("CURRENT_ROLE", "current_role"), ("CHARSET", "charset"), ("COLLATION", "collation"), ("ICU_VERSION", "icu_version")] => (SessionDependent, VarString, None, false);
             [("LAST_INSERT_ID", "last_insert_id")] => (SessionDependent, LongLong, ( StatementCounter, 0, 1, Volatile, fixed_integer_result(Big, false, false)), false);
             [("COERCIBILITY", "coercibility")] => (SessionDependent, LongLong, ( Coercibility, 1, 1, Immutable, fixed_integer_result(Int, false, false)), false);
-            [("REGEXP", "regexp"), ("REGEXP_SUBSTR", "regexp_substr"), ("JSON_VALUE", "json_value")] => (RegexOrComplex, VarString, None, false);
+            [("REGEXP", "regexp"), ("REGEXP_SUBSTR", "regexp_substr")] => (RegexOrComplex, VarString, None, false);
+            [("JSON_VALUE", "json_value")] => (RegexOrComplex, VarString, None, false);
             [("REGEXP_INSTR", "regexp_instr")] => (RegexOrComplex, LongLong, None, false);
             [("JSON_SET", "json_set"), ("JSON_INSERT", "json_insert"), ("JSON_REPLACE", "json_replace"), ("JSON_REMOVE", "json_remove"), ("JSON_ARRAY_APPEND", "json_array_append"), ("JSON_ARRAY_INSERT", "json_array_insert"), ("JSON_MERGE", "json_merge"), ("JSON_SEARCH", "json_search")] => (RegexOrComplex, Json, None, false);
             [("STATEMENT_DIGEST", "statement_digest")] => (CryptoHash, VarString, None, true);

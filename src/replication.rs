@@ -13,10 +13,10 @@ use crate::util::thread_spawn::{self as thread, JoinHandle};
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -35,6 +35,9 @@ use crate::storage::{
 };
 use crate::types::{QueryError, Value};
 use crate::util::logging::log_message;
+
+mod private_metadata;
+use private_metadata::ChannelDirectory;
 
 const DEFAULT_CHANNEL: &str = "default";
 const DEFAULT_REPL_PORT: u16 = 3306;
@@ -825,6 +828,16 @@ impl ReplicationManager {
     /// threads. Best-effort: a corrupt/partial metadata file is logged and
     /// skipped rather than aborting startup.
     pub fn restore_persisted_channels(&self) {
+        let _directory = match ChannelDirectory::open(&self.data_dir, false) {
+            Ok(directory) => directory,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return,
+            Err(err) => {
+                log_message(&format!(
+                    "replication: cannot restore channel metadata: {err}"
+                ));
+                return;
+            }
+        };
         let dir = replication_dir(&self.data_dir).join("channels");
         let entries = match fs::read_dir(&dir) {
             Ok(entries) => entries,
@@ -909,8 +922,8 @@ impl ReplicationManager {
         validate_channel_name(&cfg.channel)?;
         let global_executed = self.executed_gtid_set()?;
         validate_existing_channel_metadata(&self.data_dir, &cfg.channel)?;
-        fs::create_dir_all(replication_dir(&self.data_dir))
-            .map_err(|err| io_error("create replication directory", err))?;
+        ChannelDirectory::open(&self.data_dir, true)
+            .map_err(|err| io_error("prepare replication directory", err))?;
         if cfg.is_configured() && env_bool_default("MYDB_REPLICA_READ_ONLY", true) {
             set_replica_read_only(true);
         }
@@ -1597,16 +1610,17 @@ impl ReplicationManager {
     fn load_channel(&self, channel: &str) -> Result<PersistedChannel, QueryError> {
         recover_relay_reclaim(&self.data_dir, channel)?;
         let path = channel_path(&self.data_dir, channel);
-        let bytes = read_private_channel(&path).map_err(|err| {
-            error(
-                crate::error::catalog::ER_NOT_SUPPORTED_YET,
-                if err.kind() == std::io::ErrorKind::NotFound {
-                    format!("replication channel '{channel}' is not configured")
-                } else {
-                    format!("cannot read replication channel '{channel}': {err}")
-                },
-            )
-        })?;
+        let bytes =
+            read_private_channel(&self.data_dir, path.file_name().unwrap()).map_err(|err| {
+                error(
+                    crate::error::catalog::ER_NOT_SUPPORTED_YET,
+                    if err.kind() == std::io::ErrorKind::NotFound {
+                        format!("replication channel '{channel}' is not configured")
+                    } else {
+                        format!("cannot read replication channel '{channel}': {err}")
+                    },
+                )
+            })?;
         crate::storage::metadata::decode(
             crate::storage::metadata::CHANNEL,
             crate::storage::format_versions::MYSQL_CHANNEL_VERSION,
@@ -7169,7 +7183,7 @@ fn sync_replication_directory(data_dir: &Path) -> Result<(), QueryError> {
 
 fn validate_existing_channel_metadata(data_dir: &Path, channel: &str) -> Result<(), QueryError> {
     let path = channel_path(data_dir, channel);
-    let bytes = match fs::read(&path) {
+    let bytes = match read_private_channel(data_dir, path.file_name().unwrap()) {
         Ok(bytes) => bytes,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(err) => return Err(io_error("read existing channel metadata", err)),
@@ -7192,6 +7206,13 @@ fn validate_existing_channel_metadata(data_dir: &Path, channel: &str) -> Result<
 }
 
 fn recover_relay_reclaim(data_dir: &Path, channel: &str) -> Result<(), QueryError> {
+    validate_channel_name(channel)?;
+    // Validate parents before recovery can read or modify any relay files.
+    let _directory = match ChannelDirectory::replication(data_dir) {
+        Ok(directory) => directory,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(io_error("inspect replication directory", err)),
+    };
     let marker = relay_reclaim_path(data_dir, channel);
     let bytes = match fs::read(&marker) {
         Ok(bytes) => bytes,
@@ -7326,116 +7347,15 @@ fn recover_relay_boundary(path: &Path) -> Result<(u64, Option<RelayRecord>), Que
 }
 
 fn persist_channel(data_dir: &Path, persisted: &PersistedChannel) -> Result<(), QueryError> {
-    let dir = replication_dir(data_dir).join("channels");
-    let mut builder = fs::DirBuilder::new();
-    builder.recursive(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        builder.mode(0o700);
-    }
-    builder
-        .create(&dir)
-        .map_err(|err| io_error("create replication directory", err))?;
-    for path in [replication_dir(data_dir), dir.clone()] {
-        let meta = fs::symlink_metadata(&path)
-            .map_err(|err| io_error("inspect replication directory", err))?;
-        if !meta.is_dir() {
-            return Err(error(
-                crate::error::catalog::ER_GET_ERRNO,
-                "replication metadata directory must not be a symlink",
-            ));
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::{MetadataExt, PermissionsExt};
-            if meta.uid() != rustix::process::geteuid().as_raw() {
-                return Err(error(
-                    crate::error::catalog::ER_GET_ERRNO,
-                    "replication metadata directory must be owned by the server",
-                ));
-            }
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
-                .map_err(|err| io_error("secure replication directory", err))?;
-        }
-    }
-    let path = channel_path(data_dir, &persisted.config.channel);
-    // Unique temp name per writer: the IO and SQL threads both persist
-    // progress on their own commit boundaries, at nearly the same frequency.
-    // A shared fixed `<channel>.json.tmp` let the two `File::create(O_TRUNC)`
-    // + interleaved writes clobber each other, so the installed
-    // `<channel>.json` could be a byte-spliced half-write that fails to parse
-    // on restart (1030) and bricks the channel. A pid+seq suffix keeps each
-    // writer's temp file private; the final atomic `rename` is still the
-    // single publish point.
-    static PERSIST_SEQ: AtomicU64 = AtomicU64::new(0);
-    let seq = PERSIST_SEQ.fetch_add(1, Ordering::Relaxed);
-    let tmp = path.with_extension(format!("json.tmp.{}.{seq}", std::process::id()));
-    let write = || -> Result<(), QueryError> {
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
-        }
-        let mut file = options
-            .open(&tmp)
-            .map_err(|err| io_error("create replication metadata", err))?;
-        crate::storage::metadata::write(
-            &mut file,
-            crate::storage::metadata::CHANNEL,
-            crate::storage::format_versions::MYSQL_CHANNEL_VERSION,
-            persisted,
-        )
-        .map_err(|err| {
-            error(
-                crate::error::catalog::ER_GET_ERRNO,
-                format!("serialize replication metadata failed: {err}"),
-            )
-        })?;
-        file.write_all(b"\n")
-            .and_then(|_| file.sync_all())
-            .map_err(|err| io_error("sync replication metadata", err))?;
-        fs::rename(&tmp, &path).map_err(|err| io_error("install replication metadata", err))?;
-        File::open(&dir)
-            .and_then(|file| file.sync_all())
-            .map_err(|err| io_error("sync replication metadata directory", err))?;
-        Ok(())
-    };
-    let result = write();
-    if result.is_err() {
-        // Don't leave the private temp file behind on failure.
-        let _ = fs::remove_file(&tmp);
-    }
-    result
+    validate_channel_name(&persisted.config.channel)?;
+    let directory = ChannelDirectory::open(data_dir, true)
+        .map_err(|err| io_error("prepare replication directory", err))?;
+    let name = format!("{}.json", persisted.config.channel);
+    directory.write(std::ffi::OsStr::new(&name), persisted)
 }
 
-fn read_private_channel(path: &Path) -> std::io::Result<Vec<u8>> {
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
-    }
-    let file = options.open(path)?;
-    let meta = file.metadata()?;
-    if !meta.is_file() || meta.len() > 64 * 1024 * 1024 {
-        return Err(std::io::Error::other("invalid replication metadata file"));
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if meta.mode() & 0o077 != 0 || meta.uid() != rustix::process::geteuid().as_raw() {
-            return Err(std::io::Error::other(
-                "replication metadata must be owned by the server with mode 0600",
-            ));
-        }
-    }
-    let mut bytes = Vec::new();
-    file.take(64 * 1024 * 1024 + 1).read_to_end(&mut bytes)?;
-    Ok(bytes)
+fn read_private_channel(data_dir: &Path, name: &std::ffi::OsStr) -> std::io::Result<Vec<u8>> {
+    ChannelDirectory::open(data_dir, false)?.read(name)
 }
 
 fn io_error(action: &str, err: std::io::Error) -> QueryError {
@@ -7482,13 +7402,13 @@ mod tests {
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
         );
-        assert!(read_private_channel(&path).is_ok());
+        assert!(read_private_channel(dir.path(), path.file_name().unwrap()).is_ok());
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
-        assert!(read_private_channel(&path).is_err());
+        assert!(read_private_channel(dir.path(), path.file_name().unwrap()).is_err());
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
         let link = path.with_extension("link");
         symlink(&path, &link).unwrap();
-        assert!(read_private_channel(&link).is_err());
+        assert!(read_private_channel(dir.path(), link.file_name().unwrap()).is_err());
         fs::remove_file(&path).unwrap();
         fs::remove_file(&link).unwrap();
         fs::remove_dir(path.parent().unwrap()).unwrap();

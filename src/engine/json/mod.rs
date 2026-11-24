@@ -28,7 +28,14 @@ mod path;
 mod tests;
 
 pub(crate) use compare::{compare, compare_nodes, equality_key};
+pub(crate) use jsonb::write_json_string as append_quoted_text;
 pub(crate) use jsonb::{build_array, build_object, ArrayIter, JsonType, JsonbRef, ObjectIter};
+
+pub(crate) fn quote_text(text: &str) -> String {
+    let mut output = String::new();
+    append_quoted_text(text, &mut output);
+    output
+}
 pub(crate) use path::{ConcreteLeg, JsonPath};
 
 use crate::types::QueryError;

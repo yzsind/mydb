@@ -38,6 +38,12 @@ Result: 1
 
 - `NULL ON EMPTY`, `ERROR ON EMPTY`, or `DEFAULT literal ON EMPTY` select missing-path handling. The corresponding ON ERROR forms control scalar-conversion failures. Place ON EMPTY before ON ERROR.
 - RETURNING accepts the supported JSON_VALUE scalar targets (CHAR, SIGNED/UNSIGNED, DECIMAL, FLOAT/DOUBLE, DATE, TIME, DATETIME, YEAR and JSON). Specify sizes/precision when needed; unsupported targets and nonconstant paths are rejected.
+- RETURNING TIME requires an in-range time-shaped string, such as `"12:34:56"`.
+  Numeric JSON scalars and compact strings such as `"123"` use ON ERROR;
+  the general `CAST('123' AS TIME)` conversion remains supported separately.
+- RETURNING JSON preserves JSON result metadata even for SQL NULL or missing
+  values. JSON_ARRAYAGG and JSON_OBJECTAGG likewise retain JSON result metadata
+  in ordinary, empty and windowed aggregates.
 
 ## Related Functions
 

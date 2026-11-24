@@ -2292,12 +2292,20 @@ pub trait QueryEngine: Send + Sync + 'static {
         ))
     }
 
+    /// Engines must explicitly authorize administrative operations. A missing
+    /// authorization implementation never grants privileges implicitly.
     fn authorize_global_privilege(
         &self,
         _session: &SessionContext,
-        _privilege: crate::engine::auth::Privilege,
+        privilege: crate::engine::auth::Privilege,
     ) -> Result<(), QueryError> {
-        Ok(())
+        Err(crate::storage::error(
+            crate::error::catalog::ER_SPECIFIC_ACCESS_DENIED_ERROR,
+            format!(
+                "Access denied; the engine must authorize the {} privilege for this operation",
+                privilege.sql_name()
+            ),
+        ))
     }
 
     fn init_session_database(
@@ -4082,9 +4090,15 @@ mod authorization_default_tests {
     fn auth_security_global_privileges_default_to_denied() {
         use crate::engine::auth::Privilege;
         let session = SessionContext::default();
-        for privilege in [Privilege::Super, Privilege::Shutdown, Privilege::ReplSlave,
-            Privilege::Dynamic("SYSTEM_VARIABLES_ADMIN".into())] {
-            assert!(MinimalEngine.authorize_global_privilege(&session, privilege).is_err());
+        for privilege in [
+            Privilege::Super,
+            Privilege::Shutdown,
+            Privilege::ReplSlave,
+            Privilege::Dynamic("SYSTEM_VARIABLES_ADMIN".into()),
+        ] {
+            assert!(MinimalEngine
+                .authorize_global_privilege(&session, privilege)
+                .is_err());
         }
     }
 }

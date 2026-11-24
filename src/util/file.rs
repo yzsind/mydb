@@ -431,6 +431,9 @@ pub(crate) fn copy_fixture_tree(source: &Path, destination: &Path) -> io::Result
             copy_fixture_file(&entry.path(), &target)?;
         }
     }
+    // The fallback must preserve private credential directories just like
+    // clonefile does; default mkdir permissions are not a faithful fixture.
+    fs::set_permissions(destination, fs::metadata(source)?.permissions())?;
     Ok(())
 }
 

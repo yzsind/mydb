@@ -2374,6 +2374,16 @@ pub(crate) fn session_utc_now() -> chrono::NaiveDateTime {
         .unwrap_or_else(|| chrono::Utc::now().naive_utc())
 }
 
+/// SQL-visible object creation uses the statement clock; storage-only callers
+/// retain the real clock. Recovery and physical generation clocks stay separate.
+pub(crate) fn session_creation_time_ms() -> u64 {
+    if with_session_view(|view| view.is_some()) {
+        session_utc_now().and_utc().timestamp_millis().max(0) as u64
+    } else {
+        crate::storage::naming::current_unix_ms()
+    }
+}
+
 /// Current time in the session's configured time zone, returned as
 /// `NaiveDateTime`. Used by NOW() / CURRENT_TIMESTAMP / CURDATE / CURTIME
 /// so a session that runs `SET time_zone = '+08:00'` actually sees +08:00.
@@ -6831,6 +6841,22 @@ where
                 // (1-69 → 2001-2069, 70-99 → 1970-1999). Valid range is
                 // 1901-2155 plus the literal 0.
                 "YEAR" => {
+                    if matches!(
+                        &value,
+                        Value::String(_) | Value::SmallString(_) | Value::Bytes(_)
+                    ) {
+                        let text = str_value(&value);
+                        let trimmed = text.trim_start_matches(|c: char| c.is_ascii_whitespace());
+                        let digits = trimmed.strip_prefix(['+', '-']).unwrap_or(trimmed);
+                        if !digits.as_bytes().first().is_some_and(u8::is_ascii_digit) {
+                            crate::engine::api::push_statement_warning(
+                                crate::error::ConditionLevel::Warning,
+                                crate::error::catalog::ER_WRONG_VALUE,
+                                format!("Incorrect YEAR value: '{}'", diagnostic_value(&text)),
+                            );
+                            return Ok(Value::Null);
+                        }
+                    }
                     let year = match &value {
                         Value::String(s) => lenient_str_to_i64(s)?,
                         Value::SmallString(s) => {
@@ -7796,9 +7822,7 @@ where
         // -- Date/time functions --
         "DATE_ADD" | "ADDDATE" | "DATE_SUB" | "SUBDATE" => {
             expect_arg_range(name, args, 2, 2)?;
-            let prepared_dynamic_first = args
-                .first()
-                .is_some_and(|arg| matches!(arg, Expr::Placeholder(_) | Expr::BoundValue(_)));
+            let prepared_dynamic_first = args.first().is_some_and(dynamic_temporal_parameter);
             let date_val = eval_arg(&args[0])?;
             if matches!(date_val, Value::Null) {
                 return Ok(Value::Null);
@@ -7876,12 +7900,15 @@ where
         "MONTHNAME" => {
             let value = eval_one(name, args, &mut eval_arg)?;
             null_or(value, |value| {
-                let Some(dt) = parse_temporal_function_datetime(&value, "date")? else {
+                let Some(month) = temporal_month_component(&value)? else {
                     return Ok(Value::Null);
                 };
+                if month == 0 {
+                    return Ok(Value::Null);
+                }
                 let locale = session_time_locale();
                 Ok(Value::String(
-                    locale.months[dt.month0() as usize].to_string(),
+                    locale.months[(month - 1) as usize].to_string(),
                 ))
             })
         }
@@ -7931,11 +7958,10 @@ where
             let value = eval_one(name, args, &mut eval_arg)?;
             null_or(value, |value| {
                 let day_number = int_value(&value)?;
-                if day_number <= 0 {
+                if day_number <= 365 {
                     return Ok(Value::Date(crate::types::ZERO_DATE));
                 }
-                let offset = if day_number < 60 { 366 } else { 365 };
-                let Some(days_from_ce) = day_number.checked_sub(offset) else {
+                let Some(days_from_ce) = day_number.checked_sub(365) else {
                     return Ok(Value::Null);
                 };
                 let Ok(days_from_ce) = i32::try_from(days_from_ce) else {
@@ -8266,9 +8292,7 @@ where
         }
         "ADDTIME" | "SUBTIME" => {
             expect_arg_count(name, args, 2)?;
-            let prepared_dynamic_first = args
-                .first()
-                .is_some_and(|arg| matches!(arg, Expr::Placeholder(_) | Expr::BoundValue(_)));
+            let prepared_dynamic_first = args.first().is_some_and(dynamic_temporal_parameter);
             let values = eval_args(args, &mut eval_arg)?;
             null_if_any(values, |values| {
                 if is_zero_datetime_value(&values[0]) {
@@ -9483,9 +9507,8 @@ where
                         "Incorrect type for argument 1 in function JSON_QUOTE",
                     ));
                 }
-                // Wrap the input as a JSON string scalar (escaping as needed).
-                Ok(json_value_from_dom(&serde_json::Value::String(
-                    string_value_for_connection(&value)?,
+                Ok(Value::String(crate::engine::json::quote_text(
+                    &string_value_for_connection(&value)?,
                 )))
             })
         }
@@ -10847,9 +10870,6 @@ fn round_or_truncate_f64(value: f64, d: i32, round: bool) -> Result<Value, Query
         if !divisor.is_finite() {
             return Ok(Value::Double(0.0));
         }
-        if value.is_finite() && value + divisor == value {
-            return Ok(Value::Double(value));
-        }
         let scaled = value / divisor;
         let integral = if round {
             scaled.round_ties_even()
@@ -10857,7 +10877,9 @@ fn round_or_truncate_f64(value: f64, d: i32, round: bool) -> Result<Value, Query
             scaled.trunc()
         };
         let result = integral * divisor;
-        return Ok(Value::Double(if result.is_finite() { result } else { 0.0 }));
+        // Preserve rescaling overflow for enclosing expressions: FORMAT
+        // renders a non-finite REAL as "0", distinct from finite zero.
+        return Ok(Value::Double(result));
     }
     let factor = 10_f64.powi(d);
     if !factor.is_finite() || factor == 0.0 {
@@ -10876,10 +10898,7 @@ fn round_or_truncate_f64(value: f64, d: i32, round: bool) -> Result<Value, Query
         scaled.trunc()
     };
     let result = out / factor;
-    // With a large negative D, division by a tiny factor can overflow even
-    // though both the input and the intermediate remain finite. MySQL treats
-    // that unrepresentable rounded/truncated magnitude as zero.
-    Ok(Value::Double(if result.is_finite() { result } else { 0.0 }))
+    Ok(Value::Double(result))
 }
 
 /// MySQL `ABS()`: the result type follows the argument — integers stay
@@ -11830,13 +11849,37 @@ pub(crate) fn extract_datetime_part(
             Err(err) => Ok(warn_invalid_temporal_function("time", value, err)),
         };
     }
-    if matches!(value, Value::Time(_))
-        && matches!(
-            part.as_str(),
-            "DAY_HOUR" | "DAY_MINUTE" | "DAY_SECOND" | "DAY_MICROSECOND"
-        )
-    {
-        let (negative, hour, minute, second, micros) = parse_time_value_components(value)?;
+    let duration_domain = matches!(
+        part.as_str(),
+        "DAY_HOUR" | "DAY_MINUTE" | "DAY_SECOND" | "DAY_MICROSECOND"
+    ) && (matches!(value, Value::Time(_))
+        || match value {
+            Value::String(_) | Value::SmallString(_) | Value::Bytes(_) => {
+                let text = str_value(value);
+                let text = text.trim();
+                // Calendar dates retain their day field. Duration and compact
+                // time inputs must not inherit the epoch's day-of-month.
+                let main = text.split('.').next().unwrap_or("");
+                let compact_calendar = main.len() >= 9 && main.bytes().all(|b| b.is_ascii_digit());
+                let clock = main.contains(':')
+                    && main
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || matches!(b, b':' | b' '));
+                !compact_calendar
+                    && !text
+                        .trim_start_matches(['+', '-'])
+                        .contains(['-', '/', 'T'])
+                    && (clock
+                        || crate::util::temporal::parse_delimited_datetime_components(text)
+                            .is_none())
+            }
+            _ => value_is_numeric(value) && numeric(value)?.abs() < 100_000_000.0,
+        });
+    if duration_domain {
+        let (negative, hour, minute, second, micros) = match parse_time_value_components(value) {
+            Ok(parts) => parts,
+            Err(err) => return Ok(warn_invalid_temporal_function("time", value, err)),
+        };
         let mut number = i64::from(hour);
         if part != "DAY_HOUR" {
             number = number * 100 + i64::from(minute);
@@ -13540,31 +13583,47 @@ pub(crate) fn eval_unix_timestamp_scalar_value(v: &Value) -> Result<Value, Query
     }
 }
 
-pub(crate) fn eval_quarter_value(v: &Value) -> Result<Value, QueryError> {
+fn temporal_month_component(v: &Value) -> Result<Option<u32>, QueryError> {
     if reject_zero_date_text(v) {
-        return Ok(warn_invalid_temporal_cast("date", v));
+        warn_invalid_temporal_cast("date", v);
+        return Ok(None);
     }
     if is_zero_datetime_value(v) {
-        return Ok(Value::Int(0));
+        return Ok(Some(0));
     }
-    let tagged_month = match v {
+    let month = match v {
         Value::Date(days) => crate::types::decode_tagged_date(*days).map(|(_, month, _)| month),
         Value::DateTime(micros) => {
             crate::types::decode_tagged_datetime(*micros).map(|(_, month, ..)| month)
         }
+        Value::String(_) | Value::SmallString(_) | Value::Bytes(_) => {
+            crate::util::temporal::parse_delimited_datetime_components(&str_value(v))
+                .filter(|p| {
+                    p.month == 0
+                        || p.day == 0
+                        || (session_temporal_sql_mode_bits()
+                            & crate::engine::api::TEMPORAL_MODE_ALLOW_INVALID_DATES
+                            != 0
+                            && invalid_date_components_are_preservable(p.year, p.month, p.day))
+                })
+                .map(|p| p.month)
+        }
         _ => None,
     };
-    if let Some(month) = tagged_month {
-        return Ok(Value::Int(if month == 0 {
+    if month.is_some() {
+        return Ok(month);
+    }
+    Ok(parse_temporal_function_datetime(v, "date")?.map(|dt| dt.month()))
+}
+
+pub(crate) fn eval_quarter_value(v: &Value) -> Result<Value, QueryError> {
+    Ok(temporal_month_component(v)?.map_or(Value::Null, |month| {
+        Value::Int(if month == 0 {
             0
         } else {
             i64::from((month - 1) / 3 + 1)
-        }));
-    }
-    let Some(dt) = parse_temporal_function_datetime(v, "date")? else {
-        return Ok(Value::Null);
-    };
-    Ok(Value::Int(((dt.month() - 1) / 3 + 1) as i64))
+        })
+    }))
 }
 
 pub(crate) fn mysql_calendar_day_number(year: i32, month: u32, day: u32) -> i64 {
@@ -13672,9 +13731,12 @@ pub(crate) fn eval_week_value(v: &Value, mode: Option<i64>) -> Result<Value, Que
     Ok(Value::Int(mysql_calc_week(dt.date(), mode).1 as i64))
 }
 
-/// `DATE_ADD` / `DATE_SUB` (and the ADDDATE/SUBDATE aliases) on
-/// already-evaluated values. Output shape follows the input: a date-only
-/// argument yields a DATE string.
+/// Auto-parameterized literals keep their source domain; genuine prepared
+/// parameters use the function's prepare-time temporal conversion contract.
+pub(crate) fn dynamic_temporal_parameter(expr: &Expr) -> bool {
+    matches!(expr, Expr::Placeholder(_)) && !crate::engine::params::auto_parameterized_active()
+}
+
 /// Typed temporal result for textual temporal-function operands. MySQL's
 /// temporal functions return a value that reads as `YYYYMMDD[HHMMSS]` in numeric
 /// context even when their operand was text, so a whole-second result keeps a
@@ -13687,7 +13749,7 @@ fn typed_textual_temporal_result(result: NaiveDateTime, date_only: bool, fsp: us
         if let Ok(days) = i32::try_from(days) {
             return Value::Date(days);
         }
-    } else if fsp == 0 {
+    } else if fsp == 0 || result.nanosecond() == 0 {
         return Value::DateTime(result.and_utc().timestamp_micros());
     }
     Value::String(if date_only {
@@ -13850,12 +13912,18 @@ pub(crate) fn eval_date_add_values(
             .expect("valid epoch")
             .and_hms_opt(0, 0, 0)
             .expect("valid midnight");
-        return Ok(Value::Time(
-            result
-                .signed_duration_since(epoch)
-                .num_microseconds()
-                .unwrap_or(if result < epoch { i64::MIN } else { i64::MAX }),
-        ));
+        let micros = result.signed_duration_since(epoch).num_microseconds();
+        let Some(micros) =
+            micros.filter(|v| v.unsigned_abs() <= (TIME_MAX_SECONDS * 1_000_000) as u64)
+        else {
+            crate::engine::api::push_statement_warning(
+                crate::error::ConditionLevel::Warning,
+                crate::error::catalog::ER_DATETIME_FUNCTION_OVERFLOW,
+                "Datetime function: datetime field overflow",
+            );
+            return Ok(Value::Null);
+        };
+        return Ok(Value::Time(micros));
     }
     if matches!(
         date_val,
@@ -15099,12 +15167,24 @@ impl StrToDateBuilder {
             return None;
         }
 
-        // For DATE / DATETIME: year/month/day must all be present and valid.
+        // Calendar components may be incomplete or invalid when the session
+        // mode permits them. Preserve those components in the tagged lanes.
         if has_date {
             let y = self.year?;
             let mo = self.month?;
             let d = self.day?;
-            chrono::NaiveDate::from_ymd_opt(y, mo, d)?;
+            let zero = y == 0 && mo == 0 && d == 0;
+            if zero
+                && session_temporal_sql_mode_bits() & crate::engine::api::TEMPORAL_MODE_NO_ZERO_DATE
+                    != 0
+            {
+                return None;
+            }
+            let date = if zero {
+                Some(Value::Date(crate::types::ZERO_DATE))
+            } else {
+                date_value_from_components(u32::try_from(y).ok()?, mo, d)
+            }?;
             if has_time {
                 let h = self.hour.unwrap_or(0);
                 let mi = self.minute.unwrap_or(0);
@@ -15113,13 +15193,18 @@ impl StrToDateBuilder {
                 if h > 23 || mi > 59 || s > 59 || us > 999_999 {
                     return None;
                 }
-                let micros = chrono::NaiveDate::from_ymd_opt(y, mo, d)?
-                    .and_hms_micro_opt(h, mi, s, us)?
-                    .and_utc()
-                    .timestamp_micros();
+                let micros = if zero && h == 0 && mi == 0 && s == 0 && us == 0 {
+                    crate::types::ZERO_DATETIME
+                } else if let Some(date) = chrono::NaiveDate::from_ymd_opt(y, mo, d) {
+                    date.and_hms_micro_opt(h, mi, s, us)?
+                        .and_utc()
+                        .timestamp_micros()
+                } else {
+                    crate::types::encode_tagged_datetime(y as u32, mo, d, h, mi, s, us)?
+                };
                 Some(Value::DateTime(micros))
             } else {
-                date_value_from_components(y as u32, mo, d)
+                Some(date)
             }
         } else {
             // Time-only
@@ -15702,6 +15787,9 @@ fn format_round_fixed(value: &Value, decimals: usize) -> Result<String, QueryErr
         } else {
             f64::MAX
         };
+    }
+    if !n.is_finite() {
+        return Ok("0".into());
     }
     let mut out = if n.is_finite() && n.abs() >= 1e22 {
         // Large REALs have no fractional bits to round. Render their shortest
@@ -17778,12 +17866,13 @@ where
     // JSON_SEARCH(doc, one_or_all, pattern [, escape [, path ...]])
     expect_min_args(name, args, 3)?;
     let values = eval_args(args, eval_arg)?;
-    if values.iter().take(3).any(|v| matches!(v, Value::Null)) {
+    if values.iter().take(2).any(|v| matches!(v, Value::Null)) {
         return Ok(Value::Null);
     }
     let doc = json_doc_bytes(&values[0], 1, name)?;
     let root = crate::engine::json::JsonbRef::new(&doc)?;
     let one = parse_json_one_or_all(&str_value(&values[1]))?;
+    let null_search = matches!(values[2], Value::Null);
     let pattern = str_value(&values[2]);
     // The 4th arg is the LIKE escape character (previously hard-coded to
     // `\`). NULL / absent → default `\`; an empty string disables escaping.
@@ -17813,12 +17902,17 @@ where
                 return Ok(Value::Null);
             }
             let path = crate::engine::func_cache::cached_json_path(&string_value(pv))?;
-            for node in path.eval_without_auto_wrap(root) {
-                scopes.push((node.identity(), priority));
+            if !null_search {
+                for node in path.eval_without_auto_wrap(root) {
+                    scopes.push((node.identity(), priority));
+                }
             }
         }
     } else {
         scopes.push((root.identity(), 0));
+    }
+    if null_search {
+        return Ok(Value::Null);
     }
     if scopes.is_empty() {
         return Ok(Value::Null);
@@ -18368,7 +18462,34 @@ fn json_value_cast(value: Value, returning: &str) -> Result<Value, QueryError> {
         }
         "TIME" => {
             let fsp = params.first().copied().unwrap_or(0).clamp(0, 6) as u8;
-            json_value_require_conversion(value_to_time_string(&value, fsp))
+            // JSON_VALUE accepts time-shaped character scalars, not the
+            // compact numeric spelling accepted by the general CAST path.
+            let text = match &value {
+                Value::String(text) => text.as_str(),
+                Value::SmallString(text) => std::str::from_utf8(text).unwrap_or(""),
+                _ => "",
+            };
+            let parsed = text
+                .contains(':')
+                .then(|| parse_time_components(text))
+                .transpose()?;
+            let invalid = || {
+                crate::error::catalog::ER_INVALID_JSON_VALUE_FOR_CAST
+                    .error("JSON_VALUE TIME requires an in-range time string")
+            };
+            let (negative, h, m, s, us) = parsed.ok_or_else(invalid)?;
+            let round_up = session_temporal_sql_mode_bits()
+                & crate::engine::api::TEMPORAL_MODE_TIME_TRUNCATE_FRACTIONAL
+                == 0
+                && comparison_fraction_rounds_up(&value);
+            let micros = (i64::from(h) * 3600 + i64::from(m) * 60 + i64::from(s)) * 1_000_000
+                + i64::from(us)
+                + i64::from(round_up);
+            if micros > TIME_MAX_SECONDS * 1_000_000 {
+                return Err(invalid());
+            }
+            let time = Value::Time(if negative { -micros } else { micros });
+            json_value_require_conversion(value_to_time_string(&time, fsp))
         }
         "DATETIME" => json_value_require_conversion(cast_value_to_datetime(
             &value,
@@ -22472,7 +22593,18 @@ fn fold_constant_subexprs_inner_checked(expr: &mut Expr) {
     }
     // If the whole subtree is constant, evaluate once.
     if is_constant {
-        let typed_domain = contains_typed_constant(expr).then(|| {
+        // Preserve a constant function's declared domain even when its value
+        // is NULL, without disabling value folding and repeating JSON work
+        // for every source row.
+        let preserve_json_type = match expr {
+            Expr::Function { name, .. } if name.eq_ignore_ascii_case("JSON_QUOTE") => true,
+            Expr::Function { name, args, .. } if name.eq_ignore_ascii_case("JSON_VALUE") => {
+                matches!(args.get(2), Some(Expr::Literal(Literal::String(target)))
+                    if target.eq_ignore_ascii_case("JSON"))
+            }
+            _ => false,
+        };
+        let typed_domain = (contains_typed_constant(expr) || preserve_json_type).then(|| {
             let no_column = |_: &Expr| None;
             let no_placeholder = |_: usize| None;
             crate::engine::expr_type::infer_expr_type(
@@ -24409,9 +24541,9 @@ fn eval_arithmetic_inner(left: &Value, op: BinaryOp, right: &Value) -> Result<Va
         BinaryOp::Mod => l % r,
         _ => unreachable!(),
     };
-    // MySQL: DOUBLE arithmetic that overflows from finite operands is an
-    // error (1690), never silent infinity.
-    if value.is_infinite() && l.is_finite() && r.is_finite() {
+    // Non-finite DOUBLE arithmetic is an error, including when an operand
+    // came from an overflowing ROUND/TRUNCATE rescaling operation.
+    if !value.is_finite() {
         return Err(error(
             crate::error::catalog::ER_DATA_OUT_OF_RANGE,
             "DOUBLE value is out of range",
@@ -28319,6 +28451,11 @@ pub(crate) fn coerce_result_to_expr_type(
                 cast_to_decimal(&value, precision, scale)
             }
         }
+        // An already-typed REAL result needs no SQL CAST. In particular,
+        // preserve ROUND/TRUNCATE's non-finite intermediate for FORMAT;
+        // explicit casts still perform their range checks.
+        ExprTypeKind::Float { single: false, .. } if matches!(value, Value::Double(_)) => Ok(value),
+        ExprTypeKind::Float { single: true, .. } if matches!(value, Value::Float(_)) => Ok(value),
         ExprTypeKind::Float { single, .. } => cast_to_float(&value, single),
         ExprTypeKind::String {
             kind: StringKind::Binary | StringKind::Blob,
@@ -30040,11 +30177,35 @@ pub(crate) fn parse_time_value_components(
     value: &Value,
 ) -> Result<(bool, u32, u32, u32, u32), QueryError> {
     let (negative, h, m, s, us) = parse_time_value_components_inner(value)?;
+    // Native TIME is already quantized to microseconds. In-range values need
+    // neither textual fraction inspection nor a session-mode lookup.
+    if matches!(value, Value::Time(micros)
+        if micros.unsigned_abs() <= (TIME_MAX_SECONDS * 1_000_000) as u64)
+    {
+        return Ok((negative, h, m, s, us));
+    }
+    let numeric_input = value_is_numeric(value);
     let round_up = session_temporal_sql_mode_bits()
         & crate::engine::api::TEMPORAL_MODE_TIME_TRUNCATE_FRACTIONAL
         == 0
         && comparison_fraction_rounds_up(value);
-    if value_is_numeric(value) || round_up {
+    // Character TIME conversion clips at the whole-second endpoint. Numeric
+    // input retains its distinct NULL-on-overflow rule above.
+    if !numeric_input
+        && h >= 838
+        && (u64::from(h) * 3600 + u64::from(m) * 60 + u64::from(s)) * 1_000_000
+            + u64::from(us)
+            + u64::from(round_up)
+            > (TIME_MAX_SECONDS * 1_000_000) as u64
+    {
+        crate::engine::api::push_statement_warning(
+            crate::error::ConditionLevel::Warning,
+            crate::error::catalog::ER_TRUNCATED_WRONG_VALUE,
+            format!("Truncated incorrect time value: '{}'", string_value(value)),
+        );
+        return Ok((negative, 838, 59, 59, 0));
+    }
+    if numeric_input || round_up {
         let total = (u64::from(h) * 3600 + u64::from(m) * 60 + u64::from(s)) * 1_000_000
             + u64::from(us)
             + u64::from(round_up);
@@ -30125,7 +30286,20 @@ fn parse_time_value_components_inner(
         .split('.')
         .next()
         .unwrap_or("");
-    if !main.is_empty() && main.len() <= 7 && main.bytes().all(|b| b.is_ascii_digit()) {
+    if !main.is_empty() && main.len() <= 8 && main.bytes().all(|b| b.is_ascii_digit()) {
+        return parse_time_components(&text);
+    }
+    // An unambiguous character duration needs no calendar parse first. Keep
+    // compact dates, alternate date delimiters and typed temporals on their
+    // existing conversion paths.
+    if matches!(
+        value,
+        Value::String(_) | Value::SmallString(_) | Value::Bytes(_)
+    ) && main.contains(':')
+        && main
+            .bytes()
+            .all(|b| b.is_ascii_digit() || matches!(b, b':' | b' '))
+    {
         return parse_time_components(&text);
     }
     if let Ok(dt) = parse_datetime(value) {

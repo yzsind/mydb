@@ -40,6 +40,11 @@ Result:
   (`9999-12-31 23:59:59.999999` UTC). A TIMESTAMP argument is already UTC;
   DATETIME and text arguments use the session time zone. Exact decimal output
   preserves microseconds. Out-of-range datetime arguments return zero.
+  The extended future range is intentional: unlike MySQL's function boundary
+  near year 3001, a valid year-9999 input returns its epoch seconds. The native
+  TIMESTAMP range and WAL replication preserve this domain; MySQL binlog
+  encodability and destination-column ranges impose separate limits, as
+  documented in [MySQL compatibility](../../mysql80-compatibility.md).
 
 ## Related Functions
 

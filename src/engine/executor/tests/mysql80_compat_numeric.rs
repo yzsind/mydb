@@ -513,16 +513,63 @@ fn format_after_extreme_truncate_does_not_emit_infinity() {
         &engine,
         "SELECT FORMAT(TRUNCATE('1.7976931348623157E+308', -12), 1, 'fr_BE')",
     );
-    // At this magnitude the requested decimal positions are below DOUBLE's
-    // resolution. Preserve the finite input rather than copying MySQL's
-    // intermediate-overflow fallback to zero.
-    assert_eq!(
-        row,
-        vec![Value::String(format!(
-            "17976931348623157{},0",
-            "0".repeat(292)
-        ))]
-    );
+    // MySQL formats a non-finite REAL as zero without fractional padding.
+    assert_eq!(row, vec![Value::String("0".into())]);
+}
+
+#[test]
+fn approximate_round_rescaling_overflow_reaches_format_boundary() {
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let engine = open_test_engine(dir.path());
+    engine
+        .execute("CREATE TABLE extreme_real(v DOUBLE, d INT)")
+        .unwrap();
+    engine
+        .execute("INSERT INTO extreme_real VALUES (1.7976931348623157e308,-12),(-1.7976931348623157e308,-12)")
+        .unwrap();
+    for mode in [
+        vec::config::VecMode::Off,
+        vec::config::VecMode::On,
+        vec::config::VecMode::Auto,
+    ] {
+        let _mode = vec::config::enter_mode(mode);
+        let result = rows(engine.execute(
+            "SELECT TRUNCATE(v,d),ROUND(v,d),FORMAT(TRUNCATE(v,d),1,'fr_BE'),FORMAT(ROUND(v,d),0) FROM extreme_real"
+        ).unwrap());
+        assert_eq!(result.len(), 2);
+        for row in result {
+            for value in &row[..2] {
+                assert!(
+                    matches!(value, Value::Double(v) if v.is_infinite()),
+                    "{mode:?}: {value:?}"
+                );
+                assert_eq!(value.to_display_string(), "0");
+            }
+            assert_eq!(
+                &row[2..],
+                &[Value::String("0".into()), Value::String("0".into())]
+            );
+        }
+        let nested = rows(engine.execute(
+            "SELECT FORMAT(ROUND(TRUNCATE(v,d),2),1),FORMAT(TRUNCATE(ROUND(v,d),0),1) FROM extreme_real"
+        ).unwrap());
+        assert_eq!(nested, vec![vec![Value::String("0".into()); 2]; 2]);
+        let row = one_row(&engine,
+            "SELECT FORMAT(1.7976931348623157e308,1,'fr_BE'),FORMAT(0e0,1,'fr_BE'),FORMAT(TRUNCATE(1234.5e0,-2),1,'fr_BE')"
+        );
+        assert_eq!(
+            row,
+            vec![
+                Value::String(format!("17976931348623157{},0", "0".repeat(292))),
+                Value::String("0,0".into()),
+                Value::String("1200,0".into()),
+            ]
+        );
+        let err = engine
+            .execute("SELECT TRUNCATE(v,d) + 0 FROM extreme_real")
+            .unwrap_err();
+        assert!(err.is(crate::error::catalog::ER_DATA_OUT_OF_RANGE));
+    }
 }
 
 #[test]

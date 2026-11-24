@@ -1784,6 +1784,7 @@ pub(crate) fn aggregate_result_type(
 ) -> ExprType {
     let normalized = crate::engine::sys_schema::NormalizedFuncName::new(name);
     match normalized.as_str() {
+        "JSON_ARRAYAGG" | "JSON_OBJECTAGG" => ExprType::new(ExprTypeKind::Json, true),
         "BIT_AND" | "BIT_OR" | "BIT_XOR" => argument
             .filter(|arg| {
                 matches!(
@@ -2866,6 +2867,30 @@ fn infer_expr_type_checked(expr: &Expr, context: &TypeContext<'_>) -> ExprType {
                         true,
                     )
                 }
+                "JSON_QUOTE" => {
+                    let input = args.first().map(|arg| infer_expr_type(arg, context));
+                    let mut result = fixed_string_result(None, true);
+                    result.collation_id = Some(context.connection_collation_id);
+                    let input_width = input.and_then(|input| {
+                        if matches!(input.kind, Null) {
+                            Some(0)
+                        } else {
+                            input.max_octets
+                        }
+                    });
+                    result.max_octets = input_width.map(|width| {
+                        width
+                            .saturating_mul(6)
+                            .saturating_add(2 * u32::from(context.connection_mbmaxlen))
+                    });
+                    result
+                }
+                "JSON_VALUE"
+                    if matches!(args.get(2), Some(Expr::Literal(Literal::String(target)))
+                        if target.eq_ignore_ascii_case("JSON")) =>
+                {
+                    ExprType::new(Json, true)
+                }
                 "JSON_VALUE"
                     if crate::engine::expr::expression_metadata_decimals(expr).is_some() =>
                 {
@@ -3007,7 +3032,17 @@ fn infer_expr_type_checked(expr: &Expr, context: &TypeContext<'_>) -> ExprType {
                         .first()
                         .map(|arg| infer_expr_type(arg, context))
                         .unwrap_or_else(|| ExprType::new(Unknown, true));
+                    let dynamic = args
+                        .first()
+                        .is_some_and(crate::engine::expr::dynamic_temporal_parameter);
                     match input.kind {
+                        _ if dynamic => ExprType::new(
+                            Temporal {
+                                kind: TemporalKind::Time,
+                                fsp: 6,
+                            },
+                            true,
+                        ),
                         Temporal { kind, fsp } => ExprType::new(
                             Temporal {
                                 kind,
@@ -3251,6 +3286,8 @@ fn infer_expr_type_checked(expr: &Expr, context: &TypeContext<'_>) -> ExprType {
                     result
                 }
                 "COUNT"
+                | "JSON_ARRAYAGG"
+                | "JSON_OBJECTAGG"
                 | "SUM"
                 | "AVG"
                 | "MIN"
@@ -3375,7 +3412,7 @@ fn infer_expr_type_checked(expr: &Expr, context: &TypeContext<'_>) -> ExprType {
                     fixed_integer_result(IntegerWidth::Big, true, false)
                 }
                 "COUNT" => fixed_integer_result(IntegerWidth::Big, false, false),
-                "SUM" | "AVG" | "MIN" | "MAX" => {
+                "SUM" | "AVG" | "MIN" | "MAX" | "JSON_ARRAYAGG" | "JSON_OBJECTAGG" => {
                     aggregate_result_type(normalized.as_str(), argument, context)
                 }
                 "LAG" | "LEAD" | "FIRST_VALUE" | "LAST_VALUE" | "NTH_VALUE" => {
