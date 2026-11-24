@@ -143,6 +143,7 @@ pub(super) fn pop_bounded_scan_task(
 
 pub(super) fn build_batch_scan_tasks(
     db: &Arc<Database>,
+    txn: TxnView,
     table: &crate::planner::PlanTable,
     filter: Option<&Expr>,
     use_zone_map: bool,
@@ -151,6 +152,7 @@ pub(super) fn build_batch_scan_tasks(
     if let Some(degree) = parallel_degree.filter(|degree| *degree > 1) {
         return Ok(crate::engine::executor::select::parallel::scan_morsels(
             db,
+            txn,
             table,
             filter,
             use_zone_map,
@@ -160,20 +162,26 @@ pub(super) fn build_batch_scan_tasks(
     }
     let morsel_pages = scan_morsel_pages(false);
     Ok(
-        crate::engine::executor::select::parallel::scan_tasks(db, table, filter, use_zone_map)?
-            .into_iter()
-            .flat_map(|task| {
-                (task.page_lo..task.page_hi)
-                    .step_by(morsel_pages as usize)
-                    .map(
-                        move |page_lo| crate::engine::executor::select::parallel::ScanTask {
-                            storage_id: task.storage_id,
-                            page_lo,
-                            page_hi: (page_lo + morsel_pages).min(task.page_hi),
-                        },
-                    )
-            })
-            .collect(),
+        crate::engine::executor::select::parallel::scan_tasks(
+            db,
+            txn,
+            table,
+            filter,
+            use_zone_map,
+        )?
+        .into_iter()
+        .flat_map(|task| {
+            (task.page_lo..task.page_hi)
+                .step_by(morsel_pages as usize)
+                .map(
+                    move |page_lo| crate::engine::executor::select::parallel::ScanTask {
+                        storage_id: task.storage_id,
+                        page_lo,
+                        page_hi: (page_lo + morsel_pages).min(task.page_hi),
+                    },
+                )
+        })
+        .collect(),
     )
 }
 
@@ -2146,6 +2154,7 @@ pub(super) fn try_build_direct_batch_scan<'a>(
             if predicate_first || borrowed_string || !runtime_filters.is_empty() {
                 let scan_tasks = build_batch_scan_tasks(
                     db,
+                    txn,
                     table,
                     Some(f),
                     use_zone_map,
@@ -2213,6 +2222,7 @@ pub(super) fn try_build_direct_batch_scan<'a>(
         // inheriting a discarded candidate generation from this probe.
         let scan_tasks = build_batch_scan_tasks(
             db,
+            txn,
             table,
             Some(f),
             use_zone_map,
@@ -2305,6 +2315,7 @@ pub(super) fn try_build_direct_batch_scan<'a>(
     }
     let scan_tasks = build_batch_scan_tasks(
         db,
+        txn,
         table,
         None,
         use_zone_map,
@@ -2608,7 +2619,7 @@ pub(super) fn try_build_direct_index_batch_scan<'a>(
             let candidate_heap_ranges = if defer_zone_map {
                 None
             } else {
-                db.zone_map_candidate_ranges(&table.schema, predicate)
+                db.zone_map_candidate_ranges_for_read(txn, &table.schema, predicate)
                     .and_then(|ranges| {
                         let covered_pages = ranges
                             .iter()

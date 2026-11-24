@@ -134,15 +134,16 @@ pub(in crate::engine::executor::select) fn window_for_select(
     })))
 }
 
-pub(crate) fn window_json(window: &Option<OutputWindow>) -> serde_json::Value {
-    fn value(limit: &crate::parser::LimitValue) -> serde_json::Value {
-        match limit {
-            crate::parser::LimitValue::Rows(rows) => serde_json::json!(rows),
-            crate::parser::LimitValue::Placeholder(index)
-            | crate::parser::LimitValue::OffsetCommaPlaceholder(index) => {
-                serde_json::json!({"parameter":index})
-            }
+pub(super) fn limit_json(limit: &crate::parser::LimitValue) -> serde_json::Value {
+    match limit {
+        crate::parser::LimitValue::Rows(rows) => serde_json::json!(rows),
+        crate::parser::LimitValue::Placeholder(index)
+        | crate::parser::LimitValue::OffsetCommaPlaceholder(index) => {
+            serde_json::json!({"parameter":index})
         }
     }
-    window.as_ref().map(|window|serde_json::json!({"limit":value(&window.limit),"offset":window.offset.as_ref().map(value).unwrap_or_else(||serde_json::json!(0))})).unwrap_or(serde_json::Value::Null)
+}
+
+pub(crate) fn window_json(window: &Option<OutputWindow>) -> serde_json::Value {
+    window.as_ref().map(|window|serde_json::json!({"limit":limit_json(&window.limit),"offset":window.offset.as_ref().map(limit_json).unwrap_or_else(||serde_json::json!(0))})).unwrap_or(serde_json::Value::Null)
 }

@@ -2616,7 +2616,11 @@ pub(crate) fn estimate_value_section_len(
     let layout = &row_layout.value_layout;
     let bitmap_len = n.div_ceil(8);
     let ext_bitmap_len = layout.var_count.div_ceil(8);
-    let mut len = varint_len(n as u64) + bitmap_len + layout.fixed_len + layout.var_count * 2;
+    let mut len = varint_len(codec.active_layout_id as u64)
+        + varint_len(n as u64)
+        + bitmap_len
+        + layout.fixed_len
+        + layout.var_count * 2;
     if externalized.iter().any(|&e| e) {
         len += ext_bitmap_len; // external bitmap over varlen columns
     }
@@ -8032,6 +8036,7 @@ mod row_codec_tests {
                 .collect::<Vec<_>>();
             for txn in [0, 1, 42, u64::MAX] {
                 let expected = encode_visible_row_payload(&values, &c, txn).unwrap();
+                assert!(estimate_value_section_len(&values, &c, &[]) >= expected.len());
                 let mut direct = program.begin_row(txn, 0);
                 for value in &values {
                     direct.push_value(value).unwrap();

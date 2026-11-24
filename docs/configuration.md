@@ -53,6 +53,20 @@ eases incremental migration of existing configurations. Test, benchmark,
 crash-injection, and debug environment switches cannot be written into the config
 file.
 
+## Logical replication credentials and write protection
+
+Configuring a MySQL replication channel enables `mydb_replica_read_only` by
+default, even before `START REPLICA`. This protects replica data from local
+writes, including writes by root. If the channel is being staged on a writable
+server, explicitly run `SET GLOBAL mydb_replica_read_only = OFF`. Stopping
+replication alone does not promise to clear this setting.
+
+Channel metadata contains the source password. On Unix, mydb creates private
+replication directories (0700) and channel files (0600), rejects symbolic-link
+channel files, and refuses to load files readable by other users. Protect
+backups and copies of these files with the same permissions. Channel passwords
+are not encrypted at rest.
+
 ## Connection Reactors
 
 `tokio_workers` (`MYDB_TOKIO_WORKERS`) sets the number of connection reactors

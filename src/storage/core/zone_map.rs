@@ -9007,14 +9007,31 @@ impl Database {
             .ranges()
     }
 
+    /// Dirty reads can observe heap writes before summary widening finishes.
+    pub(crate) fn zone_map_candidate_ranges_for_read(
+        &self,
+        txn: TxnView,
+        table: &TableSchema,
+        filter: &Expr,
+    ) -> Option<ZoneMapRanges> {
+        if txn.dirty_read {
+            return None;
+        }
+        self.zone_map_candidate_ranges(table, filter)
+    }
+
     /// Execute an already-selected ZoneMapScan. Planner/session switch checks
     /// happened before the physical operator was created and must not be
     /// repeated on a worker thread with a different TLS context.
     pub fn zone_map_candidate_ranges_for_plan(
         &self,
+        txn: TxnView,
         table: &TableSchema,
         filter: &Expr,
     ) -> Option<ZoneMapRanges> {
+        if txn.dirty_read {
+            return None;
+        }
         self.zone_map_candidate_ranges_inner(table, filter, true)
             .ranges()
     }
@@ -9023,10 +9040,14 @@ impl Database {
     /// Partitioned execution calls this once per selected `storage_id`.
     pub fn zone_map_candidate_ranges_for_storage_for_plan(
         &self,
+        txn: TxnView,
         table: &TableSchema,
         storage_id: u64,
         filter: &Expr,
     ) -> Option<ZoneMapRanges> {
+        if txn.dirty_read {
+            return None;
+        }
         self.zone_map_candidate_ranges_for_storage_inner(table, storage_id, filter, true)
             .ranges()
     }
@@ -15100,12 +15121,12 @@ mod zone_map_tests {
             right: Box::new(Expr::Literal(Literal::Int(-100))),
         };
         assert!(db
-            .zone_map_candidate_ranges_for_plan(&table, &filter)
+            .zone_map_candidate_ranges_for_plan(TxnView::read_only(u64::MAX, crate::storage::IsolationLevel::ReadCommitted), &table, &filter)
             .is_none());
         assert!(db.zone_map_cost_estimate_forced(&table, &filter).is_none());
         db.set_zone_map_enabled(true).unwrap();
         assert!(db
-            .zone_map_candidate_ranges_for_plan(&table, &filter)
+            .zone_map_candidate_ranges_for_plan(TxnView::read_only(u64::MAX, crate::storage::IsolationLevel::ReadCommitted), &table, &filter)
             .is_none_or(|ranges| !ranges.is_empty()));
         let crate::engine::QueryResponse::ResultSet(result) = engine
             .execute("SELECT /*+ ZONE_MAP(zm) */ id,v FROM zm WHERE v=-100")
@@ -15116,7 +15137,7 @@ mod zone_map_tests {
         assert_eq!(result.rows, vec![vec![Value::Int(1), Value::Int(-100)]]);
         engine.execute("ANALYZE TABLE zm").unwrap();
         assert!(db
-            .zone_map_candidate_ranges_for_plan(&table, &filter)
+            .zone_map_candidate_ranges_for_plan(TxnView::read_only(u64::MAX, crate::storage::IsolationLevel::ReadCommitted), &table, &filter)
             .is_some());
     }
 

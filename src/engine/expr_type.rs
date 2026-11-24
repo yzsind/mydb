@@ -1142,7 +1142,51 @@ pub(crate) fn checked_branch_types(
                 &operands.iter().collect::<Vec<_>>(),
                 "UNION",
             )?;
+        } else if matches!(
+            result.kind,
+            ExprTypeKind::String {
+                kind: StringKind::Character
+            }
+        ) {
+            // Numeric/temporal metadata uses the binary protocol collation;
+            // their textual common domain belongs to the connection charset.
+            result.collation_id = Some(crate::engine::expr::connection_collation_id());
         }
+        // Numeric and temporal widths are presentation characters, whereas
+        // character operands already advertise octets. Convert the former to
+        // the selected result charset before taking the common capacity.
+        let mb = result
+            .collation_id
+            .and_then(crate::charset::resolve_collation_id)
+            .and_then(|info| crate::charset::resolve_charset(info.charset).ok())
+            .map_or(1, |charset| u32::from(charset.max_len));
+        let octets = |ty: ExprType| -> Option<u32> {
+            let chars = match ty.kind {
+                ExprTypeKind::Integer { width, unsigned } => ty
+                    .max_octets
+                    .unwrap_or(u32::from(width.decimal_precision()))
+                    .saturating_add(u32::from(!unsigned)),
+                ExprTypeKind::Decimal {
+                    precision,
+                    scale,
+                    unsigned,
+                } => u32::from(precision) + u32::from(scale > 0) + u32::from(!unsigned),
+                ExprTypeKind::Float { .. } => 24,
+                ExprTypeKind::Year => 4,
+                ExprTypeKind::Temporal { kind, fsp } => match kind {
+                    TemporalKind::Date => 10,
+                    TemporalKind::Time => 10 + if fsp > 0 { u32::from(fsp) + 1 } else { 0 },
+                    _ => 19 + if fsp > 0 { u32::from(fsp) + 1 } else { 0 },
+                },
+                ExprTypeKind::Null => return Some(0),
+                _ => return ty.max_octets,
+            };
+            Some(chars.saturating_mul(mb))
+        };
+        result.max_octets = match (octets(left), octets(right)) {
+            (Some(l), Some(r)) => Some(l.max(r)),
+            _ => None,
+        };
     }
     Ok(result)
 }
@@ -2055,7 +2099,8 @@ fn infer_expr_type_checked(expr: &Expr, context: &TypeContext<'_>) -> ExprType {
                         Integer { width, unsigned } => {
                             *width = IntegerWidth::Big;
                             *unsigned = false;
-                            result.max_octets = None;
+                            result.max_octets =
+                                input.max_octets.map(|width| width.saturating_add(1));
                         }
                         Decimal { unsigned, .. } => *unsigned = false,
                         Year => {
@@ -2885,13 +2930,33 @@ fn infer_expr_type_checked(expr: &Expr, context: &TypeContext<'_>) -> ExprType {
                             TemporalKind::Date if !time_unit => TemporalKind::Date,
                             _ => TemporalKind::DateTime,
                         };
+                        let interval_fsp = match args.get(1) {
+                            Some(Expr::Function {
+                                name,
+                                args: interval,
+                                ..
+                            }) if name.eq_ignore_ascii_case("__INTERVAL") => {
+                                if unit.is_some_and(|unit| unit.contains("MICROSECOND")) {
+                                    6
+                                } else if unit.is_some_and(|unit| unit.contains("SECOND")) {
+                                    match interval
+                                        .first()
+                                        .map(|amount| infer_expr_type(amount, context).kind)
+                                    {
+                                        Some(Decimal { scale, .. }) => scale.min(6),
+                                        Some(Integer { .. } | Year | Bit { .. }) => 0,
+                                        _ => 6,
+                                    }
+                                } else {
+                                    0
+                                }
+                            }
+                            _ => 0,
+                        };
                         ExprType::new(
                             Temporal {
                                 kind,
-                                fsp: fsp.max(
-                                    crate::engine::expr::expression_metadata_decimals(expr)
-                                        .unwrap_or(0),
-                                ),
+                                fsp: fsp.max(interval_fsp),
                             },
                             true,
                         )

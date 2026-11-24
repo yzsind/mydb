@@ -13,7 +13,7 @@ use crate::util::thread_spawn::{self as thread, JoinHandle};
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -1597,7 +1597,7 @@ impl ReplicationManager {
     fn load_channel(&self, channel: &str) -> Result<PersistedChannel, QueryError> {
         recover_relay_reclaim(&self.data_dir, channel)?;
         let path = channel_path(&self.data_dir, channel);
-        let bytes = fs::read(&path).map_err(|err| {
+        let bytes = read_private_channel(&path).map_err(|err| {
             error(
                 crate::error::catalog::ER_NOT_SUPPORTED_YET,
                 if err.kind() == std::io::ErrorKind::NotFound {
@@ -7327,7 +7327,38 @@ fn recover_relay_boundary(path: &Path) -> Result<(u64, Option<RelayRecord>), Que
 
 fn persist_channel(data_dir: &Path, persisted: &PersistedChannel) -> Result<(), QueryError> {
     let dir = replication_dir(data_dir).join("channels");
-    fs::create_dir_all(&dir).map_err(|err| io_error("create replication directory", err))?;
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder
+        .create(&dir)
+        .map_err(|err| io_error("create replication directory", err))?;
+    for path in [replication_dir(data_dir), dir.clone()] {
+        let meta = fs::symlink_metadata(&path)
+            .map_err(|err| io_error("inspect replication directory", err))?;
+        if !meta.is_dir() {
+            return Err(error(
+                crate::error::catalog::ER_GET_ERRNO,
+                "replication metadata directory must not be a symlink",
+            ));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            if meta.uid() != rustix::process::geteuid().as_raw() {
+                return Err(error(
+                    crate::error::catalog::ER_GET_ERRNO,
+                    "replication metadata directory must be owned by the server",
+                ));
+            }
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
+                .map_err(|err| io_error("secure replication directory", err))?;
+        }
+    }
     let path = channel_path(data_dir, &persisted.config.channel);
     // Unique temp name per writer: the IO and SQL threads both persist
     // progress on their own commit boundaries, at nearly the same frequency.
@@ -7341,8 +7372,16 @@ fn persist_channel(data_dir: &Path, persisted: &PersistedChannel) -> Result<(), 
     let seq = PERSIST_SEQ.fetch_add(1, Ordering::Relaxed);
     let tmp = path.with_extension(format!("json.tmp.{}.{seq}", std::process::id()));
     let write = || -> Result<(), QueryError> {
-        let mut file =
-            File::create(&tmp).map_err(|err| io_error("create replication metadata", err))?;
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        }
+        let mut file = options
+            .open(&tmp)
+            .map_err(|err| io_error("create replication metadata", err))?;
         crate::storage::metadata::write(
             &mut file,
             crate::storage::metadata::CHANNEL,
@@ -7359,6 +7398,9 @@ fn persist_channel(data_dir: &Path, persisted: &PersistedChannel) -> Result<(), 
             .and_then(|_| file.sync_all())
             .map_err(|err| io_error("sync replication metadata", err))?;
         fs::rename(&tmp, &path).map_err(|err| io_error("install replication metadata", err))?;
+        File::open(&dir)
+            .and_then(|file| file.sync_all())
+            .map_err(|err| io_error("sync replication metadata directory", err))?;
         Ok(())
     };
     let result = write();
@@ -7369,12 +7411,91 @@ fn persist_channel(data_dir: &Path, persisted: &PersistedChannel) -> Result<(), 
     result
 }
 
+fn read_private_channel(path: &Path) -> std::io::Result<Vec<u8>> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options.open(path)?;
+    let meta = file.metadata()?;
+    if !meta.is_file() || meta.len() > 64 * 1024 * 1024 {
+        return Err(std::io::Error::other("invalid replication metadata file"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if meta.mode() & 0o077 != 0 || meta.uid() != rustix::process::geteuid().as_raw() {
+            return Err(std::io::Error::other(
+                "replication metadata must be owned by the server with mode 0600",
+            ));
+        }
+    }
+    let mut bytes = Vec::new();
+    file.take(64 * 1024 * 1024 + 1).read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
 fn io_error(action: &str, err: std::io::Error) -> QueryError {
     crate::util::io_error::map_io_error(action, err)
 }
 
+#[cfg(all(test, unix))]
+#[path = "replication_auth_security_tests.rs"]
+mod auth_security_tests;
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[cfg(unix)]
+    fn audit_five_replication_credentials_are_private() {
+        use super::*;
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        let mut state = PersistedChannel {
+            config: ReplicationChannelConfig {
+                channel: "private".into(),
+                source_password: "test-secret".into(),
+                ..Default::default()
+            },
+            status: ReplicationStatus::default(),
+        };
+        persist_channel(dir.path(), &state).unwrap();
+        let path = channel_path(dir.path(), "private");
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(path.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        state.config.source_password = "replacement".into();
+        persist_channel(dir.path(), &state).unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(read_private_channel(&path).is_ok());
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(read_private_channel(&path).is_err());
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let link = path.with_extension("link");
+        symlink(&path, &link).unwrap();
+        assert!(read_private_channel(&link).is_err());
+        fs::remove_file(&path).unwrap();
+        fs::remove_file(&link).unwrap();
+        fs::remove_dir(path.parent().unwrap()).unwrap();
+        symlink(dir.path(), path.parent().unwrap()).unwrap();
+        assert!(persist_channel(dir.path(), &state).is_err());
+    }
+
     #[test]
     fn fulltext_incremental_mysql_row_apply_preserves_transactional_counters() {
         let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();

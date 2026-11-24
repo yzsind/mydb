@@ -422,6 +422,39 @@ fn projected_and_streamed_scan_routes_match_full_rows_across_types_and_filters()
 }
 
 #[test]
+fn dirty_read_scan_tasks_keep_all_physical_heaps() {
+    let (_dir, engine) = fixture();
+    let db = engine.db_for_tests();
+    let rc = TxnView::read_only(db.visible_scn(), IsolationLevel::ReadCommitted);
+    let ru = TxnView::read_only(db.visible_scn(), IsolationLevel::ReadUncommitted);
+    let filter = Some(crate::parser::parse_expr_fragment("id < 0").unwrap());
+    for name in ["route_plain", "route_parts"] {
+        let table = table(db, name);
+        assert!(
+            super::super::parallel::scan_tasks(db, rc, &table, filter.as_ref(), true)
+                .unwrap()
+                .is_empty(),
+            "fixture must prune all pages: {name}"
+        );
+        let expected = super::super::parallel::scan_tasks(db, ru, &table, None, false).unwrap();
+        let actual =
+            super::super::parallel::scan_tasks(db, ru, &table, filter.as_ref(), true).unwrap();
+        let ranges = |tasks: Vec<super::super::parallel::ScanTask>| {
+            tasks
+                .into_iter()
+                .map(|task| (task.storage_id, task.page_lo, task.page_hi))
+                .collect::<Vec<_>>()
+        };
+        assert!(!expected.is_empty());
+        assert_eq!(
+            ranges(actual),
+            ranges(expected),
+            "dirty-read ranges: {name}"
+        );
+    }
+}
+
+#[test]
 fn projected_scan_routes_distinguish_empty_candidates_and_stop_on_consumer_error() {
     let (_dir, engine) = fixture();
     let db = engine.db_for_tests();
@@ -433,6 +466,7 @@ fn projected_scan_routes_distinguish_empty_candidates_and_stop_on_consumer_error
             for storage_id in table.schema.storage_ids() {
                 assert!(db
                     .zone_map_candidate_ranges_for_storage_for_plan(
+                        txn,
                         &table.schema,
                         storage_id,
                         &exclude_all
@@ -443,7 +477,7 @@ fn projected_scan_routes_distinguish_empty_candidates_and_stop_on_consumer_error
             None
         } else {
             let ranges = db
-                .zone_map_candidate_ranges_for_plan(&table.schema, &exclude_all)
+                .zone_map_candidate_ranges_for_plan(txn, &table.schema, &exclude_all)
                 .expect("fixture has trusted zone maps");
             assert!(ranges.is_empty());
             Some(ranges)

@@ -59,6 +59,31 @@ intentional differences, and migration boundaries.
 
 **➕ Table sampling:** `TABLESAMPLE` supports row/page sampling by percentage or exact row count, execution-time parameters, `REPEATABLE`, and parallel scans over user base tables and partitions. The default is `SYSTEM` percentage sampling. MySQL 8.0.46 has no equivalent TABLESAMPLE clause; see [SELECT table sampling](statement/query/select.md#table-sampling) for semantics and restrictions.
 
+### Intentional SQL Differences
+
+The following behaviors are intentional and should be considered when comparing
+results or affected-row counts with MySQL:
+
+- Mixed integer/DECIMAL `CASE` and `IF` results retain the common DECIMAL scale,
+  consistent with their result metadata; a selected integer branch can display
+  as `128.0`.
+- Nonrecursive CTEs can reference a CTE defined later in the same `WITH` clause.
+  Window position functions return signed integers, so subtracting two
+  `ROW_NUMBER()` results can produce a negative number.
+- Valid year-0000 dates use the proleptic Gregorian calendar. Date arithmetic
+  preserves valid dates, and `FROM_DAYS(TO_DAYS(date))` round-trips them. Week
+  functions and zero-date clamping can therefore differ from MySQL.
+- `REPLACE` counts the actual deleted and inserted rows. Replacing one
+  conflicting row reports two affected rows even when its values are unchanged.
+- Mixed explicit/generated `AUTO_INCREMENT` inserts allocate generated values
+  as needed; they do not discard MySQL-style unused batch reservations.
+- When several columns in one strict INSERT are invalid, the first reported
+  error can differ because expressions are evaluated before row coercion. The
+  rejected statement remains atomic.
+- For very large finite DOUBLE values, `ROUND`/`TRUNCATE` preserve the input
+  when the requested decimal positions are below its numeric resolution;
+  `FORMAT` renders that finite result instead of an intermediate-overflow zero.
+
 ---
 
 ## 1. Client Protocol and Connections

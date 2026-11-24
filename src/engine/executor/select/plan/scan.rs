@@ -78,7 +78,7 @@ pub(crate) fn runtime_filter_zone_ranges(
         high: Box::new(Expr::BoundValue(Value::Int(i64::try_from(hi).ok()?))),
         negated: false,
     };
-    let ranges = db.zone_map_candidate_ranges_for_plan(&table.schema, &predicate)?;
+    let ranges = db.zone_map_candidate_ranges_for_plan(txn, &table.schema, &predicate)?;
     let pages = db.heap_page_count_for_storage(table.schema.id).ok()?;
     ranges
         .iter()
@@ -218,6 +218,7 @@ pub(in crate::engine::executor::select) fn scan_plan_table(
             let mut rows = Vec::new();
             scan_partition_ranges(
                 db,
+                txn,
                 &table.schema,
                 filter.as_ref().filter(|_| use_zone_map),
                 |storage_id, lo, hi| {
@@ -236,7 +237,7 @@ pub(in crate::engine::executor::select) fn scan_plan_table(
         if let Some(ranges) = use_zone_map
             .then(|| filter.as_ref())
             .flatten()
-            .and_then(|expr| db.zone_map_candidate_ranges_for_plan(&table.schema, expr))
+            .and_then(|expr| db.zone_map_candidate_ranges_for_plan(txn, &table.schema, expr))
         {
             let mut rows = Vec::new();
             for (lo, hi) in ranges {
@@ -279,13 +280,14 @@ pub(in crate::engine::executor::select) fn scan_plan_table(
 /// The owning candidate iterator keeps its scratch reservation through errors.
 fn scan_partition_ranges(
     db: &Database,
+    txn: TxnView,
     schema: &TableSchema,
     zone_map_filter: Option<&Expr>,
     mut visit: impl FnMut(u64, u64, u64) -> Result<(), QueryError>,
 ) -> Result<(), QueryError> {
     for storage_id in db.scan_storage_ids(schema) {
         let ranges = zone_map_filter.and_then(|expr| {
-            db.zone_map_candidate_ranges_for_storage_for_plan(schema, storage_id, expr)
+            db.zone_map_candidate_ranges_for_storage_for_plan(txn, schema, storage_id, expr)
         });
         if let Some(ranges) = ranges {
             for (lo, hi) in ranges {
@@ -318,7 +320,7 @@ where
     F: FnMut(&[Value]) -> Result<(), QueryError>,
 {
     if schema.is_partitioned() {
-        scan_partition_ranges(db, schema, zone_map_filter, |storage_id, lo, hi| {
+        scan_partition_ranges(db, txn, schema, zone_map_filter, |storage_id, lo, hi| {
             scan_projected_range(
                 db,
                 schema,
@@ -514,7 +516,7 @@ pub(super) fn scan_plan_table_projected(
             None
         } else {
             zone_map_filter
-                .and_then(|expr| db.zone_map_candidate_ranges_for_plan(&table.schema, expr))
+                .and_then(|expr| db.zone_map_candidate_ranges_for_plan(txn, &table.schema, expr))
         };
         scan_projected_table(
             db,
@@ -6009,7 +6011,7 @@ pub(super) fn open_fulltext_scan(
         ),
         Some(crate::planner::FulltextBaseAccess::ZoneMap { filter }) => {
             let ids = if let Some(ranges) =
-                db.zone_map_candidate_ranges_for_plan(&table.schema, filter)
+                db.zone_map_candidate_ranges_for_plan(txn, &table.schema, filter)
             {
                 let mut ids = Vec::new();
                 for (page_lo, page_hi) in ranges {

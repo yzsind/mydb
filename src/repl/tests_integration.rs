@@ -1427,7 +1427,14 @@ mod online_apply {
                 ))),
             };
             assert_eq!(
-                db.zone_map_candidate_ranges_for_plan(&table, &filter),
+                db.zone_map_candidate_ranges_for_plan(
+                    crate::storage::TxnView::read_only(
+                        u64::MAX,
+                        crate::storage::IsolationLevel::ReadCommitted
+                    ),
+                    &table,
+                    &filter
+                ),
                 Some(crate::storage::ZoneMapRanges::default())
             );
             assert!(db.zone_map_enabled());
@@ -1781,7 +1788,7 @@ mod online_apply {
                 op: crate::parser::BinaryOp::Eq,
                 right: Box::new(crate::parser::Expr::Literal(crate::parser::Literal::Int(9000))),
             };
-            let candidates = db.zone_map_candidate_ranges_for_plan(&table, &filter);
+            let candidates = db.zone_map_candidate_ranges_for_plan(crate::storage::TxnView::read_only(u64::MAX, crate::storage::IsolationLevel::ReadCommitted), &table, &filter);
             assert!(candidates.as_ref().is_none_or(|ranges| !ranges.is_empty()),
                 "a rebuilt source summary cannot exclude a zone for an older replica snapshot: {candidates:?}");
             let QueryResponse::ResultSet(oracle) = replica.execute_with_session(&mut reader,

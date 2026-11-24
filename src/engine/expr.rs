@@ -13303,54 +13303,22 @@ pub(crate) fn is_zero_datetime_value(value: &Value) -> bool {
 // can never drift apart.
 
 pub(crate) fn eval_datediff_values(a: &Value, b: &Value) -> Result<Value, QueryError> {
-    let parse = |value: &Value| {
-        if temporal_value_has_year_zero(value) {
-            if !strict_dml_expression() {
-                crate::engine::api::push_statement_warning(
-                    crate::error::ConditionLevel::Warning,
-                    crate::error::catalog::ER_TRUNCATED_WRONG_VALUE,
-                    format!(
-                        "Truncated incorrect datetime value: '{}'",
-                        string_value(value)
-                    ),
-                );
-                return Ok(None);
-            }
-            return Err(error(
+    let parse = |value: &Value| match parse_datetime_null_on_zero(value) {
+        Ok(parsed) => Ok(parsed),
+        Err(err) if !strict_dml_expression() => {
+            crate::engine::api::push_statement_warning(
+                crate::error::ConditionLevel::Warning,
                 crate::error::catalog::ER_TRUNCATED_WRONG_VALUE,
-                format!("Incorrect datetime value: '{}'", string_value(value)),
-            ));
+                err.to_string(),
+            );
+            Ok(None)
         }
-        match parse_datetime_null_on_zero(value) {
-            Ok(parsed) => Ok(parsed),
-            Err(err) if !strict_dml_expression() => {
-                crate::engine::api::push_statement_warning(
-                    crate::error::ConditionLevel::Warning,
-                    crate::error::catalog::ER_TRUNCATED_WRONG_VALUE,
-                    err.to_string(),
-                );
-                Ok(None)
-            }
-            Err(err) => Err(err),
-        }
+        Err(err) => Err(err),
     };
     let (Some(left), Some(right)) = (parse(a)?, parse(b)?) else {
         return Ok(Value::Null);
     };
     Ok(Value::Int((left.date() - right.date()).num_days()))
-}
-
-fn temporal_value_has_year_zero(value: &Value) -> bool {
-    match value {
-        Value::Date(days) => crate::types::date_components(*days).0 == 0,
-        Value::DateTime(micros) | Value::Timestamp(micros) => {
-            crate::types::datetime_components(*micros).0 == 0
-        }
-        Value::String(_) | Value::SmallString(_) | Value::Bytes(_) | Value::Decimal(_) => {
-            string_value(value).trim_start().starts_with("0000-")
-        }
-        _ => false,
-    }
 }
 
 fn reject_zero_date_text(value: &Value) -> bool {
@@ -13910,11 +13878,13 @@ pub(crate) fn eval_date_add_values(
         // fractional amount). Previously the `%H:%M:%S` format silently
         // truncated to whole seconds, so `+ INTERVAL 500000 MICROSECOND` was
         // a no-op and `.123456` inputs lost their fraction.
-        let arg_fsp = text_fsp(date_val);
-        let unit_fsp = if unit_upper.contains("MICROSECOND") {
+        let arg_fsp = if text_fsp(date_val) > 0 { 6 } else { 0 };
+        let unit_fsp = if unit_upper.contains("MICROSECOND")
+            || (unit_upper.contains("SECOND") && result.nanosecond() > 0)
+        {
             6
         } else {
-            text_fsp(amount)
+            0
         };
         Ok(typed_textual_temporal_result(
             result,
@@ -15683,22 +15653,12 @@ fn format_exact_decimal_parts(v: &Value) -> Option<(i128, u8)> {
 /// `decimals` fractional digits. Single source of truth for FORMAT rounding.
 fn format_round_fixed(value: &Value, decimals: usize) -> Result<String, QueryError> {
     if let Some((mag, scale)) = format_exact_decimal_parts(value) {
-        let overflow = || {
-            error(
-                crate::error::catalog::ER_DATA_OUT_OF_RANGE,
-                "DECIMAL value is out of range",
-            )
-        };
-        let (rmag, rscale) = crate::util::decimal::round_exact_parts(mag, scale, decimals as i32)
-            .ok_or_else(overflow)?;
-        let pad = decimals as u32 - rscale as u32;
-        let final_mag = rmag
-            .checked_mul(10i128.checked_pow(pad).ok_or_else(overflow)?)
-            .ok_or_else(overflow)?;
-        return Ok(crate::util::decimal::format_decimal_parts(
-            final_mag,
+        return Ok(crate::util::decimal::rescale_exact(
+            crate::util::decimal::ExactDecimal::from_i128(mag, scale),
             decimals as u8,
-        ));
+            true,
+        )
+        .format());
     }
     // DECIMAL(39..65) cannot be represented by i128. Keep it in the wide
     // fixed-point lane; FORMAT is an explicit presentation boundary, so this
@@ -15743,15 +15703,24 @@ fn format_round_fixed(value: &Value, decimals: usize) -> Result<String, QueryErr
             f64::MAX
         };
     }
-    let factor = 10f64.powi(decimals as i32);
-    let scaled = (n.abs() * factor).round_ties_even();
-    // MySQL's FORMAT boundary returns the stable fallback "0" when scaling
-    // an otherwise finite DOUBLE overflows. Besides matching its observable
-    // result, this prevents `inf` from escaping a presentation function.
-    if !scaled.is_finite() && n.is_finite() {
-        return Ok("0".to_string());
-    }
-    let mut out = format!("{:.prec$}", scaled / factor, prec = decimals);
+    let mut out = if n.is_finite() && n.abs() >= 1e22 {
+        // Large REALs have no fractional bits to round. Render their shortest
+        // decimal spelling before padding, avoiding binary expansion noise
+        // and intermediate overflow from multiplying by the scale factor.
+        let text = n.abs().to_string();
+        let (magnitude, scale) = crate::util::decimal::parse_exact_decimal_big(&text)
+            .ok_or_else(decimal_overflow_error)?;
+        crate::util::decimal::rescale_exact(
+            crate::util::decimal::ExactDecimal::from_big(magnitude, scale),
+            decimals as u8,
+            false,
+        )
+        .format()
+    } else {
+        let factor = 10f64.powi(decimals as i32);
+        let rounded = (n.abs() * factor).round_ties_even() / factor;
+        format!("{:.prec$}", rounded, prec = decimals)
+    };
     if n.is_sign_negative() {
         out.insert(0, '-');
     }
@@ -19887,7 +19856,10 @@ pub(super) fn function_metadata_decimals(name: &str, args: &[Expr]) -> Option<u8
         let text = match expr {
             Expr::Literal(Literal::Decimal(text) | Literal::String(text)) => text.as_str(),
             Expr::BoundValue(Value::Decimal(text) | Value::String(text)) => text.as_str(),
-            Expr::BoundValue(Value::DecimalCompact(_, scale)) => return Some((*scale).min(6)),
+            Expr::BoundValue(Value::DecimalCompact(_, scale) | Value::Decimal128(_, scale)) => {
+                return Some((*scale).min(6))
+            }
+            Expr::BoundValue(Value::DecimalWide(value)) => return Some(value.scale.min(6)),
             _ => return None,
         };
         let (_, fraction) = text.rsplit_once('.')?;
@@ -19953,6 +19925,29 @@ pub(super) fn function_metadata_decimals(name: &str, args: &[Expr]) -> Option<u8
             }) =>
         {
             Some(6)
+        }
+        "DATE_ADD" | "DATE_SUB" | "ADDDATE" | "SUBDATE" => {
+            let Expr::Function {
+                name,
+                args: interval,
+                ..
+            } = args.get(1)?
+            else {
+                return None;
+            };
+            if !name.eq_ignore_ascii_case("__INTERVAL")
+                || !interval
+                    .get(1)
+                    .is_some_and(|unit| interval_unit_from_arg(unit).contains("SECOND"))
+            {
+                return None;
+            }
+            let amount = interval.first()?;
+            Some(match amount {
+                Expr::Literal(Literal::Int(_) | Literal::UInt(_))
+                | Expr::BoundValue(Value::Int(_) | Value::UInt(_)) => 0,
+                _ => literal_fsp(amount).unwrap_or(6),
+            })
         }
         "NOW" | "CURRENT_TIMESTAMP" | "LOCALTIME" | "LOCALTIMESTAMP" | "UTC_TIMESTAMP"
         | "SYSDATE" | "CURTIME" | "CURRENT_TIME" | "UTC_TIME" => match args.first() {
@@ -24306,6 +24301,10 @@ fn eval_arithmetic_inner(left: &Value, op: BinaryOp, right: &Value) -> Result<Va
                 BinaryOp::Mod => crate::util::decimal::DecimalBinaryOp::Mod,
                 _ => unreachable!(),
             };
+            let wide = |value: &crate::util::decimal::ExactDecimal| {
+                matches!(value, crate::util::decimal::ExactDecimal::Big(..))
+            };
+            let wide_operand = wide(&left_decimal) || wide(&right_decimal);
             let result = if decimal_op == crate::util::decimal::DecimalBinaryOp::Div {
                 Some(crate::util::decimal::DecimalResultSpec {
                     precision: crate::util::decimal::MAX_DECIMAL_INTERMEDIATE_PRECISION,
@@ -24317,6 +24316,7 @@ fn eval_arithmetic_inner(left: &Value, op: BinaryOp, right: &Value) -> Result<Va
                 })
             } else {
                 (decimal_op == crate::util::decimal::DecimalBinaryOp::Mod
+                    || wide_operand
                     || left_decimal.scale().saturating_add(right_decimal.scale()) > 30)
                     .then(|| {
                         // MySQL exposes the full 81-digit scratch result for a
@@ -25129,11 +25129,10 @@ pub(crate) fn eval_negate_typed(
         // negates it (result is a DOUBLE, matching `-str` = REAL_RESULT):
         // `-'3'` → -3, `-'3.5'` → -3.5, `-'abc'` → 0 with warning 1292.
         // `lenient_str_to_f64` reuses the shared implicit-conversion rules
-        // and raises the truncation warning. Guard against `-0.0` so a
-        // non-numeric string prints `0`, not `-0`, like MySQL.
+        // and raises the truncation warning. Preserve IEEE signed zero.
         Value::String(_) | Value::SmallString(_) | Value::Bytes(_) => {
             let n = lenient_str_to_f64(&str_value(&value))?;
-            Ok(Value::Double(if n == 0.0 { 0.0 } else { -n }))
+            Ok(Value::Double(-n))
         }
         other => Err(error(
             crate::error::catalog::ER_TRUNCATED_WRONG_VALUE_FOR_FIELD,
@@ -25664,10 +25663,8 @@ fn decimal_overflow_error() -> QueryError {
 }
 
 thread_local! {
-    /// MySQL normalizes an overwide exact literal to DECIMAL(65), but keeps
-    /// enough source provenance for its immediately enclosing addition or
-    /// subtraction to use the result formula's carry digit. A genuine
-    /// DECIMAL(65,0) operand has no such provenance and still overflows.
+    /// Keep oversized source tokens on the bounded wide-literal +/- path,
+    /// including tokens that exceed the literal scratch buffer and saturate.
     static OVERWIDE_DECIMAL_LITERAL_CARRY: Cell<bool> = const { Cell::new(false) };
 }
 
@@ -25720,8 +25717,8 @@ pub(crate) fn exact_numeric_string_operand(value: &Value) -> Option<Value> {
 
 /// Evaluate arithmetic with the source-expression context needed by MySQL's
 /// bounded wide-literal rules.  Carry provenance applies only to +/-; MOD has
-/// its own 81-digit scratch-operand path.  Multiplication and division keep
-/// the ordinary DECIMAL(65,30) shaping rules.
+/// its own scratch-operand path. Destination coercion remains independent of
+/// these expression intermediates and enforces DECIMAL(65,30) on storage.
 pub(crate) fn eval_arithmetic_expression(
     left_expr: &Expr,
     right_expr: &Expr,
@@ -25746,8 +25743,8 @@ pub(crate) fn eval_arithmetic_expression(
 
 /// MOD reads an exact literal through MySQL's full nine-word decimal scratch
 /// buffer (81 decimal digits) before the result is shaped to DECIMAL(65,30).
-/// Preserve that source only for this operation; globally widening literal
-/// values would change the established normalization of +, *, CTAS and DML.
+/// Recover source provenance for MOD before its operation-specific scratch
+/// shaping; destination coercion remains bounded to DECIMAL(65,30).
 fn eval_modulo_expression(
     left_expr: &Expr,
     right_expr: &Expr,
@@ -25960,7 +25957,7 @@ fn try_decimal_big_arithmetic(
                 _ => unreachable!(),
             };
             let max_precision = if OVERWIDE_DECIMAL_LITERAL_CARRY.with(Cell::get) {
-                crate::util::decimal::MAX_DECIMAL_PRECISION as usize + 1
+                crate::util::decimal::MAX_DECIMAL_INTERMEDIATE_PRECISION as usize
             } else {
                 crate::util::decimal::MAX_DECIMAL_PRECISION as usize
             };
@@ -27679,11 +27676,10 @@ pub(crate) fn literal_into_value(lit: Literal) -> Value {
 }
 
 /// Convert an exact numeric token to MySQL's expression DECIMAL operand.
-/// MySQL keeps at most 65 significant digits when an expression DECIMAL is
-/// materialized, while the source token remains available to comparison and
-/// arithmetic paths that require a bounded wider intermediate. Merely
-/// resolving an exact literal is not a lossy string conversion and therefore
-/// must not publish warning 1292.
+/// Literal operands retain the nine-word exact scratch domain independently
+/// of DECIMAL(65,30) destination columns. Over-capacity integer tokens follow
+/// MySQL's saturated literal behavior; fractional words truncate only when
+/// the scratch buffer is full.
 pub(crate) fn mysql_decimal_literal_value(text: &str) -> Value {
     use num_bigint::BigInt;
     use num_traits::Signed;
@@ -27692,22 +27688,24 @@ pub(crate) fn mysql_decimal_literal_value(text: &str) -> Value {
         return Value::Decimal(text.to_string());
     };
     let digits = magnitude.abs().to_str_radix(10).len();
-    if digits <= crate::util::decimal::MAX_DECIMAL_PRECISION as usize {
+    let integer_digits = digits.saturating_sub(scale as usize);
+    if integer_digits <= crate::util::decimal::MAX_DECIMAL_INTERMEDIATE_PRECISION as usize {
+        // Literal operands use MySQL's nine base-1e9 scratch words. Storage
+        // columns still enforce DECIMAL(65,30) at the assignment boundary.
+        let integer_words = integer_digits.max(1).div_ceil(9);
+        let target_scale = scale.min(((9 - integer_words) * 9) as u8);
+        let magnitude = if target_scale < scale {
+            magnitude / BigInt::from(10u8).pow(u32::from(scale - target_scale))
+        } else {
+            magnitude
+        };
         return Value::from_exact_decimal(crate::util::decimal::ExactDecimal::from_big(
-            magnitude, scale,
+            magnitude,
+            target_scale,
         ));
     }
-
-    if let Some((normalized, normalized_scale)) = normalized_decimal_big_parts(text) {
-        return Value::from_exact_decimal(crate::util::decimal::ExactDecimal::from_big(
-            normalized,
-            normalized_scale,
-        ));
-    }
-
-    // The integer part alone exceeds DECIMAL(65). Materialize the normalized
-    // 65-digit coefficient; the enclosing AST guard preserves provenance so
-    // add/sub can still use MySQL's one carry digit.
+    // An integer token beyond the scratch capacity saturates at the SQL
+    // DECIMAL precision, matching MySQL's literal overflow normalization.
     let max = BigInt::from(10u8).pow(crate::util::decimal::MAX_DECIMAL_PRECISION as u32)
         - BigInt::from(1u8);
     let clamped = if magnitude.is_negative() { -max } else { max };

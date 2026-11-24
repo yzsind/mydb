@@ -254,6 +254,7 @@ thread_local! {
     /// Duplicates: D Warnings: W` (multi-row INSERT) MySQL diagnostic
     /// strings. Empty = no trailer.
     static STATEMENT_INFO: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+    static STATEMENT_INFO_EXPLICIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static SHARED_RESULT_METADATA_ALLOWED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Running duplicate-row count for the in-flight INSERT (rows skipped by
     /// IGNORE, matched by ON DUPLICATE KEY UPDATE, or replaced by REPLACE).
@@ -1039,6 +1040,7 @@ pub(crate) fn take_statement_dml_candidate_rows() -> Option<u64> {
 }
 
 pub(crate) fn clear_statement_info() {
+    STATEMENT_INFO_EXPLICIT.with(|cell| cell.set(false));
     STATEMENT_INFO.with(|cell| cell.borrow_mut().clear());
 }
 
@@ -1112,6 +1114,7 @@ pub(crate) fn take_insert_duplicates() -> u64 {
 
 #[allow(dead_code)]
 pub(crate) fn set_statement_info(info: impl Into<String>) {
+    STATEMENT_INFO_EXPLICIT.with(|cell| cell.set(true));
     STATEMENT_INFO.with(|cell| {
         let mut buf = cell.borrow_mut();
         buf.clear();
@@ -1120,6 +1123,7 @@ pub(crate) fn set_statement_info(info: impl Into<String>) {
 }
 
 pub(crate) fn take_statement_info() -> String {
+    STATEMENT_INFO_EXPLICIT.with(|cell| cell.set(false));
     STATEMENT_INFO.with(|cell| std::mem::take(&mut *cell.borrow_mut()))
 }
 
@@ -1131,6 +1135,10 @@ pub(crate) fn take_statement_info() -> String {
 /// thread-local directly via `take_statement_info`.
 pub(crate) fn peek_statement_info() -> String {
     STATEMENT_INFO.with(|cell| cell.borrow().clone())
+}
+
+pub(crate) fn statement_info_is_explicit() -> bool {
+    STATEMENT_INFO_EXPLICIT.with(std::cell::Cell::get)
 }
 
 /// Internal consumers can retain a producer's typed batch and its memory
@@ -4057,6 +4065,28 @@ pub(crate) fn with_frozen_statement_time<R>(micros: i64, f: impl FnOnce() -> R) 
     }
     let _restore = Restore(STMT_NOW_MICROS.with(|c| c.replace(Some(micros))));
     f()
+}
+
+#[cfg(test)]
+mod authorization_default_tests {
+    use super::*;
+
+    struct MinimalEngine;
+    impl QueryEngine for MinimalEngine {
+        fn execute(&self, _: &mut SessionContext, _: &str) -> Result<QueryResponse, QueryError> {
+            Ok(QueryResponse::Ok)
+        }
+    }
+
+    #[test]
+    fn auth_security_global_privileges_default_to_denied() {
+        use crate::engine::auth::Privilege;
+        let session = SessionContext::default();
+        for privilege in [Privilege::Super, Privilege::Shutdown, Privilege::ReplSlave,
+            Privilege::Dynamic("SYSTEM_VARIABLES_ADMIN".into())] {
+            assert!(MinimalEngine.authorize_global_privilege(&session, privilege).is_err());
+        }
+    }
 }
 
 #[cfg(test)]

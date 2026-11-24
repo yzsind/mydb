@@ -2863,6 +2863,9 @@ fn simplify_folded_predicate(expr: Expr) -> Expr {
             let left = simplify_folded_predicate(*left);
             let right = simplify_folded_predicate(*right);
             let neutral = op == BinaryOp::And;
+            if boolean(&left) == Some(!neutral) || boolean(&right) == Some(!neutral) {
+                return Expr::Literal(crate::parser::Literal::Bool(!neutral));
+            }
             if boolean(&left) == Some(neutral) {
                 return right;
             }

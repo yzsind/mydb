@@ -89,6 +89,16 @@ fn alias(
         };
         *pos += 1;
         Ok(name.value.clone())
+    } else if let Some(Token::Word(name)) = sig.get(*pos).map(|i| &tokens[*i].token) {
+        if name.quote_style.is_some()
+            || (name.keyword == sqlparser::keywords::Keyword::NoKeyword
+                && !name.value.eq_ignore_ascii_case("RRF"))
+        {
+            *pos += 1;
+            Ok(name.value.clone())
+        } else {
+            Ok(format!("branch_{default}"))
+        }
     } else {
         Ok(format!("branch_{default}"))
     }
@@ -124,6 +134,11 @@ pub(in crate::parser) fn lower(
                 && tokens[sig[p - 3]].token == Token::RParen
             {
                 sig[p - 3]
+            } else if p >= 2
+                && matches!(&tokens[sig[p - 1]].token, Token::Word(name) if name.quote_style.is_some() || name.keyword == sqlparser::keywords::Keyword::NoKeyword)
+                && tokens[sig[p - 2]].token == Token::RParen
+            {
+                sig[p - 2]
             } else {
                 return None;
             };

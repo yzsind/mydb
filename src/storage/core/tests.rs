@@ -1,6 +1,7 @@
 use super::*;
 
 include!("storage_handle_memo_tests.rs");
+include!("audit_five_storage_tests.rs");
 
 #[test]
 fn snapshot_slots_preserve_other_readers_across_threads_and_reuse() {
