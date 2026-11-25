@@ -399,3 +399,59 @@ fn cte_audit_correlated_expression_with() {
         assert_eq!(rows(&e, sql), vec![vec![Value::Int(2)]], "{sql}");
     }
 }
+
+#[test]
+fn recursive_distinct_compiled_step_stops_cycles_after_assignment() {
+    let (_dir, e) = engine();
+    let result = rows(
+        &e,
+        "WITH RECURSIVE t(n) AS (SELECT 1 UNION SELECT (n+1)%7 FROM t) SELECT n FROM t ORDER BY n",
+    );
+    assert_eq!(
+        result,
+        (0..7).map(|n| vec![Value::Int(n)]).collect::<Vec<_>>()
+    );
+    let result = rows(
+        &e,
+        "WITH RECURSIVE t(n,s,z) AS (SELECT 0,CAST('a' AS CHAR(4)),NULL \
+        UNION SELECT (n+1)%3,UPPER(s),z FROM t) SELECT n,s,z FROM t ORDER BY n",
+    );
+    assert_eq!(result.len(), 3);
+    assert!(result.iter().all(|r| r[2] == Value::Null));
+}
+
+#[test]
+fn recursive_native_deltas_preserve_passthrough_and_computed_assignment() {
+    let (_dir, e) = engine();
+    let result = rows(&e,
+        "WITH RECURSIVE t(n,d,s,b,x) AS (\
+        SELECT n,0,CAST(REPEAT('中文',8) AS CHAR(16)),CAST(X'00FF' AS BINARY(2)),CAST(1.25 AS DECIMAL(8,2)) \
+        FROM generate_series(1,13) g(n) UNION ALL \
+        SELECT r.n,r.d+1,r.s,r.b,r.x+0.25 FROM t r WHERE r.d<3) \
+        SELECT COUNT(*),SUM(n),SUM(d),SUM(OCTET_LENGTH(s)),SUM(x),MIN(HEX(b)) FROM t");
+    assert_eq!(
+        result[0]
+            .iter()
+            .map(Value::to_display_string)
+            .collect::<Vec<_>>(),
+        ["52", "364", "78", "2496", "84.50", "00FF"]
+    );
+}
+
+#[test]
+fn recursive_native_delta_falls_back_under_small_query_budget() {
+    let (_dir, e) = engine();
+    e.execute("SET GLOBAL mydb_query_mem_limit_mb=2").unwrap();
+    let result = rows(
+        &e,
+        "WITH RECURSIVE t(n,d) AS (SELECT n,0 FROM generate_series(1,10000) g(n) \
+        UNION ALL SELECT n,d+1 FROM t WHERE d<3) SELECT COUNT(*),SUM(n),SUM(d) FROM t",
+    );
+    assert_eq!(
+        result[0]
+            .iter()
+            .map(Value::to_display_string)
+            .collect::<Vec<_>>(),
+        ["40000", "200020000", "60000"]
+    );
+}

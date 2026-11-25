@@ -63,6 +63,11 @@ impl PackedRows {
         self.finish_row(bytes)
     }
 
+    pub(super) fn push_batch(&mut self, batch: &Batch) -> Result<(), QueryError> {
+        self.flush()?;
+        self.inner.push_batch(batch)
+    }
+
     /// Borrow a reusable recursive delta. Scalar Values are copied into
     /// column buffers without allocating a separate vector for every row.
     pub(super) fn push_values(&mut self, row: &[Value]) -> Result<(), QueryError> {

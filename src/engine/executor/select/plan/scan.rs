@@ -1488,6 +1488,14 @@ pub(in crate::engine::executor::select) fn eval_cte_row_predicate(
             provenance,
         } => {
             let left = row.get(*col).unwrap_or(&Value::Null);
+            // Homogeneous integers need neither string conversion provenance
+            // nor a temporary thread-local comparison context.
+            if matches!(
+                (left, value),
+                (Value::Int(_), Value::Int(_)) | (Value::UInt(_), Value::UInt(_))
+            ) {
+                return eval_cte_row_cmp(left, *op, value, *flipped);
+            }
             crate::engine::expr::with_numeric_comparison_context_from_provenance(
                 *provenance,
                 left,
@@ -1552,6 +1560,7 @@ pub(in crate::engine::executor::select) fn eval_cte_row_predicate(
     }
 }
 
+#[inline]
 pub(super) fn eval_cte_row_cmp(
     left: &Value,
     op: BinaryOp,

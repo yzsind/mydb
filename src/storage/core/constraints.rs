@@ -1362,6 +1362,9 @@ pub(crate) fn coerce_routine_typed_value(
     data_type: &DataTypeKind,
     unsigned: bool,
 ) -> Result<Value, QueryError> {
+    if integer_value_fits_type(&value, data_type, unsigned) {
+        return Ok(value);
+    }
     coerce_column_value(value, name, data_type, unsigned)
 }
 
@@ -1459,10 +1462,15 @@ fn coerce_column_value_for_schema(
 
 #[inline]
 fn integer_value_fits_column(value: &Value, column: &ColumnSchema) -> bool {
+    integer_value_fits_type(value, &column.data_type, column.unsigned)
+}
+
+#[inline]
+fn integer_value_fits_type(value: &Value, data_type: &DataTypeKind, unsigned: bool) -> bool {
     if !matches!(value, Value::Int(_) | Value::UInt(_)) {
         return false;
     }
-    let bits = match column.data_type {
+    let bits = match data_type {
         DataTypeKind::TinyInt | DataTypeKind::Bool => 8,
         DataTypeKind::SmallInt => 16,
         DataTypeKind::MediumInt => 24,
@@ -1470,7 +1478,7 @@ fn integer_value_fits_column(value: &Value, column: &ColumnSchema) -> bool {
         DataTypeKind::BigInt => 64,
         _ => return false,
     };
-    match (value, column.unsigned) {
+    match (value, unsigned) {
         (Value::Int(number), false) => {
             let high = number >> (bits - 1);
             high == 0 || high == -1

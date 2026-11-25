@@ -3557,6 +3557,41 @@ pub(super) fn precompute_read_only_projection(
     (columns, retained)
 }
 
+/// Evaluate successful, warning-free constant escapes once per input batch.
+/// Siblings must be read-only so moving this evaluation cannot observe a
+/// session mutation. Diagnostics and failures retain the ordered row oracle.
+fn projection_statement_constants(
+    projection: &[VecResultProjection],
+    schema: &BatchSchema,
+) -> Result<(Vec<Option<Value>>, mem_budget::ScopedCharge), QueryError> {
+    use crate::engine::executor::memory_footprint::AllocatedBytes;
+    let mut charge = mem_budget::ScopedCharge::new(0);
+    if !projection.iter().any(
+        |item| matches!(item, VecResultProjection::Expr(p) if p.is_statement_constant_escape()),
+    ) || !projection.iter().all(|item| match item {
+        VecResultProjection::Column(_) => true,
+        VecResultProjection::Expr(p) => {
+            p.has_column_contract(schema) || p.is_statement_constant_escape()
+        }
+        VecResultProjection::Scalar(_) => false,
+    }) {
+        return Ok((Vec::new(), charge));
+    }
+    charge.add_force(projection.len() * std::mem::size_of::<Option<Value>>())?;
+    let mut values = Vec::with_capacity(projection.len());
+    for item in projection {
+        let value = match item {
+            VecResultProjection::Expr(program) => program.try_statement_constant(),
+            _ => None,
+        };
+        if let Some(value) = &value {
+            charge.add_force(value.allocated_bytes())?;
+        }
+        values.push(value);
+    }
+    Ok((values, charge))
+}
+
 struct QueryProjectionBatchOperator<'a> {
     db: &'a Arc<Database>,
     txn: TxnView,
@@ -3608,6 +3643,8 @@ impl BatchOperator for QueryProjectionBatchOperator<'_> {
         let Some(batch) = self.input.next_batch()? else {
             return Ok(None);
         };
+        let (constants, _constant_charge) =
+            projection_statement_constants(&self.projection, batch.schema())?;
         let visible = batch.visible_indices().collect::<Vec<_>>();
         let mut output = (0..self.projection.len())
             .map(|_| Vec::with_capacity(visible.len()))
@@ -3645,7 +3682,11 @@ impl BatchOperator for QueryProjectionBatchOperator<'_> {
                         VecResultProjection::Column(column) => batch.columns()[*column]
                             .typed_value_at(row, self.input_template[*column].column_type),
                         VecResultProjection::Expr(program) => {
-                            if let Some(column) = precomputed.get(index).and_then(Option::as_ref) {
+                            if let Some(value) = constants.get(index).and_then(Option::as_ref) {
+                                value.clone()
+                            } else if let Some(column) =
+                                precomputed.get(index).and_then(Option::as_ref)
+                            {
                                 column.value_at(row)
                             } else {
                                 crate::engine::expr_program::with_eval_scratch(|scratch| {
@@ -3668,34 +3709,57 @@ impl BatchOperator for QueryProjectionBatchOperator<'_> {
                 }
             }
         } else {
-            let computed = self
+            // Pure scalar kernels have no row-order effects. Preserve native
+            // lanes for direct bindings instead of decoding variable-length
+            // fields into Values and immediately encoding them again.
+            let indices = visible.iter().map(|&row| row as u32).collect::<Vec<_>>();
+            let columns = self
                 .projection
                 .iter()
-                .map(|projection| match projection {
-                    VecResultProjection::Column(_) => Ok(None),
-                    VecResultProjection::Expr(program) => {
-                        expr_batch::eval_to_column(program, &batch).map(Some)
-                    }
-                    VecResultProjection::Scalar(_) => {
-                        unreachable!("scalar query projection must select the row-major lane")
-                    }
-                })
-                .collect::<Result<Vec<_>, QueryError>>()?;
-            for row in visible {
-                for (index, projection) in self.projection.iter().enumerate() {
-                    output[index].push(match projection {
-                        VecResultProjection::Column(column) => batch.columns()[*column]
-                            .typed_value_at(row, self.input_template[*column].column_type),
-                        VecResultProjection::Expr(_) => computed[index]
-                            .as_ref()
-                            .expect("query projection column missing")
-                            .value_at(row),
+                .enumerate()
+                .map(|(index, projection)| {
+                    let column = match projection {
+                        VecResultProjection::Column(index) => {
+                            let kind = self.input_template[*index].column_type;
+                            if matches!(kind, ColumnType::Float | ColumnType::Decimal { .. }) {
+                                ColumnVector::from_values(
+                                    visible
+                                        .iter()
+                                        .map(|&row| {
+                                            batch.columns()[*index].typed_value_at(row, kind)
+                                        })
+                                        .collect(),
+                                )
+                            } else {
+                                batch.columns()[*index].take_indices_exact(&indices)
+                            }
+                        }
+                        VecResultProjection::Expr(program) => {
+                            let computed = if let Some(value) =
+                                constants.get(index).and_then(Option::as_ref)
+                            {
+                                ColumnVector::from_values(vec![value.clone(); batch.num_rows()])
+                            } else {
+                                expr_batch::eval_to_column(program, &batch)?
+                            };
+                            if batch.selection().is_some() {
+                                computed.take_indices_exact(&indices)
+                            } else {
+                                computed
+                            }
+                        }
                         VecResultProjection::Scalar(_) => {
                             unreachable!("scalar query projection must select the row-major lane")
                         }
-                    });
-                }
-            }
+                    };
+                    Ok(column)
+                })
+                .collect::<Result<Vec<_>, QueryError>>()?;
+            return Ok(Some(Batch::with_row_count(
+                self.schema.clone(),
+                columns,
+                visible.len(),
+            )));
         }
         let row_count = output.first().map_or(0, Vec::len);
         Ok(Some(Batch::with_row_count(

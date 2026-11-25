@@ -26,6 +26,8 @@ mod consumer_domain;
 pub(super) mod grouped_domain;
 mod grouped_share;
 mod packed_rows;
+mod recursive_assignment;
+mod seen_keys;
 pub(crate) mod spool;
 
 thread_local! {
@@ -3419,38 +3421,6 @@ impl CteResultRowCursor {
     }
 }
 
-/// Concatenate a recursion's prior delta spools without materializing them.
-/// `UNION DISTINCT` uses this as the right side of a spillable EXCEPT to find
-/// the genuinely-new delta for the next iteration.
-struct CteHistoryRowCursor {
-    history: std::vec::IntoIter<Arc<CteResult>>,
-    current: Option<CteResultRowCursor>,
-}
-
-impl CteHistoryRowCursor {
-    fn new(history: Vec<Arc<CteResult>>) -> Self {
-        Self {
-            history: history.into_iter(),
-            current: None,
-        }
-    }
-
-    fn next_row(&mut self) -> Result<Option<Vec<Value>>, QueryError> {
-        loop {
-            if let Some(current) = self.current.as_mut() {
-                if let Some(row) = current.next_row()? {
-                    return Ok(Some(row));
-                }
-            }
-            let Some(result) = self.history.next() else {
-                self.current = None;
-                return Ok(None);
-            };
-            self.current = Some(CteResultRowCursor::open(result)?);
-        }
-    }
-}
-
 /// Split the left-associative UNION chain without executing or binding its
 /// recursive side. Metadata comes exclusively from the nonrecursive prefix.
 pub(super) fn recursive_parts(
@@ -3739,7 +3709,7 @@ fn materialize_recursive(
     // UNION DISTINCT first canonicalizes the anchor through the same
     // spillable hash-count state used by ordinary SetOp. This bounds the
     // duplicate state and establishes a unique first delta.
-    let mut working = if union_all {
+    let mut working = if union_all || (anchor.spill.is_none() && anchor.store.nrows() <= 1) {
         anchor
     } else {
         let mut input = CteResultRowCursor::open(anchor)?;
@@ -3763,25 +3733,41 @@ fn materialize_recursive(
     };
     let mut total_builder =
         packed_rows::PackedRows::new(total_columns.clone(), db.data_dir().to_path_buf());
+    let mut seen =
+        (!union_all).then(|| seen_keys::SeenKeys::new(&total_columns, db.data_dir().to_path_buf()));
     let mut emitted_rows = 0usize;
-    let mut anchor_rows = CteResultRowCursor::open(Arc::clone(&working))?;
-    while emitted_rows < row_cap {
-        let Some(row) = anchor_rows.next_row()? else {
-            break;
-        };
-        if emitted_rows >= offset {
-            total_builder.push(row)?;
+    let native_anchor = (union_all
+        && row_cap == usize::MAX
+        && offset == 0
+        && working.spill.is_none()
+        && working.store.nrows() > 1)
+        .then(|| working.store.native_batches())
+        .flatten();
+    if let Some(batches) = native_anchor {
+        for batch in batches.iter() {
+            crate::engine::cancel::check_cancelled()?;
+            total_builder.push_batch(batch)?;
+            emitted_rows = emitted_rows.saturating_add(batch.visible_rows());
         }
-        emitted_rows += 1;
+    } else {
+        let mut anchor_rows = CteResultRowCursor::open(Arc::clone(&working))?;
+        while emitted_rows < row_cap {
+            let Some(row) = anchor_rows.next_row()? else {
+                break;
+            };
+            if let Some(seen) = &mut seen {
+                seen.insert(&row)?;
+            }
+            if emitted_rows >= offset {
+                total_builder.push(row)?;
+            }
+            emitted_rows += 1;
+        }
+        drop(anchor_rows);
     }
-    drop(anchor_rows);
     if emitted_rows >= row_cap {
         return total_builder.finish();
     }
-    // DISTINCT keeps each already-unique delta as a spillable history segment.
-    // Membership is `produced EXCEPT DISTINCT history`; no unbounded process-
-    // resident HashSet grows with recursion depth.
-    let mut history = (!union_all).then(|| vec![Arc::clone(&working)]);
     set_cte_result(&cte.name, Arc::clone(&working));
     let target_types: Vec<_> = total_columns
         .iter()
@@ -3812,14 +3798,22 @@ fn materialize_recursive(
             }
         })
         .collect();
-    let coerce_row = |row: &mut [Value]| -> Result<(), QueryError> {
+    let coerce_row = |row: &mut [Value], identity: Option<&[bool]>| -> Result<(), QueryError> {
         if row.len() != total_columns.len() {
             return Err(error(
                 crate::error::catalog::ER_WRONG_NUMBER_OF_COLUMNS_IN_SELECT,
                 "The used SELECT statements have a different number of columns",
             ));
         }
-        for ((value, column), target) in row.iter_mut().zip(&total_columns).zip(&target_types) {
+        for (index, ((value, column), target)) in row
+            .iter_mut()
+            .zip(&total_columns)
+            .zip(&target_types)
+            .enumerate()
+        {
+            if identity.is_some_and(|mask| mask[index]) {
+                continue;
+            }
             let decimal_before = match target {
                 crate::storage::DataTypeKind::Decimal { scale, .. } => {
                     let scale = scale.unwrap_or(0);
@@ -3883,20 +3877,10 @@ fn materialize_recursive(
             }
         })
         .collect::<Result<Vec<_>, QueryError>>()?;
-    // A unary recursive term cannot fan out a single-row delta. Bind its
-    // existing scalar kernels once and alternate two admitted row buffers,
-    // rather than reopening a batch graph and publishing a new working spool
-    // on every iteration. SQL-visible ordering and assignment stay unchanged.
-    if union_all
-        && recursive_selects.len() == 1
-        && working.spill.is_none()
-        && working.store.nrows() == 1
-        && cte_spill_threshold_bytes() > 0
-    {
-        let plan = supplied_branches
+    let scalar_step = if recursive_selects.len() == 1 {
+        supplied_branches
             .map(|(_, plan)| plan)
-            .or(owned_recursive_plans[0].as_ref());
-        if let Some(step) = plan
+            .or(owned_recursive_plans[0].as_ref())
             .map(|plan| {
                 super::select::vec_bridge::recursive_step::RecursiveStep::compile(
                     &recursive_selects[0],
@@ -3906,7 +3890,29 @@ fn materialize_recursive(
             })
             .transpose()?
             .flatten()
-        {
+    } else {
+        None
+    };
+    if scalar_step
+        .as_ref()
+        .is_some_and(|step| step.columns.len() != total_columns.len())
+    {
+        return Err(error(
+            crate::error::catalog::ER_WRONG_NUMBER_OF_COLUMNS_IN_SELECT,
+            "The used SELECT statements have a different number of columns",
+        ));
+    }
+    let identity_assignments = scalar_step.as_ref().map(|step| step.identity_assignments());
+    // A unary recursive term cannot fan out a single-row delta. Bind its
+    // existing scalar kernels once and alternate two admitted row buffers,
+    // rather than reopening a batch graph and publishing a new working spool
+    // on every iteration. SQL-visible ordering and assignment stay unchanged.
+    if recursive_selects.len() == 1
+        && working.spill.is_none()
+        && working.store.nrows() == 1
+        && cte_spill_threshold_bytes() > 0
+    {
+        if let Some(step) = scalar_step.as_ref() {
             if step.columns.len() != total_columns.len() {
                 return Err(error(
                     crate::error::catalog::ER_WRONG_NUMBER_OF_COLUMNS_IN_SELECT,
@@ -3965,7 +3971,12 @@ fn materialize_recursive(
                             admitted_payload = payload;
                         }
                     }
-                    coerce_row(&mut next)?;
+                    coerce_row(&mut next, identity_assignments.as_deref())?;
+                    if let Some(seen) = &mut seen {
+                        if !seen.insert(&next)? {
+                            break;
+                        }
+                    }
                     if variable_payload {
                         let payload = row
                             .iter()
@@ -4044,8 +4055,60 @@ fn materialize_recursive(
             let recursive_plan = supplied_branches
                 .map(|(_, plan)| plan)
                 .or(owned_plan.as_ref());
+            // Unary terms preserve direct recursive fields. Keep those lanes
+            // columnar and assign only computed fields, avoiding repeated text
+            // decoding and reconstruction of both total and working spools.
+            if union_all && row_cap == usize::MAX && offset == 0 {
+                if let (Some(plan), Some(identity)) =
+                    (recursive_plan, identity_assignments.as_deref())
+                {
+                    let consumed = with_cte_materialization(|| {
+                        super::select::vec_bridge::try_consume_analyzed_select(
+                            db,
+                            txn,
+                            recursive_select,
+                            plan,
+                            |columns, stream| {
+                                if columns.len() != total_columns.len() {
+                                    return Err(error(crate::error::catalog::ER_WRONG_NUMBER_OF_COLUMNS_IN_SELECT,
+                                    "The used SELECT statements have a different number of columns"));
+                                }
+                                while let Some(batch) = stream.next_batch()? {
+                                    if let Some(output) = recursive_assignment::assign_batch(
+                                        &batch,
+                                        &columns,
+                                        identity,
+                                        |row| coerce_row(row, Some(identity)),
+                                    )? {
+                                        total_builder.push_batch(&output)?;
+                                        next_builder.push_batch(&output)?;
+                                        emitted_rows =
+                                            emitted_rows.saturating_add(output.visible_rows());
+                                    } else {
+                                        // Continue from this already-evaluated batch;
+                                        // volatile expressions and diagnostics cannot replay.
+                                        for index in batch.visible_indices() {
+                                            let mut row = recursive_assignment::typed_row(
+                                                &batch, &columns, index,
+                                            );
+                                            coerce_row(&mut row, None)?;
+                                            total_builder.push(row.clone())?;
+                                            next_builder.push(row)?;
+                                            emitted_rows = emitted_rows.saturating_add(1);
+                                        }
+                                    }
+                                }
+                                Ok(())
+                            },
+                        )
+                    })?;
+                    if consumed.is_some() {
+                        continue;
+                    }
+                }
+            }
             let mut consume_row = |mut row: Vec<Value>| -> Result<bool, QueryError> {
-                coerce_row(&mut row)?;
+                coerce_row(&mut row, None)?;
                 if let Some(builder) = produced_builder.as_mut() {
                     builder.push(row)?;
                 } else {
@@ -4149,25 +4212,14 @@ fn materialize_recursive(
         if let Some(produced_builder) = produced_builder {
             let produced = Arc::new(produced_builder.finish()?);
             let mut produced_rows = CteResultRowCursor::open(produced)?;
-            let mut prior_rows = CteHistoryRowCursor::new(
-                history
-                    .as_ref()
-                    .expect("DISTINCT recursion history initialized")
-                    .clone(),
-            );
-            let mut new_rows = crate::engine::executor::dispatch::combine_set_sources_spillable(
-                &total_columns
-                    .iter()
-                    .map(|column| column.source.collation_id)
-                    .collect::<Vec<_>>(),
-                SetOp::Except,
-                false,
-                total_columns.len(),
-                db.data_dir(),
-                || produced_rows.next_row(),
-                || prior_rows.next_row(),
-            )?;
-            while let Some(row) = new_rows.next_row()? {
+            while let Some(row) = produced_rows.next_row()? {
+                if !seen
+                    .as_mut()
+                    .expect("recursive UNION keys initialized")
+                    .insert(&row)?
+                {
+                    continue;
+                }
                 if emitted_rows >= offset {
                     total_builder.push(row.clone())?;
                 }
@@ -4181,9 +4233,6 @@ fn materialize_recursive(
         let next = Arc::new(next_builder.finish()?);
         if depth_first {
             pending.push((Arc::clone(&working), depth, branch_end));
-        }
-        if let Some(history) = history.as_mut() {
-            history.push(Arc::clone(&next));
         }
         working = next;
         branch_start = 0;
