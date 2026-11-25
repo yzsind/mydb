@@ -102,6 +102,16 @@ else:
             self.assertEqual(call['options'], 'halt_on_error=1')
             self.assertTrue(Path(call['tmp']).is_relative_to('/tmp/mydb'))
 
+    def test_sanitizer_build_excludes_uninstrumented_allocator(self):
+        result, calls = self.run_script(['first'])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(calls), 2)
+        for call in calls:
+            self.assertIn('--no-default-features', call['args'])
+            features = call['args'][call['args'].index('--features') + 1].split(',')
+            self.assertEqual(set(features), {'tls', 'zstd-compression'})
+            self.assertNotIn('--all-features', call['args'])
+
 
 if __name__ == '__main__':
     unittest.main()

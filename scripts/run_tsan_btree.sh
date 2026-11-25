@@ -53,9 +53,14 @@ echo "TSAN_OPTIONS: $TSAN_OPTIONS"
 echo "output      : $run_dir"
 echo
 
+# mimalloc's C allocator is not instrumented by RUSTFLAGS. Its cross-thread
+# frees and block reuse are invisible to TSan, causing false races between an
+# old Arc's final decrement and a new allocation at the same address. Disable
+# fast-alloc for this run, retaining the other default protocol features.
 # libtest accepts one positional filter. The first listing builds the same
 # instrumented test binary reused by every subsequent listing and execution.
-CARGO_TEST=(cargo +nightly test --locked -Zbuild-std --target "$TARGET" -p mydb --lib)
+CARGO_TEST=(cargo +nightly test --locked -Zbuild-std --target "$TARGET" -p mydb --lib
+  --no-default-features --features tls,zstd-compression)
 for filter in "${FILTERS[@]}"; do
   if [[ -z "$filter" ]]; then
     echo "TSAN test filter must not be empty" >&2
