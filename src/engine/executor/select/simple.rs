@@ -3166,16 +3166,35 @@ pub(crate) struct CompactRangeRecipe {
     _charge: super::super::mem_budget::ControlledMemoryCharge,
 }
 
-const COMPACT_ORDERED_WINDOW_ROWS: usize = 64;
+pub(crate) const COMPACT_ORDERED_WINDOW_ROWS: usize = 64;
+
+pub(crate) fn primary_row_goal_cost_is_stable(table: &TableSchema, index: &IndexSchema) -> bool {
+    index.primary
+        && index.columns.len() == 1
+        && !table.is_partitioned()
+        && table.row_security.version == 0
+        && !table.row_security.enabled
+        && table
+            .column_index(&index.columns[0])
+            .ok()
+            .is_some_and(|i| table.columns[i].data_type.is_integer())
+        && table.iter_queryable_indexes().all(|other| {
+            other.primary
+                || (other.predicate.is_none()
+                    && !other
+                        .columns
+                        .first()
+                        .is_some_and(|name| name.eq_ignore_ascii_case(&index.columns[0]))
+                    && other.key_expressions.iter().all(Option::is_none))
+        })
+}
 
 fn stable_ordered_range_row_goal(stmt: &Select, input: &PhysicalPlan) -> bool {
-    let Some(limit) = stmt.limit.as_ref().and_then(LimitValue::as_usize) else {
+    let Ok(Some(limit)) = select_limit(stmt) else {
         return false;
     };
-    let offset = match &stmt.offset {
-        None => 0,
-        Some(LimitValue::Rows(offset)) => *offset,
-        _ => return false,
+    let Ok(offset) = select_offset(stmt) else {
+        return false;
     };
     let PhysicalPlan::IndexRangeScan {
         table,
@@ -3193,8 +3212,7 @@ fn stable_ordered_range_row_goal(stmt: &Select, input: &PhysicalPlan) -> bool {
     // interval. Keep selectivity-dependent costing if another usable index
     // could offer a different plan, or if candidates need residual filtering.
     limit.saturating_add(offset) <= COMPACT_ORDERED_WINDOW_ROWS
-        && index.primary
-        && table.schema.iter_queryable_indexes().take(2).count() == 1
+        && primary_row_goal_cost_is_stable(&table.schema, index)
         && crate::planner::index_residual::all_covered(
             filter,
             &table.schema,

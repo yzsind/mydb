@@ -109,6 +109,13 @@ pub(crate) struct RowEncoder {
     _charge: crate::engine::executor::mem_budget::ControlledMemoryCharge,
 }
 
+/// A typed scalar or a borrowed UTF-8 lane. Text never needs an owning Value
+/// merely to obtain the same canonical collation weights.
+pub(crate) enum BorrowedKey<'a> {
+    Scalar(Value),
+    Text(&'a str),
+}
+
 impl RowEncoder {
     pub(crate) fn new(fields: std::sync::Arc<[SortField]>) -> Option<Self> {
         use crate::engine::executor::mem_budget::{
@@ -177,6 +184,60 @@ impl RowEncoder {
                     *field,
                     cached.get(i).and_then(Option::as_deref),
                 )
+            });
+        self.lanes = encoder.lanes;
+        self.weights = encoder.weights;
+        *output = encoder.arena;
+        success
+    }
+
+    pub(crate) fn borrowed_bound(keys: &[BorrowedKey<'_>]) -> Option<usize> {
+        keys.iter().try_fold(0usize, |bytes, key| {
+            bytes.checked_add(match key {
+                BorrowedKey::Scalar(value) => Self::bound(std::slice::from_ref(value), &[])?,
+                BorrowedKey::Text(text) => text.len().saturating_mul(16).saturating_add(3),
+            })
+        })
+    }
+
+    pub(crate) fn encode_borrowed(
+        &mut self,
+        keys: &[BorrowedKey<'_>],
+        output: &mut Vec<u8>,
+    ) -> bool {
+        if keys.len() != self.fields.len() {
+            return false;
+        }
+        let mut encoder = Encoder {
+            fields: &self.fields,
+            lanes: std::mem::take(&mut self.lanes),
+            arena: std::mem::take(output),
+            offsets: Vec::new(),
+            weights: self.weights.take(),
+        };
+        encoder.arena.clear();
+        let success = keys
+            .iter()
+            .zip(self.fields.iter())
+            .enumerate()
+            .all(|(i, (key, field))| match key {
+                BorrowedKey::Scalar(value) => encoder.push_field_cached(i, value, *field, None),
+                BorrowedKey::Text(text) => {
+                    encoder.arena.push(0x01);
+                    match &mut encoder.lanes[i] {
+                        slot @ None => *slot = Some(Lane::Str),
+                        Some(Lane::Str) => {}
+                        Some(_) => return false,
+                    }
+                    let start = encoder.arena.len();
+                    encoder.push_str_payload(text, field.collation_id);
+                    if !field.ascending {
+                        for byte in &mut encoder.arena[start..] {
+                            *byte = !*byte;
+                        }
+                    }
+                    true
+                }
             });
         self.lanes = encoder.lanes;
         self.weights = encoder.weights;
@@ -1007,6 +1068,64 @@ mod tests {
             std::cmp::Ordering::Less => assert_eq!(items[0].0, 0),
             std::cmp::Ordering::Greater => assert_eq!(items[0].0, 1),
             std::cmp::Ordering::Equal => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod borrowed_key_tests {
+    use super::*;
+
+    #[test]
+    fn borrowed_text_is_bit_identical_to_owned_keys_for_collations_and_directions() {
+        for collation in [45, 46, 63, 255] {
+            for ascending in [true, false] {
+                for nulls_first in [true, false] {
+                    let fields: std::sync::Arc<[SortField]> = vec![
+                        SortField {
+                            ascending,
+                            nulls_first,
+                            collation_id: Some(collation),
+                        },
+                        SortField {
+                            ascending: !ascending,
+                            nulls_first: false,
+                            collation_id: None,
+                        },
+                    ]
+                    .into();
+                    let mut owned = RowEncoder::new(fields.clone()).unwrap();
+                    let mut borrowed = RowEncoder::new(fields).unwrap();
+                    for (i, text) in [
+                        None,
+                        Some(""),
+                        Some("a\0b"),
+                        Some("É"),
+                        Some("e\u{301}"),
+                        Some("汉字"),
+                        Some("a "),
+                        None,
+                        Some("long text with unicode 🙂"),
+                    ]
+                    .iter()
+                    .enumerate()
+                    {
+                        let values = [
+                            text.map_or(Value::Null, |s| Value::String(s.into())),
+                            Value::Int(i as i64),
+                        ];
+                        let keys = [
+                            text.map_or(BorrowedKey::Scalar(Value::Null), BorrowedKey::Text),
+                            BorrowedKey::Scalar(Value::Int(i as i64)),
+                        ];
+                        let (mut a, mut b) = (Vec::new(), Vec::new());
+                        assert!(owned.encode(&values, &[], &mut a));
+                        assert!(borrowed.encode_borrowed(&keys, &mut b));
+                        assert_eq!(a, b);
+                        assert!(b.len() <= RowEncoder::borrowed_bound(&keys).unwrap());
+                    }
+                }
+            }
         }
     }
 }

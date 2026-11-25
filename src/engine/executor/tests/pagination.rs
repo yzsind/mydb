@@ -698,3 +698,245 @@ fn pagination_reordered_join_wildcards_keep_sql_column_order_and_metadata() {
     assert_eq!(actual.rows, expected.rows);
     assert_eq!(actual.columns, expected.columns);
 }
+
+#[test]
+fn pagination_hash_join_resident_pages_preserve_fanout_outer_rows_and_typed_keys() {
+    use crate::engine::executor::select::vec_bridge::RESIDENT_WINDOW_HITS;
+    use crate::engine::executor::sort::key_encode::with_sort_key_encode;
+    use std::sync::atomic::Ordering;
+    let (_dir, engine) = fixture();
+    engine.execute("CREATE TABLE fact(id INT PRIMARY KEY,k INT NULL,s VARCHAR(32) COLLATE utf8mb4_0900_ai_ci,d DECIMAL(12,2),stamp DATETIME,payload VARCHAR(128))").unwrap();
+    engine
+        .execute("CREATE TABLE dim(id INT PRIMARY KEY,k INT,label VARCHAR(32))")
+        .unwrap();
+    insert_fixture_rows(
+        &engine,
+        "test.fact",
+        (0..12000).map(|id| {
+            vec![
+                Value::Int(id),
+                if id % 17 == 0 {
+                    Value::Null
+                } else {
+                    Value::Int(id % 64)
+                },
+                Value::String(["A", "a", "É", "e", "汉字"][id as usize % 5].into()),
+                Value::Decimal(format!("{}.25", id % 131)),
+                Value::DateTime((1_735_689_600 + id % 131) * 1_000_000),
+                Value::String("x".repeat(120)),
+            ]
+        }),
+    );
+    insert_fixture_rows(
+        &engine,
+        "test.dim",
+        (0..150).map(|id| {
+            vec![
+                Value::Int(id),
+                Value::Int(id % 40),
+                Value::String(format!("dim-{id}")),
+            ]
+        }),
+    );
+    engine.execute("ANALYZE TABLE fact,dim").unwrap();
+    for (join, order, predicate) in [
+        ("JOIN", "f.k DESC,d.id,f.id", "1=1"),
+        ("LEFT JOIN", "f.s DESC,d.id,f.id", "f.id%3<>0"),
+        ("LEFT JOIN", "f.d,f.stamp DESC,d.id,f.id", "1=1"),
+    ] {
+        let base = format!("SELECT /*+ HASH_JOIN(f,d) */ f.id,f.k,f.s,f.d,f.stamp,f.payload,d.id,d.label FROM fact f {join} dim d ON f.k=d.k WHERE {predicate} ORDER BY {order}");
+        let sorted = with_sort_key_encode(false, || query_rows(&engine, &base));
+        for offset in [18000, 40000] {
+            let sql = format!("{base} LIMIT 17 OFFSET {offset}");
+            let begin = offset.min(sorted.len());
+            let expected = &sorted[begin..(begin + 17).min(sorted.len())];
+            let before = RESIDENT_WINDOW_HITS.load(Ordering::Relaxed);
+            let budget = Arc::new(MemBudget::new(64 * 1024 * 1024));
+            assert_eq!(
+                with_query_budget(budget.clone(), || query_rows(&engine, &sql)),
+                expected,
+                "{sql}"
+            );
+            assert!(
+                RESIDENT_WINDOW_HITS.load(Ordering::Relaxed) > before,
+                "{sql}"
+            );
+            assert_eq!(budget.used(), 0);
+            assert!(budget.peak_used() <= budget.limit());
+            let budget = Arc::new(MemBudget::new(1024 * 1024));
+            assert_eq!(
+                with_query_budget(budget.clone(), || query_rows(&engine, &sql)),
+                expected,
+                "spill: {sql}"
+            );
+            assert_eq!(budget.used(), 0);
+        }
+    }
+}
+
+#[test]
+fn pagination_single_partition_windows_match_spill_and_rank_bounds() {
+    let (_dir, engine) = fixture();
+    engine.execute("CREATE TABLE t(id INT PRIMARY KEY,k INT NULL,d DECIMAL(12,2),stamp DATETIME,s VARCHAR(32))").unwrap();
+    insert_fixture_rows(
+        &engine,
+        "test.t",
+        (0..512).map(|id| {
+            vec![
+                Value::Int(id),
+                if id % 11 == 0 {
+                    Value::Null
+                } else {
+                    Value::Int(id % 31 - 15)
+                },
+                if id % 7 == 0 {
+                    Value::Null
+                } else {
+                    Value::Decimal(format!("{}.25", id % 47))
+                },
+                Value::DateTime((1_735_689_600 + id % 29) * 1_000_000),
+                Value::String(format!("数据-{id}")),
+            ]
+        }),
+    );
+    for sql in [
+        "SELECT id,s,ROW_NUMBER() OVER (ORDER BY k DESC,id),RANK() OVER (ORDER BY k),DENSE_RANK() OVER (ORDER BY stamp DESC) FROM t WHERE id%3<>0 ORDER BY id",
+        "SELECT id,SUM(d) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW),AVG(d) OVER (ORDER BY id ROWS BETWEEN 2 PRECEDING AND 1 FOLLOWING),MIN(stamp) OVER (ORDER BY k RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW),COUNT(*) OVER () FROM t ORDER BY id",
+        "SELECT id,LAG(k,2) OVER (ORDER BY id),LEAD(d) OVER (ORDER BY id),FIRST_VALUE(stamp) OVER (ORDER BY k),LAST_VALUE(stamp) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) FROM t ORDER BY id",
+        "SELECT id,rn FROM (SELECT id,ROW_NUMBER() OVER (ORDER BY k DESC,id) rn FROM t) q WHERE rn>400 AND rn<=420 ORDER BY rn",
+        "SELECT id,ROW_NUMBER() OVER (ORDER BY k,id),COUNT(*) OVER () FROM t WHERE id<0 ORDER BY id",
+    ] {
+        let low = Arc::new(MemBudget::new(32 * 1024));
+        let expected = with_query_budget(low.clone(), || query_rows(&engine, sql));
+        assert_eq!(low.used(), 0);
+        let high = Arc::new(MemBudget::new(16 * 1024 * 1024));
+        assert_eq!(with_query_budget(high.clone(), || query_rows(&engine, sql)), expected, "{sql}");
+        assert_eq!(high.used(), 0);
+        assert!(high.peak_used() <= high.limit());
+    }
+    let tree = analyzed(
+        &engine,
+        "SELECT id,ROW_NUMBER() OVER (ORDER BY k DESC,id) FROM t",
+    );
+    assert!(tree.contains("window_mode=columnar_partitions"), "{tree}");
+    let rows = query_rows(&engine, "SELECT id,rn FROM (SELECT id,ROW_NUMBER() OVER (ORDER BY id DESC) rn FROM t) q WHERE rn>400 AND rn<=420 ORDER BY rn");
+    assert_eq!(
+        rows,
+        (401..=420)
+            .map(|rank| vec![Value::Int(512 - rank), Value::Int(rank)])
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn window_final_pages_match_full_results_for_types_expressions_and_distinct() {
+    let (_dir, engine) = fixture();
+    engine.execute("CREATE TABLE window_pages(id INT PRIMARY KEY,k INT NULL,d DECIMAL(30,3),s VARCHAR(64) COLLATE utf8mb4_0900_ai_ci,stamp DATETIME)").unwrap();
+    insert_fixture_rows(
+        &engine,
+        "test.window_pages",
+        (0..301).map(|id| {
+            vec![
+                Value::Int(id),
+                if id % 17 == 0 {
+                    Value::Null
+                } else {
+                    Value::Int(id % 13)
+                },
+                Value::Decimal(format!("{}.125", id - 150)),
+                if id % 19 == 0 {
+                    Value::Null
+                } else {
+                    Value::String(["École", "ecole", "中文", "A", "a"][id as usize % 5].into())
+                },
+                Value::DateTime((1_735_689_600 + id % 23) * 1_000_000),
+            ]
+        }),
+    );
+    for base in [
+        "SELECT id,k,d,s,stamp,COUNT(*) OVER() AS total FROM window_pages ORDER BY s DESC NULLS FIRST,d,id",
+        "SELECT id,COUNT(*) OVER() AS total FROM window_pages ORDER BY stamp DESC,id",
+        "SELECT id AS z,COUNT(k) OVER(PARTITION BY k) AS c,SUM(d) OVER() AS total FROM window_pages ORDER BY 2 DESC,1",
+        "SELECT id,RANK() OVER(ORDER BY k) AS r,ROW_NUMBER() OVER(ORDER BY d DESC) AS rn FROM window_pages ORDER BY r DESC,id",
+        "SELECT id,SUM(d) OVER(ORDER BY id ROWS BETWEEN 2 PRECEDING AND CURRENT ROW)+id AS x FROM window_pages ORDER BY x DESC,id",
+        "SELECT id,COUNT(*) OVER() AS total FROM window_pages ORDER BY ABS(k),id",
+        "SELECT DISTINCT k,COUNT(*) OVER() AS c FROM window_pages ORDER BY k",
+        "SELECT id,COUNT(*) OVER() AS total FROM window_pages WHERE id<0 ORDER BY id",
+    ] {
+        let all=query_rows(&engine,base);
+        for (offset,limit) in [(0,0),(0,1),(2,7),(150,11),(299,20),(301,2),(1000,7)] {
+            let sql=format!("{base} LIMIT {limit} OFFSET {offset}");
+            let actual=query_rows(&engine,&sql);
+            assert_eq!(actual,all.iter().skip(offset).take(limit).cloned().collect::<Vec<_>>(),"{sql}");
+        }
+    }
+}
+
+#[test]
+fn window_final_page_preserves_random_draws_warnings_and_bound_limits() {
+    let (_dir, engine) = fixture();
+    engine
+        .execute("CREATE TABLE window_observable(id INT PRIMARY KEY)")
+        .unwrap();
+    insert_fixture_rows(
+        &engine,
+        "test.window_observable",
+        (0..101).map(|id| vec![Value::Int(id)]),
+    );
+    let mut session = SessionContext::default();
+    fn run(
+        engine: &StorageQueryEngine,
+        session: &mut SessionContext,
+        sql: &str,
+    ) -> (Vec<Vec<Value>>, Vec<Vec<Value>>, Vec<Vec<Value>>) {
+        engine
+            .execute_with_session(session, "SET @@rand_seed1=10000000,@@rand_seed2=1000000")
+            .unwrap();
+        engine
+            .execute_with_session(session, "SET sql_mode='ERROR_FOR_DIVISION_BY_ZERO'")
+            .unwrap();
+        let rows = super::support::result_rows(engine.execute_with_session(session, sql).unwrap());
+        let warnings = super::support::result_rows(
+            engine
+                .execute_with_session(session, "SHOW WARNINGS")
+                .unwrap(),
+        );
+        let next = super::support::result_rows(
+            engine
+                .execute_with_session(session, "SELECT RAND()")
+                .unwrap(),
+        );
+        (rows, warnings, next)
+    }
+    for sql in [
+        "SELECT id,COUNT(*) OVER()+RAND() AS x FROM window_observable FORCE INDEX(PRIMARY) ORDER BY x,id",
+        "SELECT id,COUNT(*) OVER() AS c FROM window_observable FORCE INDEX(PRIMARY) ORDER BY RAND(),id",
+        "SELECT id,COUNT(*) OVER()+1/0 AS x FROM window_observable FORCE INDEX(PRIMARY) ORDER BY id",
+    ] {
+        let (full,warnings,next)=run(&engine,&mut session,sql);
+        for (offset,limit) in [(0,0),(3,7),(1000,7)] {
+            let (page,actual_warnings,actual_next)=run(&engine,&mut session,&format!("{sql} LIMIT {limit} OFFSET {offset}"));
+            assert_eq!(page,full.iter().skip(offset).take(limit).cloned().collect::<Vec<_>>(),"{sql}, offset={offset}, limit={limit}");
+            assert_eq!(actual_warnings,warnings,"discarded projections retain diagnostics: {sql}");
+            assert_eq!(actual_next,next,"discarded sort keys retain their random draws: {sql}");
+        }
+    }
+    engine.execute_with_session(&mut session,"PREPARE window_page FROM 'SELECT id,COUNT(*) OVER() AS c FROM window_observable ORDER BY id DESC LIMIT ? OFFSET ?'").unwrap();
+    for (limit, offset) in [(1, 0), (7, 11), (20, 99), (20, 1000)] {
+        engine
+            .execute_with_session(&mut session, &format!("SET @n={limit},@o={offset}"))
+            .unwrap();
+        let actual = super::support::result_rows(
+            engine
+                .execute_with_session(&mut session, "EXECUTE window_page USING @n,@o")
+                .unwrap(),
+        );
+        let expected = (0..101)
+            .rev()
+            .skip(offset)
+            .take(limit)
+            .map(|id| vec![Value::Int(id), Value::Int(101)])
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected, "bound offset={offset}, limit={limit}");
+    }
+}

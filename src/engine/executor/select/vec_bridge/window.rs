@@ -62,6 +62,7 @@ pub(super) struct WindowBatchOperator<'a> {
     pub(super) partition_output:
         Option<Box<dyn crate::engine::executor::select::plan::PlanStream + 'a>>,
     pub(super) co_partitioned: bool,
+    pub(super) compact_input: bool,
     pub(super) prefix_output: Option<Box<dyn BatchOperator + 'a>>,
 }
 
@@ -110,9 +111,10 @@ impl BatchOperator for WindowBatchOperator<'_> {
         if let Some(output) = self.prefix_output.as_mut() {
             return output.next_batch();
         }
-        if self.co_partitioned {
+        if self.compact_input {
+            self.compact_input = false;
             if let Some(upstream) = self.upstream.take() {
-                let upstream = match compact_window::prepare(
+                match compact_window::prepare(
                     upstream,
                     &self.input_template,
                     self.windows,
@@ -124,8 +126,14 @@ impl BatchOperator for WindowBatchOperator<'_> {
                         self.install_output(batches, charge)?;
                         return Ok(self.output.next());
                     }
-                    compact_window::Preparation::Streaming(upstream) => upstream,
-                };
+                    compact_window::Preparation::Streaming(upstream) => {
+                        self.upstream = Some(upstream);
+                    }
+                }
+            }
+        }
+        if self.co_partitioned {
+            if let Some(upstream) = self.upstream.take() {
                 if crate::engine::executor::cte::cte_materialization_active()
                     && matches!(self.properties.ordering, BatchOrdering::Unordered)
                     && spooled_prefix_window::supported(&self.input_template, self.windows)
@@ -401,14 +409,13 @@ pub(super) fn try_build_window_batch<'a>(
     }));
     let schema = template_to_batch_schema(&template);
     let input_schema = template_to_batch_schema(&input_template);
-    let mut co_partitioned = windows.first().is_some_and(|first| {
-        !first.partition_by.is_empty()
-            && windows.iter().all(|w| w.partition_by == first.partition_by)
-    });
+    let mut compact_input = windows
+        .first()
+        .is_some_and(|first| windows.iter().all(|w| w.partition_by == first.partition_by));
     // Clustering evaluates rows in a different order before restoring their
     // ordinals. Volatile/session-dependent expressions retain the existing
     // evaluator so side effects and per-row evaluation order cannot change.
-    if co_partitioned {
+    if compact_input {
         for expr in windows.iter().flat_map(|w| {
             w.partition_by
                 .iter()
@@ -423,11 +430,18 @@ pub(super) fn try_build_window_batch<'a>(
                 capability.deterministic && !capability.depends_on_session
             });
             if !safe {
-                co_partitioned = false;
+                compact_input = false;
                 break;
             }
         }
     }
+    // An empty PARTITION BY denotes one complete partition. Try compact
+    // columns for it too, but retain the ordinary single-partition evaluator
+    // on admission failure rather than introducing an ordinal-restoring sort.
+    let co_partitioned = compact_input
+        && windows
+            .first()
+            .is_some_and(|first| !first.partition_by.is_empty());
     let properties = stream.properties();
     Ok(Some(VecBatchInput {
         stream: Box::new(WindowBatchOperator {
@@ -443,6 +457,7 @@ pub(super) fn try_build_window_batch<'a>(
             memory_charge: None,
             partition_output: None,
             co_partitioned,
+            compact_input,
             prefix_output: None,
         }),
         template,

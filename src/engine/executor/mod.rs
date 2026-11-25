@@ -67,6 +67,7 @@ pub(crate) mod cte;
 pub(crate) mod cte_store;
 mod ddl_deprecation;
 mod dispatch;
+mod integer_range_text;
 pub(crate) use dispatch::statement_writes_only_temp_tables;
 pub(crate) mod rls;
 pub(crate) mod row_spool;
@@ -4899,6 +4900,15 @@ impl QueryEngine for StorageQueryEngine {
         {
             return None;
         }
+        // Disabling the plan cache requests fresh literal-sensitive costing.
+        // A text range template is only a prepared vehicle for a proven
+        // compiled row goal; let the ordinary path restore its literals.
+        if !self.plan_cache_enabled
+            && crate::engine::params::auto_parameterized_active()
+            && integer_range_text::is_template(parsed.as_ref())
+        {
+            return None;
+        }
         self.attach_expression_registry(session);
         let _trace = crate::engine::cbo::trace::statement(
             session.connection_id,
@@ -5018,6 +5028,19 @@ impl QueryEngine for StorageQueryEngine {
         if !tx::can_use_prepared_read(session, rp.has_locking_read) {
             return None;
         }
+        if crate::engine::params::auto_parameterized_active()
+            && integer_range_text::is_template(parsed.as_ref())
+            && !rp
+                .compiled
+                .compact_range
+                .as_ref()
+                .is_some_and(|recipe| recipe.stable_row_goal)
+        {
+            // No input has opened and no question has been charged. Restore
+            // the source integers in the ordinary fallback so policies and
+            // alternate access paths retain literal-sensitive planning.
+            return None;
+        }
         Some(self.run_prepared_select(session, &rp, sql, params))
     }
 
@@ -5082,14 +5105,18 @@ impl QueryEngine for StorageQueryEngine {
         let shaped = text_shape_key_and_params(sql, parser_mode_bits).and_then(|(key, params)| {
             self.statement_cache
                 .get(&key)
+                .filter(|statement| {
+                    !integer_range_text::is_template(statement)
+                        || integer_range_text::candidate(&self.db, session, statement, &params)
+                })
                 .map(|statement| (key, statement, params))
         });
         let (key, statement, mut params) = if let Some(shaped) = shaped {
             shaped
         } else {
             // An exact parser-cache entry is also an authoritative zero-bind
-            // template. Literal-free reads must not pay the generic dispatch
-            // cost just because their selective quals came from a policy.
+            // template. Preserve literal provenance and keep diagnostics-rich
+            // expressions on their ordinary statement path.
             if sql.contains("/*+")
                 || sql.contains("/*!")
                 || source_syntax_warning_scan_required(sql, parser_mode_bits)
@@ -5109,10 +5136,78 @@ impl QueryEngine for StorageQueryEngine {
             {
                 return None;
             }
-            struct UnsafeTemplate(bool);
+            // Keep range endpoints literal: they can select parallel scans
+            // and cost tiers. Exact text can nevertheless reuse the existing
+            // validated prepared vehicle without sharing across endpoints.
+            fn literal_column_read(select: &Select) -> bool {
+                fn column(expr: &Expr) -> bool {
+                    matches!(expr, Expr::Identifier(_) | Expr::CompoundIdentifier(_))
+                }
+                fn integer(expr: &Expr) -> bool {
+                    matches!(
+                        expr,
+                        Expr::Literal(
+                            crate::parser::Literal::Int(_)
+                                | crate::parser::Literal::UInt(_)
+                                | crate::parser::Literal::Null
+                        )
+                    )
+                }
+                fn predicate(expr: &Expr) -> bool {
+                    match expr {
+                        Expr::Binary {
+                            left,
+                            op: BinaryOp::And | BinaryOp::Or,
+                            right,
+                        } => predicate(left) && predicate(right),
+                        Expr::Binary {
+                            left,
+                            op:
+                                BinaryOp::Eq
+                                | BinaryOp::NullSafeEq
+                                | BinaryOp::NotEq
+                                | BinaryOp::Lt
+                                | BinaryOp::LtEq
+                                | BinaryOp::Gt
+                                | BinaryOp::GtEq,
+                            right,
+                        } => (column(left) && integer(right)) || (integer(left) && column(right)),
+                        Expr::IsNull(expr) | Expr::IsNotNull(expr) => column(expr),
+                        Expr::Between {
+                            expr, low, high, ..
+                        } => column(expr) && integer(low) && integer(high),
+                        Expr::InList { expr, list, .. } => column(expr) && list.iter().all(integer),
+                        _ => false,
+                    }
+                }
+                select.group_by.is_empty()
+                    && select.having.is_none()
+                    && select.projection.iter().all(|item| match item {
+                        SelectItem::Expr { expr, .. } => column(expr),
+                        SelectItem::Wildcard | SelectItem::QualifiedWildcard(_) => true,
+                    })
+                    && select.selection.as_ref().is_none_or(predicate)
+            }
+            let literal_read = sql.len() <= 4096 && literal_column_read(select);
+            struct UnsafeTemplate {
+                unsafe_shape: bool,
+                literal_read: bool,
+            }
             impl crate::parser::visit::AstVisitor for UnsafeTemplate {
                 fn enter_expr(&mut self, expr: &Expr) {
-                    self.0 |= matches!(
+                    if self.literal_read
+                        && matches!(
+                            expr,
+                            Expr::Literal(
+                                crate::parser::Literal::Int(_)
+                                    | crate::parser::Literal::UInt(_)
+                                    | crate::parser::Literal::Null
+                            )
+                        )
+                    {
+                        return;
+                    }
+                    self.unsafe_shape |= matches!(
                         expr,
                         Expr::Literal(_)
                             | Expr::BoundValue(_)
@@ -5122,13 +5217,17 @@ impl QueryEngine for StorageQueryEngine {
                             | Expr::WindowFunction { .. }
                     );
                 }
-                fn enter_limit(&mut self, _: &crate::parser::LimitValue) {
-                    self.0 = true;
+                fn enter_limit(&mut self, value: &crate::parser::LimitValue) {
+                    self.unsafe_shape |=
+                        !self.literal_read || !matches!(value, crate::parser::LimitValue::Rows(_));
                 }
             }
-            let mut unsafe_template = UnsafeTemplate(false);
+            let mut unsafe_template = UnsafeTemplate {
+                unsafe_shape: false,
+                literal_read,
+            };
             crate::parser::visit::visit_statement(&mut unsafe_template, statement.as_ref());
-            if unsafe_template.0 {
+            if unsafe_template.unsafe_shape {
                 return None;
             }
             (key, statement, Vec::new())
@@ -5178,6 +5277,12 @@ impl QueryEngine for StorageQueryEngine {
         params: Vec<Value>,
         shape_sql: Arc<str>,
     ) -> Result<QueryResponse, QueryError> {
+        if let Some(restored) = integer_range_text::restore(statement.as_ref(), &params) {
+            return crate::engine::perf_events::with_statement_digest_sql_override(
+                shape_sql,
+                || self.execute_parsed(session, sql, Arc::new(restored)),
+            );
+        }
         self.attach_expression_registry(session);
         let _trace = crate::engine::cbo::trace::statement(
             session.connection_id,
@@ -6536,15 +6641,50 @@ impl StorageQueryEngine {
         statement: &Statement,
         auto_result: &crate::engine::auto_param::AutoParamResult,
     ) {
-        if auto_result.fingerprint.is_none()
-            || !matches!(
-                statement,
-                Statement::Select(_)
-                    | Statement::Insert(_)
-                    | Statement::Update(_)
-                    | Statement::Delete(_)
-            )
-        {
+        if auto_result.fingerprint.is_none() {
+            if sql.len() <= 4096
+                && !matches!(
+                    crate::engine::auto_param::AutoParameterizeMode::from_env(),
+                    crate::engine::auto_param::AutoParameterizeMode::Off
+                )
+                // Decline unrelated statements before probing the AST cache:
+                // publishing a range vehicle must not add parser-cache reads
+                // (or alter hit/miss accounting) for ordinary SELECTs.
+                && integer_range_text::candidate(
+                    &self.db,
+                    session,
+                    statement,
+                    &auto_result.params,
+                )
+            {
+                let bits = crate::engine::api::parse_temporal_sql_mode_bits(&session.sql_mode);
+                if let Some((key, mut scanned)) = text_shape_key_and_params(sql, bits) {
+                    if let Some(raw) = self
+                        .statement_cache
+                        .get(&crate::engine::cache::ParsedStatementKey::new(sql, bits))
+                    {
+                        if integer_range_text::candidate(&self.db, session, &raw, &[]) {
+                            let (template, params) =
+                                crate::engine::auto_param::bounded_range_template(&raw);
+                            if normalize_text_limit_params(&template, &mut scanned)
+                                && scanned == params
+                                && parse_statement(&key.sql).ok().as_ref() == Some(&template)
+                            {
+                                self.statement_cache.insert(key, Arc::new(template));
+                            }
+                        }
+                    }
+                }
+            }
+            return;
+        }
+        if !matches!(
+            statement,
+            Statement::Select(_)
+                | Statement::Insert(_)
+                | Statement::Update(_)
+                | Statement::Delete(_)
+        ) {
             return;
         }
         let parser_mode_bits = crate::engine::api::parse_temporal_sql_mode_bits(&session.sql_mode);

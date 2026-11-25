@@ -230,6 +230,45 @@ pub(crate) fn sort_by_cached_keys<T>(
     apply_sorted_perm_in_place(items.as_mut_slice(), &keyed);
 }
 
+/// Select a stable ORDER BY page without sorting its discarded prefix or
+/// suffix. Key evaluation retains the full sort's input order and frequency;
+/// the original ordinal makes selection deterministic even for equal keys.
+pub(crate) fn sort_window_by_cached_keys<T>(
+    items: &mut Vec<T>,
+    fields: &[SortField],
+    offset: usize,
+    limit: usize,
+    mut key_fn: impl FnMut(&T) -> Vec<Value>,
+) {
+    if fields.is_empty() || items.len() < 2 {
+        let end = offset.saturating_add(limit).min(items.len());
+        items.truncate(end);
+        items.drain(..offset.min(end));
+        return;
+    }
+    let mut keyed = build_keyed(items, &mut key_fn);
+    if offset >= items.len() || limit == 0 {
+        items.clear();
+        return;
+    }
+    let end = offset.saturating_add(limit).min(items.len());
+    let compare = |a: &KeyedIndex, b: &KeyedIndex| {
+        compare_sort_keys(fields, &a.keys, &b.keys).then_with(|| a.index.cmp(&b.index))
+    };
+    if end < keyed.len() {
+        keyed.select_nth_unstable_by(end, compare);
+    }
+    if offset != 0 {
+        keyed[..end].select_nth_unstable_by(offset, compare);
+    }
+    keyed[offset..end].sort_unstable_by(compare);
+    // The complete permutation preserves ownership without cloning payloads.
+    // Its selected window is moved to the front before discarded rows drop.
+    keyed.rotate_left(offset);
+    apply_sorted_perm_in_place(items.as_mut_slice(), &keyed);
+    items.truncate(end - offset);
+}
+
 /// Sort items using keys prepared by a fallible expression layer. Keeping
 /// preparation outside the comparison loop lets SQL errors propagate instead
 /// of being coerced to NULL, while each expression is evaluated once.
@@ -1116,6 +1155,114 @@ mod tests {
             blind.into_sorted_vec().unwrap(),
             gated.into_sorted_vec().unwrap()
         );
+    }
+
+    #[test]
+    fn selected_pages_match_stable_full_sort_across_domains_and_bounds() {
+        let values = vec![
+            Value::Null,
+            Value::Int(i64::MIN),
+            Value::Int(0),
+            Value::UInt(u64::MAX),
+            Value::Double(f64::NEG_INFINITY),
+            Value::Double(-0.0),
+            Value::Double(f64::INFINITY),
+            Value::Double(f64::NAN),
+            Value::Decimal128(-(1i128 << 90), 3),
+            Value::DecimalCompact(123, 2),
+            Value::Decimal("0.0000000000000000000000001".into()),
+            Value::String("École".into()),
+            Value::String("ecole".into()),
+            Value::String("中文".into()),
+            Value::String("a\0z".into()),
+            Value::Bytes(vec![0, 255]),
+            Value::Date(0),
+            Value::Date(crate::types::ZERO_DATE),
+            Value::Time(-123),
+            Value::DateTime(1234567),
+            Value::Timestamp(1234567),
+        ];
+        let input = (0..513)
+            .map(|n| {
+                (
+                    n,
+                    vec![
+                        values[n * 37 % values.len()].clone(),
+                        Value::Int((n % 7) as i64),
+                    ],
+                )
+            })
+            .collect::<Vec<_>>();
+        for ascending in [false, true] {
+            for nulls_first in [false, true] {
+                let fields = [
+                    SortField {
+                        ascending,
+                        nulls_first,
+                        collation_id: Some(255),
+                    },
+                    SortField::mysql_order(!ascending),
+                ];
+                let mut oracle = input.clone();
+                sort_by_cached_keys(&mut oracle, &fields, |r| r.1.clone());
+                for offset in [0, 1, 17, 256, 512, 513, 1000, usize::MAX - 1] {
+                    for limit in [0, 1, 20, 512, usize::MAX] {
+                        let expected = oracle
+                            .iter()
+                            .skip(offset)
+                            .take(limit)
+                            .map(|r| r.0)
+                            .collect::<Vec<_>>();
+                        let mut actual = input.clone();
+                        let mut evaluations = Vec::new();
+                        sort_window_by_cached_keys(&mut actual, &fields, offset, limit, |r| {
+                            evaluations.push(r.0);
+                            r.1.clone()
+                        });
+                        assert_eq!(evaluations, (0..input.len()).collect::<Vec<_>>());
+                        assert_eq!(actual.iter().map(|r|r.0).collect::<Vec<_>>(),expected,"offset={offset}, limit={limit}, asc={ascending}, nulls_first={nulls_first}");
+                    }
+                }
+            }
+        }
+        for mut input in [vec![], vec![7]] {
+            sort_window_by_cached_keys(
+                &mut input,
+                &[SortField::mysql_order(true)],
+                usize::MAX,
+                usize::MAX,
+                |_| panic!("full sort does not evaluate singleton keys"),
+            );
+            assert!(input.is_empty());
+        }
+    }
+
+    #[test]
+    fn selected_page_moves_nonclone_payloads_and_drops_discarded_owners() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        struct Item(usize, Arc<AtomicUsize>);
+        impl Drop for Item {
+            fn drop(&mut self) {
+                self.1.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut items = (0..100).map(|n| Item(n, drops.clone())).collect::<Vec<_>>();
+        sort_window_by_cached_keys(&mut items, &[SortField::mysql_order(true)], 41, 9, |row| {
+            vec![Value::Int((row.0 % 7) as i64)]
+        });
+        let mut expected = (0..100).collect::<Vec<_>>();
+        expected.sort_by_key(|n| n % 7);
+        assert_eq!(
+            items.iter().map(|r| r.0).collect::<Vec<_>>(),
+            expected[41..50]
+        );
+        assert_eq!(drops.load(Ordering::Relaxed), 91);
+        drop(items);
+        assert_eq!(drops.load(Ordering::Relaxed), 100);
     }
 
     #[test]

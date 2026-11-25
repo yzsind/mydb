@@ -2,6 +2,7 @@
 use super::*;
 
 mod aggregate;
+mod page;
 use aggregate::PartitionInput;
 use aggregate::WindowAggregate;
 
@@ -2133,6 +2134,34 @@ fn finish_window_plan_result(
 ) -> Result<QueryResponse, QueryError> {
     let (mut final_columns, final_cols, post_schema) =
         prepare_window_final_projection(&all_columns, window_count, window_specs, &output_template);
+    // Computed projections may affect session-dependent key metadata. Keep
+    // their original evaluation-before-order-binding sequence.
+    let mut order = (!original_order_by.is_empty()
+        && final_cols
+            .iter()
+            .all(|p| matches!(p, WindowFinalCol::Index(_))))
+    .then(|| page::Order::bind(&final_columns, &original_order_by, &order_key_map));
+    // Failed count validation retains the canonical late error path. DISTINCT
+    // must see every projected row before a page can be selected.
+    let page_window = if final_options.distinct {
+        None
+    } else {
+        crate::engine::executor::select::optional_limit_value(original_limit.as_ref())
+            .ok()
+            .flatten()
+            .and_then(|limit| {
+                crate::engine::executor::select::limit_value_or_zero(original_offset.as_ref())
+                    .ok()
+                    .map(|offset| (offset, limit))
+            })
+    };
+    let mut all_rows = all_rows;
+    let mut page_selected = match (&order, page_window) {
+        (Some(order), Some(window)) => {
+            order.select_before_projection(&mut all_rows, &final_cols, window)
+        }
+        _ => false,
+    };
     let mut final_rows: Vec<Vec<Value>> =
         crate::engine::executor::mem_budget::try_vec_with_capacity(
             all_rows.len(),
@@ -2164,75 +2193,12 @@ fn finish_window_plan_result(
         ))?;
         final_rows.push(out_row);
     }
-    // Apply ORDER BY. Keys are evaluated over the final output columns with the
-    // full expression engine, after re-pointing any expanded projection
-    // definition (e.g. a ROLLUP `GROUPING(a)+GROUPING(b)` that an ORDER BY alias
-    // was rewritten into) back at its materialised output column. This sorts
-    // correctly for expression keys (`CASE WHEN lochierarchy = 0 ...`) that the
-    // old identifier-only resolution silently dropped.
-    if !original_order_by.is_empty() {
-        let final_schema = synthetic_set_op_schema(&final_columns);
-        let output_index: std::collections::HashMap<String, usize> = final_columns
-            .iter()
-            .enumerate()
-            .map(|(idx, col)| (col.name.to_ascii_lowercase(), idx))
-            .collect();
-        let order_keys: Vec<Expr> = original_order_by
-            .iter()
-            .map(|item| {
-                let mut e = item.expr.clone();
-                rebind_expr_to_output_columns(&mut e, &order_key_map);
-                e
-            })
-            .collect();
-        let direct_order_positions: Vec<Option<usize>> = order_keys
-            .iter()
-            .enumerate()
-            .map(|(index, expr)| {
-                // Qualified expressions retain their projection slot even
-                // when two output columns have the same display name.
-                if let Some(position) = order_key_map
-                    .iter()
-                    .position(|(source, _)| source == &original_order_by[index].expr)
-                {
-                    return Some(position);
-                }
-                match expr {
-                    Expr::Literal(crate::parser::Literal::Int(n)) if *n > 0 => {
-                        Some(*n as usize - 1)
-                    }
-                    Expr::Literal(crate::parser::Literal::UInt(n)) if *n > 0 => {
-                        Some(*n as usize - 1)
-                    }
-                    _ => crate::planner::expr_column_name(expr)
-                        .and_then(|name| output_index.get(&name.to_ascii_lowercase()).copied()),
-                }
-            })
-            .collect();
-        let mut fields = crate::engine::executor::sort::fields_from_order_by(&original_order_by);
-        for (index, (field, expr)) in fields.iter_mut().zip(&order_keys).enumerate() {
-            field.collation_id = direct_order_positions[index]
-                .and_then(|pos| final_columns.get(pos))
-                .and_then(|c| c.source.collation_id)
-                .or_else(|| {
-                    crate::engine::expr::expr_collation(expr, &final_schema)
-                        .map(|info| info.collation_id)
-                });
-        }
-        crate::engine::executor::sort::sort_by_cached_keys(&mut final_rows, &fields, |row| {
-            order_keys
-                .iter()
-                .enumerate()
-                .map(|(idx, e)| {
-                    direct_order_positions[idx]
-                        .and_then(|pos| row.get(pos).cloned())
-                        .unwrap_or_else(|| {
-                            crate::engine::expr::eval_expr(e, &final_schema, row)
-                                .unwrap_or(Value::Null)
-                        })
-                })
-                .collect()
+    if !page_selected && !original_order_by.is_empty() {
+        let order = order.get_or_insert_with(|| {
+            page::Order::bind(&final_columns, &original_order_by, &order_key_map)
         });
+        order.apply(&mut final_rows, page_window);
+        page_selected = page_window.is_some();
     }
     let visible = final_columns.len().saturating_sub(final_options.hidden);
     final_columns.truncate(visible);
@@ -2257,13 +2223,15 @@ fn finish_window_plan_result(
     // against the thread-local params instead of being silently dropped.
     let offset = crate::engine::executor::select::limit_value_or_zero(original_offset.as_ref())?;
     let limit = crate::engine::executor::select::optional_limit_value(original_limit.as_ref())?;
-    if offset >= final_rows.len() {
-        final_rows.clear();
-    } else {
-        final_rows.drain(..offset);
-    }
-    if let Some(limit) = limit {
-        final_rows.truncate(limit);
+    if !page_selected {
+        if offset >= final_rows.len() {
+            final_rows.clear();
+        } else {
+            final_rows.drain(..offset);
+        }
+        if let Some(limit) = limit {
+            final_rows.truncate(limit);
+        }
     }
     Ok(QueryResponse::ResultSet(ResultSet {
         columns: final_columns,

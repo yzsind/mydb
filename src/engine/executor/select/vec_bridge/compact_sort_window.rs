@@ -1,10 +1,17 @@
-//! Resident columnar page selection, with replay into the governed sorter.
-//! Only row handles and canonical encoded keys are partitioned; payload stays
-//! in its original batches and only the final page crosses the row boundary.
+//! Budgeted columnar page selection, with replay into the governed sorter.
+//! Only row handles and canonical encoded keys are partitioned. Payload stays
+//! in producer batches, optionally spooled once; only the final page is decoded.
 
 use super::*;
-use crate::engine::executor::sort::{key_encode::RowEncoder, SortField};
+use crate::engine::executor::sort::{
+    key_encode::{BorrowedKey, RowEncoder},
+    SortField,
+};
 use std::collections::VecDeque;
+
+mod fixed;
+mod payload;
+use payload::Spool;
 
 #[cfg(test)]
 pub(crate) static RESIDENT_WINDOW_HITS: std::sync::atomic::AtomicU64 =
@@ -88,7 +95,11 @@ pub(super) fn preflight(
             | PhysicalPlan::SeqScan { .. }
             | PhysicalPlan::ParallelSeqScan { .. }
             | PhysicalPlan::ZoneMapScan { .. }
-            | PhysicalPlan::ParallelZoneMapScan { .. } => true,
+            | PhysicalPlan::ParallelZoneMapScan { .. }
+            // The join has already evaluated matches and residuals into
+            // authoritative batches. Quota fallback replays those batches,
+            // so admitting them never repeats probes or changes multiplicity.
+            | PhysicalPlan::HashJoin { .. } => true,
             PhysicalPlan::Filter { input, .. }
             | PhysicalPlan::Exchange { input, .. }
             | PhysicalPlan::Projection {
@@ -178,7 +189,9 @@ fn canonical_decimal_key(value: Value, column_type: ColumnType) -> Option<Value>
 }
 
 struct Replay<'a> {
-    prefix: VecDeque<(Batch, usize)>,
+    prefix: VecDeque<(Option<Batch>, usize)>,
+    spool: Option<Spool>,
+    position: usize,
     input: Box<dyn BatchOperator + 'a>,
     charge: mem_budget::ScopedCharge,
 }
@@ -191,8 +204,19 @@ impl BatchOperator for Replay<'_> {
     }
     fn next_batch(&mut self) -> Result<Option<Batch>, QueryError> {
         if let Some((batch, bytes)) = self.prefix.pop_front() {
+            let index = self.position;
+            self.position += 1;
             self.charge.release_bytes(bytes);
-            return Ok(Some(batch));
+            return batch.map_or_else(
+                || {
+                    self.spool
+                        .as_ref()
+                        .expect("spooled page prefix")
+                        .read(index, self.input.schema().clone())
+                        .map(Some)
+                },
+                |batch| Ok(Some(batch)),
+            );
         }
         self.input.next_batch()
     }
@@ -205,6 +229,7 @@ struct Window<'a> {
     fields: Arc<[SortField]>,
     offset: usize,
     limit: usize,
+    estimated_rows: f64,
     data_dir: std::path::PathBuf,
     output: Option<Box<dyn BatchOperator + 'a>>,
     preserve_value_shape: bool,
@@ -213,7 +238,9 @@ struct Window<'a> {
 struct ResidentOutput {
     schema: Arc<BatchSchema>,
     properties: BatchProperties,
-    batches: Vec<(Batch, usize)>,
+    batches: Vec<(Option<Batch>, usize)>,
+    spool: Option<Spool>,
+    loaded: Option<(u32, Batch)>,
     entries: std::vec::IntoIter<Entry>,
     _charge: mem_budget::ScopedCharge,
     preserve_value_shape: bool,
@@ -254,7 +281,24 @@ impl BatchOperator for ResidentOutput {
             })
             .collect::<Vec<_>>();
         for entry in self.entries.by_ref().take(count) {
-            let batch = &self.batches[entry.batch as usize].0;
+            let batch = if let Some(batch) = self.batches[entry.batch as usize].0.as_ref() {
+                batch
+            } else {
+                if self
+                    .loaded
+                    .as_ref()
+                    .is_none_or(|(index, _)| *index != entry.batch)
+                {
+                    self.loaded = None;
+                    let batch = self
+                        .spool
+                        .as_ref()
+                        .expect("spooled page payload")
+                        .read(entry.batch as usize, self.schema.clone())?;
+                    self.loaded = Some((entry.batch, batch));
+                }
+                &self.loaded.as_ref().expect("loaded page payload").1
+            };
             for (i, column) in columns.iter_mut().enumerate() {
                 charge.add_with_workspace(
                     batch.columns()[i]
@@ -284,16 +328,30 @@ impl BatchOperator for ResidentOutput {
 }
 
 fn retain_batch(
-    batches: &mut Vec<(Batch, usize)>,
+    batches: &mut Vec<(Option<Batch>, usize)>,
     batch: Batch,
     bytes: usize,
+    spool: &mut Option<Spool>,
+    spill: bool,
+    data_dir: &std::path::Path,
 ) -> Result<(), QueryError> {
     if batches.len() == batches.capacity() {
         // Per-batch admission already covers twice the metadata width.
         let additional = batches.capacity().max(1);
         mem_budget::try_reserve_vec_exact(batches, additional, "resident page batches")?;
     }
-    batches.push((batch, bytes));
+    if spill {
+        if spool.is_none() {
+            *spool = Some(Spool::new(data_dir)?);
+        }
+        spool
+            .as_ref()
+            .expect("payload spool initialized")
+            .store(batches.len(), &batch)?;
+        batches.push((None, bytes));
+    } else {
+        batches.push((Some(batch), bytes));
+    }
     Ok(())
 }
 
@@ -408,8 +466,9 @@ impl<'a> Window<'a> {
     fn spill(
         &mut self,
         input: Box<dyn BatchOperator + 'a>,
-        prefix: Vec<(Batch, usize)>,
+        prefix: Vec<(Option<Batch>, usize)>,
         charge: mem_budget::ScopedCharge,
+        spool: Option<Spool>,
     ) {
         #[cfg(test)]
         RESIDENT_WINDOW_REPLAYS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -435,6 +494,8 @@ impl<'a> Window<'a> {
                 None,
                 Box::new(Replay {
                     prefix: prefix.into(),
+                    spool,
+                    position: 0,
                     input,
                     charge,
                 }),
@@ -467,23 +528,45 @@ impl<'a> Window<'a> {
         let mut resident_bytes = 0usize;
         let mut work = mem_budget::ScopedCharge::new(0);
         let mut batches = Vec::new();
+        let mut spool = None;
         let mut entries = Vec::new();
         let mut arena = Vec::new();
         let mut encoded = Vec::new();
-        let mut values = Vec::with_capacity(self.keys.sources.len());
+        let mut fixed_mode = None;
         let mut scratch = mem_budget::ScopedCharge::new(0);
         let Some(mut encoder) = RowEncoder::new(self.fields.clone()) else {
-            self.spill(input, batches, payload);
+            self.spill(input, batches, payload, spool);
             return Ok(());
         };
         while let Some(batch) = input.next_batch()? {
             crate::engine::cancel::check_cancelled()?;
             let batch = compact_retained_batch(batch)?;
-            let retained = batch
-                .resident_bytes()
-                .saturating_add(512 * self.schema.len() + 256);
-            resident_bytes = resident_bytes.saturating_add(retained);
-            let bytes = retained.saturating_sub(batch.accounted_query_bytes());
+            let metadata = 512 * self.schema.len() + 256;
+            let retained = batch.resident_bytes().saturating_add(metadata);
+            // Reserve room for all encoded keys independently of wide payloads.
+            // Once that payload share fills, write immutable producer batches
+            // once and decode only batches referenced by the final page.
+            // Do not spool a wide prefix when even its keys are predicted to
+            // need external sorting. Observed key widths refine the estimate;
+            // runtime admission remains authoritative if estimates are wrong.
+            let key_bytes = std::mem::size_of::<Entry>().saturating_add(if entries.is_empty() {
+                self.keys.sources.len().saturating_mul(16)
+            } else {
+                arena.len().div_ceil(entries.len())
+            });
+            let keys_may_fit = self.estimated_rows.is_finite()
+                && self.estimated_rows > 0.0
+                && self.estimated_rows * key_bytes as f64 * 2.0 <= (cap / 2) as f64;
+            let spill_payload = batch.selection().is_none()
+                && keys_may_fit
+                && resident_bytes.saturating_add(retained) > cap / 2;
+            resident_bytes =
+                resident_bytes.saturating_add(if spill_payload { metadata } else { retained });
+            let bytes = if spill_payload {
+                metadata
+            } else {
+                retained.saturating_sub(batch.accounted_query_bytes())
+            };
             // All reservations precede retention. A failed speculation owns
             // one bounded producer batch and replays it without reopening I/O.
             if resident_bytes.saturating_add(work.charged()) > cap
@@ -494,8 +577,15 @@ impl<'a> Window<'a> {
                 drop(work);
                 drop(encoder);
                 payload.add_with_workspace(bytes)?;
-                retain_batch(&mut batches, batch, bytes)?;
-                self.spill(input, batches, payload);
+                retain_batch(
+                    &mut batches,
+                    batch,
+                    bytes,
+                    &mut spool,
+                    spill_payload,
+                    &self.data_dir,
+                )?;
+                self.spill(input, batches, payload, spool);
                 return Ok(());
             }
             let mut temporary = batch.memory_charge();
@@ -512,15 +602,25 @@ impl<'a> Window<'a> {
                 })
                 .expect("bounded keys preflighted");
             if !temporary.add_within(
-                bound.saturating_mul(batch.num_rows()).saturating_add(1024),
+                bound
+                    .saturating_mul(batch.num_rows())
+                    .saturating_add(self.keys.sources.len().saturating_mul(128))
+                    .saturating_add(1024),
                 temporary.remaining().saturating_add(temporary.charged()),
             ) {
                 drop(entries);
                 drop(arena);
                 drop(work);
                 drop(encoder);
-                retain_batch(&mut batches, batch, bytes)?;
-                self.spill(input, batches, payload);
+                retain_batch(
+                    &mut batches,
+                    batch,
+                    bytes,
+                    &mut spool,
+                    spill_payload,
+                    &self.data_dir,
+                )?;
+                self.spill(input, batches, payload, spool);
                 return Ok(());
             }
             let computed = self
@@ -540,8 +640,73 @@ impl<'a> Window<'a> {
                     _ => unreachable!("immutable keys preflighted"),
                 })
                 .collect::<Result<Vec<_>, QueryError>>()?;
-            let mut admitted = true;
-            for row in batch.visible_indices() {
+            // Validate each UTF-8 lane once, then borrow row slices. A lane
+            // with invalid bytes keeps the canonical per-value error path.
+            let key_columns = self
+                .keys
+                .sources
+                .iter()
+                .enumerate()
+                .map(|(i, source)| match source {
+                    TopNKeySource::Column(column) => &batch.columns()[*column],
+                    _ => computed[i].as_ref().expect("computed sort key"),
+                })
+                .collect::<Vec<_>>();
+            let key_types = self
+                .keys
+                .sources
+                .iter()
+                .map(|source| match source {
+                    TopNKeySource::Column(column) => (
+                        self.schema.fields()[*column].column_type,
+                        self.schema.fields()[*column].source.flags,
+                    ),
+                    TopNKeySource::Program { program, .. } => {
+                        (program.result_type().column_type(), 0)
+                    }
+                    _ => unreachable!("immutable keys preflighted"),
+                })
+                .collect::<Vec<_>>();
+            let fixed_plan = fixed::Plan::bind(&key_columns, &key_types, &self.fields);
+            let use_fixed = *fixed_mode.get_or_insert(fixed_plan.is_some());
+            let text = key_columns
+                .iter()
+                .map(|column| match column {
+                    ColumnVector::Utf8 { data, .. } => std::str::from_utf8(data).ok(),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            let mut values = smallvec::SmallVec::<[BorrowedKey<'_>; 4]>::new();
+            let mut admitted = !use_fixed || fixed_plan.is_some();
+            if use_fixed {
+                if let Some(plan) = fixed_plan.as_ref() {
+                    let count = batch.visible_rows();
+                    let work_cap = cap.saturating_sub(resident_bytes);
+                    let encoded_bytes = plan.encoded_bytes(&batch);
+                    admitted = u32::try_from(arena.len().saturating_add(encoded_bytes)).is_ok()
+                        && u32::try_from(entries.len().saturating_add(count)).is_ok()
+                        && u32::try_from(batches.len()).is_ok()
+                        && reserve(&mut entries, count, &mut work, work_cap)?
+                        && reserve(&mut arena, encoded_bytes, &mut work, work_cap)?;
+                    if admitted {
+                        for row in batch.visible_indices() {
+                            let start = arena.len() as u32;
+                            if !plan.encode(row, &mut arena) {
+                                admitted = false;
+                                break;
+                            }
+                            entries.push(Entry {
+                                batch: batches.len() as u32,
+                                row: row as u32,
+                                start,
+                                end: arena.len() as u32,
+                                ordinal: entries.len() as u32,
+                            });
+                        }
+                    }
+                }
+            }
+            for row in batch.visible_indices().filter(|_| !use_fixed) {
                 values.clear();
                 let value_bound =
                     self.keys
@@ -568,10 +733,23 @@ impl<'a> Window<'a> {
                     break;
                 }
                 for (i, source) in self.keys.sources.iter().enumerate() {
+                    if !key_columns[i].is_null(row) {
+                        if let (Some(text), ColumnVector::Utf8 { offsets, .. }) =
+                            (text[i], key_columns[i])
+                        {
+                            if let Some(value) =
+                                text.get(offsets[row] as usize..offsets[row + 1] as usize)
+                            {
+                                values.push(BorrowedKey::Text(value));
+                                continue;
+                            }
+                        }
+                    }
                     let value = match source {
                         TopNKeySource::Column(column) => {
                             let field_type = self.schema.fields()[*column].column_type;
-                            let value = batch.columns()[*column].try_value_at(row)?;
+                            let lane = &batch.columns()[*column];
+                            let value = lane.try_value_at(row)?;
                             if DECIMAL_KEYS && matches!(field_type, ColumnType::Decimal { .. }) {
                                 let Some(value) = canonical_decimal_key(value, field_type) else {
                                     admitted = false;
@@ -587,12 +765,12 @@ impl<'a> Window<'a> {
                             .expect("computed sort key")
                             .try_value_at(row)?,
                     };
-                    values.push(value);
+                    values.push(BorrowedKey::Scalar(value));
                 }
                 if !admitted {
                     break;
                 }
-                let Some(bound) = RowEncoder::bound(&values, &[]) else {
+                let Some(bound) = RowEncoder::borrowed_bound(&values) else {
                     admitted = false;
                     break;
                 };
@@ -613,7 +791,7 @@ impl<'a> Window<'a> {
                         "encoded page key",
                     )?;
                 }
-                if !encoder.encode(&values, &[], &mut encoded) {
+                if !encoder.encode_borrowed(&values, &mut encoded) {
                     admitted = false;
                     break;
                 }
@@ -637,15 +815,26 @@ impl<'a> Window<'a> {
                     ordinal: entries.len() as u32,
                 });
             }
+            drop(values);
+            drop(fixed_plan);
+            drop(text);
+            drop(key_columns);
             drop(computed);
             drop(temporary);
-            retain_batch(&mut batches, batch, bytes)?;
+            retain_batch(
+                &mut batches,
+                batch,
+                bytes,
+                &mut spool,
+                spill_payload,
+                &self.data_dir,
+            )?;
             if !admitted {
                 drop(entries);
                 drop(arena);
                 drop(work);
                 drop(encoder);
-                self.spill(input, batches, payload);
+                self.spill(input, batches, payload, spool);
                 return Ok(());
             }
         }
@@ -679,6 +868,8 @@ impl<'a> Window<'a> {
             schema: self.schema.clone(),
             properties: self.keys.properties.clone(),
             batches,
+            spool,
+            loaded: None,
             entries: entries.into_iter(),
             _charge: payload,
             preserve_value_shape: self.preserve_value_shape,
@@ -746,10 +937,12 @@ pub(super) fn build<'a>(
             fields,
             offset,
             limit,
+            estimated_rows: crate::planner::estimated_rows(input),
             data_dir: db.data_dir().to_path_buf(),
             output: None,
             preserve_value_shape: super::super::plan::materialized_lookup_row_bound(input)
-                .is_some(),
+                .is_some()
+                || input.any(|node| matches!(node, PhysicalPlan::HashJoin { .. })),
         }),
         template,
     }))
@@ -843,7 +1036,9 @@ mod tests {
             let mut output = ResidentOutput {
                 schema,
                 properties: BatchProperties::UNORDERED_SINGLE,
-                batches: vec![(batch, 0)],
+                batches: vec![(Some(batch), 0)],
+                spool: None,
+                loaded: None,
                 entries: (0..3)
                     .map(|row| Entry {
                         batch: 0,

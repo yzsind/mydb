@@ -3284,13 +3284,26 @@ pub(crate) fn transform_utf8_column(
     input: &[u8],
     nulls: Option<Bitmap>,
 ) -> Option<ColumnVector> {
+    // Utf8 lanes are validated as one buffer; row access still checks bounds
+    // and character boundaries. Reuse adjacent deterministic transformations
+    // without retaining a dictionary or allocating per-row strings.
+    let input = std::str::from_utf8(input).ok()?;
     let mut output = Vec::with_capacity(input.len());
     let mut output_offsets = Vec::with_capacity(offsets.len());
+    let mut previous: Option<(&str, usize, usize)> = None;
     output_offsets.push(0);
     for pair in offsets.windows(2) {
         let start = pair[0] as usize;
         let end = pair[1] as usize;
-        let value = std::str::from_utf8(input.get(start..end)?).ok()?;
+        let value = input.get(start..end)?;
+        if let Some((prior, lo, hi)) = previous {
+            if prior == value {
+                output.extend_from_within(lo..hi);
+                output_offsets.push(u32::try_from(output.len()).ok()?);
+                continue;
+            }
+        }
+        let output_start = output.len();
         match kind {
             StringTransformKind::Lower | StringTransformKind::Upper => {
                 let upper = matches!(kind, StringTransformKind::Upper);
@@ -3329,6 +3342,7 @@ pub(crate) fn transform_utf8_column(
                 }
             }
         }
+        previous = Some((value, output_start, output.len()));
         output_offsets.push(u32::try_from(output.len()).ok()?);
     }
     Some(ColumnVector::Utf8 {

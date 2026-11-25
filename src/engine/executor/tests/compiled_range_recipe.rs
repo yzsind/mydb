@@ -67,7 +67,7 @@ fn exact_small_primary_range_reuses_plan_across_range_selectivity_tiers() {
     assert_eq!(status.prepared_plan_compiles, 1);
     assert_eq!(status.prepared_plan_reuses, 5);
 
-    // Another usable index restores cost-sensitive planning.
+    // An unrelated key cannot bound or order the primary range.
     engine
         .execute("ALTER TABLE memo_ordered_range ADD KEY by_n(n)")
         .unwrap();
@@ -79,11 +79,27 @@ fn exact_small_primary_range_reuses_plan_across_range_selectivity_tiers() {
     let PreparedSelectMemoState::Ready(memo) = &state else {
         panic!("compiled memo expected");
     };
-    assert!(!memo
+    assert!(memo
         .compiled
         .compact_range
         .as_ref()
         .is_some_and(|recipe| recipe.stable_row_goal));
+    engine
+        .execute("ALTER TABLE memo_ordered_range ADD KEY competing(id,n)")
+        .unwrap();
+    with_shared_result_metadata(|| {
+        engine.execute_prepared_select(&mut session, &mut state, &parsed, sql, &[Value::Int(7)])
+    })
+    .unwrap()
+    .unwrap();
+    let PreparedSelectMemoState::Ready(memo) = &state else {
+        panic!("compiled memo expected")
+    };
+    assert!(!memo
+        .compiled
+        .compact_range
+        .as_ref()
+        .is_some_and(|r| r.stable_row_goal));
 }
 
 #[test]
@@ -691,6 +707,401 @@ fn cached_range_prefix_sort_preserves_unicode_collisions_multikey_and_limit() {
             let expected = owned_result(engine.execute(&oracle).unwrap());
             assert_eq!(actual.rows, expected.rows, "{sql}: {low}..{high}");
             assert_eq!(actual.columns, expected.columns);
+        }
+    }
+}
+
+#[test]
+fn exact_literal_ranges_reuse_a_zero_bind_template_and_recheck_schema() {
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let engine = open_test_engine(dir.path());
+    engine
+        .execute(
+            "CREATE TABLE literal_range(id BIGINT PRIMARY KEY,n INT,label VARCHAR(64),INDEX ni(n))",
+        )
+        .unwrap();
+    engine
+        .execute(
+            "INSERT INTO literal_range VALUES (1,10,'界'),(2,20,'É'),(3,30,'three'),(4,40,'four')",
+        )
+        .unwrap();
+    let mut session = SessionContext::default();
+    for sql in [
+        "SELECT id,n,label FROM literal_range WHERE id>1 ORDER BY id LIMIT 2",
+        "SELECT id,n,label FROM literal_range WHERE id<4 ORDER BY id DESC LIMIT 2",
+    ] {
+        let parsed = engine.parse_cached_statement(&session, sql).unwrap();
+        let (template, params, _) = engine
+            .cached_text_statement(&session, sql)
+            .expect("safe literal template");
+        assert!(params.is_empty());
+        assert_eq!(
+            template.as_ref(),
+            parsed.as_ref(),
+            "literal endpoints must remain authoritative"
+        );
+        let qualified = Arc::new(
+            engine
+                .prepare_statement_template(&mut session, sql, template.as_ref().clone())
+                .unwrap(),
+        );
+        let mut memo = PreparedSelectMemoState::default();
+        for pass in 0..4 {
+            if pass == 2 {
+                engine
+                    .execute("ALTER TABLE literal_range ADD COLUMN extra INT DEFAULT 7")
+                    .unwrap_or_else(|e| panic!("{e:?}"));
+            }
+            let expected = owned_result(engine.execute_with_session(&mut session, sql).unwrap());
+            let actual = owned_result(
+                with_shared_result_metadata(|| {
+                    engine.execute_prepared_select(&mut session, &mut memo, &qualified, sql, &[])
+                })
+                .unwrap()
+                .unwrap(),
+            );
+            assert_eq!(actual.rows, expected.rows);
+            assert_eq!(actual.columns, expected.columns);
+        }
+        // Character comparison domains must be replanned, even for an exact
+        // source template that originally selected an integer index range.
+        engine
+            .execute("ALTER TABLE literal_range MODIFY id VARCHAR(32) NOT NULL")
+            .unwrap();
+        let expected = owned_result(engine.execute_with_session(&mut session, sql).unwrap());
+        let actual = owned_result(
+            with_shared_result_metadata(|| {
+                engine.execute_prepared_select(&mut session, &mut memo, &qualified, sql, &[])
+            })
+            .unwrap()
+            .unwrap(),
+        );
+        assert_eq!(actual.rows, expected.rows);
+        assert_eq!(actual.columns, expected.columns);
+        engine
+            .execute("ALTER TABLE literal_range MODIFY id BIGINT NOT NULL")
+            .unwrap();
+        engine
+            .execute("ALTER TABLE literal_range DROP COLUMN extra")
+            .unwrap();
+    }
+    for sql in [
+        "SELECT id,1/0 FROM literal_range WHERE id>1 LIMIT 2",
+        "SELECT id FROM literal_range WHERE id>'1' ORDER BY id LIMIT 2",
+    ] {
+        engine.parse_cached_statement(&session, sql).unwrap();
+        assert!(
+            engine.cached_text_statement(&session, sql).is_none(),
+            "diagnostic-sensitive literal expression: {sql}"
+        );
+    }
+}
+
+#[test]
+fn changing_integer_text_ranges_share_templates_and_restore_literals_after_ddl() {
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let engine = open_test_engine(dir.path());
+    engine
+        .execute("CREATE TABLE changing_range(id BIGINT PRIMARY KEY,n INT, INDEX ni(n))")
+        .unwrap();
+    engine
+        .execute("INSERT INTO changing_range VALUES(1,10),(2,20),(3,30),(4,40)")
+        .unwrap();
+    let mut session = SessionContext::default();
+    for (op, direction) in [(">", "ASC"), ("<", "DESC"), (">=", "DESC"), ("<=", "ASC")] {
+        let warm = format!(
+            "SELECT id,n FROM changing_range WHERE id{op}1 ORDER BY id {direction} LIMIT 2"
+        );
+        engine.parse_cached_statement(&session, &warm).unwrap();
+        engine.execute_with_session(&mut session, &warm).unwrap();
+        let (template, _, _) = engine.cached_text_statement(&session, &warm).unwrap();
+        assert!(integer_range_text::is_template(&template));
+        let qualified = Arc::new(
+            engine
+                .prepare_statement_template(&mut session, &warm, (*template).clone())
+                .unwrap(),
+        );
+        let mut memo = PreparedSelectMemoState::default();
+        let mut first_memo = None;
+        for anchor in [3, 0, 4, 2, 100] {
+            let sql = format!("SELECT id,n FROM changing_range WHERE id{op}{anchor} ORDER BY id {direction} LIMIT 2");
+            let (reused, params, _) = engine
+                .cached_text_statement(&session, &sql)
+                .expect("new endpoint shares template");
+            assert_eq!(template.as_ref(), reused.as_ref());
+            let actual = crate::engine::params::with_auto_params(params.clone(), || {
+                with_shared_result_metadata(|| {
+                    engine.execute_prepared_select(
+                        &mut session,
+                        &mut memo,
+                        &qualified,
+                        &sql,
+                        &params,
+                    )
+                })
+            })
+            .unwrap()
+            .unwrap();
+            let PreparedSelectMemoState::Ready(current) = &memo else {
+                panic!("compiled memo expected")
+            };
+            if let Some(first) = &first_memo {
+                assert!(
+                    Arc::ptr_eq(first, current),
+                    "range selectivity must not recompile a stable row goal"
+                );
+            } else {
+                first_memo = Some(current.clone());
+            }
+            let expected = engine.execute_with_session(&mut session, &sql).unwrap();
+            assert_eq!(owned_result(actual).rows, owned_result(expected).rows);
+        }
+        // A competing index invalidates the proof. An already borrowed template
+        // must decline before executing, then restore the original literals.
+        engine
+            .execute("ALTER TABLE changing_range ADD KEY competing(id,n)")
+            .unwrap();
+        let params = vec![Value::Int(2), Value::UInt(2)];
+        assert!(crate::engine::params::with_auto_params(params.clone(), || {
+            with_shared_result_metadata(|| {
+                engine.execute_prepared_select(&mut session, &mut memo, &qualified, &warm, &params)
+            })
+        })
+        .is_none());
+        let sql = format!(
+            "SELECT id,n FROM changing_range WHERE id{op}2 ORDER BY id {direction} LIMIT 2"
+        );
+        let actual = engine
+            .execute_parsed_with_params(
+                &mut session,
+                &sql,
+                template,
+                params,
+                Arc::from(sql.as_str()),
+            )
+            .unwrap();
+        assert_eq!(
+            owned_result(actual).rows,
+            owned_result(engine.execute_with_session(&mut session, &sql).unwrap()).rows
+        );
+        engine
+            .execute("ALTER TABLE changing_range DROP INDEX competing")
+            .unwrap();
+    }
+    for suffix in [
+        "WHERE id>1.5 ORDER BY id LIMIT 2",
+        "WHERE id>'1' ORDER BY id LIMIT 2",
+        "WHERE id>1 ORDER BY id LIMIT 65",
+        "WHERE id>1 AND n=20 ORDER BY id LIMIT 2",
+        "WHERE id>1 ORDER BY n LIMIT 2",
+        "WHERE id>1 ORDER BY id",
+        "WHERE id>1 ORDER BY id LIMIT 2 FOR UPDATE",
+    ] {
+        let sql = format!("SELECT id,n FROM changing_range {suffix}");
+        let parsed = engine.parse_cached_statement(&session, &sql).unwrap();
+        assert!(
+            !integer_range_text::candidate(&engine.db, &session, &parsed, &[]),
+            "{sql}"
+        );
+    }
+}
+
+#[test]
+fn text_range_vehicle_rechecks_transactions_permissions_and_new_row_policies() {
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let mut engine = open_test_engine(dir.path());
+    let mut root = SessionContext::default();
+    for sql in [
+        "CREATE TABLE text_policy(id INT PRIMARY KEY,n INT)",
+        "INSERT INTO text_policy VALUES(1,10),(2,20),(3,30),(4,40)",
+        "CREATE USER range_reader",
+        "GRANT SELECT ON test.text_policy TO range_reader",
+    ] {
+        engine.execute_with_session(&mut root, sql).unwrap();
+    }
+    let warm = "SELECT id,n FROM text_policy WHERE id>1 ORDER BY id LIMIT 2";
+    engine.parse_cached_statement(&root, warm).unwrap();
+    engine.execute_with_session(&mut root, warm).unwrap();
+    let (template, _, shape) = engine.cached_text_statement(&root, warm).unwrap();
+    let qualified = Arc::new(
+        engine
+            .prepare_statement_template(&mut root, warm, (*template).clone())
+            .unwrap(),
+    );
+    let mut memo = PreparedSelectMemoState::default();
+    let run = |engine: &StorageQueryEngine,
+               session: &mut SessionContext,
+               memo: &mut PreparedSelectMemoState,
+               key| {
+        let params = vec![Value::Int(key), Value::UInt(2)];
+        crate::engine::params::with_auto_params(params.clone(), || {
+            with_shared_result_metadata(|| {
+                engine.execute_prepared_select(session, memo, &qualified, warm, &params)
+            })
+        })
+    };
+    engine.execute_with_session(&mut root, "BEGIN").unwrap();
+    engine
+        .execute_with_session(&mut root, "INSERT INTO text_policy VALUES(5,50)")
+        .unwrap();
+    assert_eq!(
+        owned_result(run(&engine, &mut root, &mut memo, 3).unwrap().unwrap()).rows,
+        vec![
+            vec![Value::Int(4), Value::Int(40)],
+            vec![Value::Int(5), Value::Int(50)]
+        ]
+    );
+    engine.execute_with_session(&mut root, "ROLLBACK").unwrap();
+    assert_eq!(
+        owned_result(run(&engine, &mut root, &mut memo, 3).unwrap().unwrap()).rows,
+        vec![vec![Value::Int(4), Value::Int(40)]]
+    );
+    engine.plan_cache_enabled = false;
+    assert!(run(&engine, &mut root, &mut memo, 3).is_none());
+    let uncached = engine
+        .execute_parsed_with_params(
+            &mut root,
+            warm,
+            template.clone(),
+            vec![Value::Int(1), Value::UInt(2)],
+            shape.clone(),
+        )
+        .unwrap();
+    assert_eq!(
+        owned_result(uncached).rows,
+        vec![
+            vec![Value::Int(2), Value::Int(20)],
+            vec![Value::Int(3), Value::Int(30)]
+        ]
+    );
+    engine.plan_cache_enabled = true;
+    let mut reader = SessionContext {
+        user: "range_reader".into(),
+        login_user: "range_reader".into(),
+        authenticated_as: AccountKey::new("range_reader", "%"),
+        connection_id: 8731,
+        ..SessionContext::default()
+    };
+    assert_eq!(
+        owned_result(run(&engine, &mut reader, &mut memo, 1).unwrap().unwrap())
+            .rows
+            .len(),
+        2
+    );
+    engine
+        .execute_with_session(
+            &mut root,
+            "REVOKE SELECT ON test.text_policy FROM range_reader",
+        )
+        .unwrap();
+    assert!(run(&engine, &mut reader, &mut memo, 1).unwrap().is_err());
+    engine
+        .execute_with_session(
+            &mut root,
+            "GRANT SELECT ON test.text_policy TO range_reader",
+        )
+        .unwrap();
+    engine
+        .execute_with_session(
+            &mut root,
+            "ALTER TABLE text_policy ENABLE ROW LEVEL SECURITY",
+        )
+        .unwrap();
+    engine
+        .execute_with_session(
+            &mut root,
+            "CREATE POLICY only_two ON text_policy USING(id=2)",
+        )
+        .unwrap();
+    assert!(run(&engine, &mut reader, &mut memo, 1).is_none());
+    let sql = "SELECT id,n FROM text_policy WHERE id>0 ORDER BY id LIMIT 2";
+    assert!(engine.cached_text_statement(&reader, sql).is_none());
+    let rows = owned_result(
+        engine
+            .execute_parsed_with_params(
+                &mut reader,
+                sql,
+                template,
+                vec![Value::Int(0), Value::UInt(2)],
+                shape,
+            )
+            .unwrap(),
+    )
+    .rows;
+    assert_eq!(rows, vec![vec![Value::Int(2), Value::Int(20)]]);
+}
+
+#[test]
+fn text_integer_range_templates_preserve_signed_unsigned_edges_and_runtime_windows() {
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let engine = open_test_engine(dir.path());
+    let mut session = SessionContext::default();
+    for (number, datatype, high) in [
+        (0, "TINYINT", "127"),
+        (1, "SMALLINT", "32767"),
+        (2, "MEDIUMINT", "8388607"),
+        (3, "INT", "2147483647"),
+        (4, "BIGINT", "9223372036854775807"),
+        (5, "BIGINT UNSIGNED", "18446744073709551615"),
+    ] {
+        let table = format!("text_edges_{number}");
+        engine
+            .execute(&format!(
+                "CREATE TABLE {table}(id {datatype} PRIMARY KEY,n VARCHAR(16))"
+            ))
+            .unwrap();
+        engine
+            .execute(&format!(
+                "INSERT INTO {table} VALUES(0,'零'),(1,'one'),(2,'two'),({high},'high')"
+            ))
+            .unwrap();
+        for (op, direction) in [(">", "ASC"), (">=", "DESC"), ("<", "DESC"), ("<=", "ASC")] {
+            let warm = format!(
+                "SELECT id,n FROM {table} WHERE id{op}1 ORDER BY id {direction} LIMIT 2 OFFSET 0"
+            );
+            engine.parse_cached_statement(&session, &warm).unwrap();
+            engine.execute_with_session(&mut session, &warm).unwrap();
+            let (template, _, _) = engine.cached_text_statement(&session, &warm).unwrap();
+            assert!(integer_range_text::is_template(&template));
+            let qualified = Arc::new(
+                engine
+                    .prepare_statement_template(&mut session, &warm, (*template).clone())
+                    .unwrap(),
+            );
+            let mut memo = PreparedSelectMemoState::default();
+            for (anchor, limit, offset) in [
+                ("-1", 1, 0),
+                ("0", 2, 1),
+                ("2", 63, 1),
+                ("9223372036854775807", 2, 0),
+                ("18446744073709551615", 2, 0),
+            ] {
+                let sql = format!("SELECT id,n FROM {table} WHERE id{op}{anchor} ORDER BY id {direction} LIMIT {limit} OFFSET {offset}");
+                let (reused, params, shape) = engine.cached_text_statement(&session, &sql).unwrap();
+                assert_eq!(reused.as_ref(), template.as_ref());
+                let fast = crate::engine::params::with_auto_params(params.clone(), || {
+                    with_shared_result_metadata(|| {
+                        engine.execute_prepared_select(
+                            &mut session,
+                            &mut memo,
+                            &qualified,
+                            &sql,
+                            &params,
+                        )
+                    })
+                });
+                let actual = match fast {
+                    Some(result) => result.unwrap(),
+                    None => engine
+                        .execute_parsed_with_params(&mut session, &sql, reused, params, shape)
+                        .unwrap(),
+                };
+                let expected = engine.execute_with_session(&mut session, &format!("SELECT id,n FROM {table} IGNORE INDEX(PRIMARY) WHERE id{op}{anchor} ORDER BY id {direction} LIMIT {limit} OFFSET {offset}")).unwrap();
+                let actual = owned_result(actual);
+                let expected = owned_result(expected);
+                assert_eq!(actual.rows, expected.rows, "{datatype}: {sql}");
+                assert_eq!(actual.columns, expected.columns, "{datatype}: {sql}");
+            }
         }
     }
 }

@@ -55,6 +55,32 @@ across 10 tables, 300 client threads on a separate host over the private network
 reconnects were recorded. See the [full benchmark report](docs/sysbench-100m-300clients-2026-11-16.md)
 for configuration, methodology, and complete results.
 
+### Smart indexing: fewer full scans without manual indexes
+
+Changing filters and agent-generated SQL make query patterns hard to predict.
+MyDB enables automatic **Zone Maps** on persistent user tables by default.
+Per-block summaries let eligible scans skip blocks that cannot match a
+predicate, reducing work without requiring a hand-built B-tree index for every
+filtering pattern. Serial, parallel, and vectorized scans retain final
+predicate checks; missing or untrusted summaries fall back to a regular scan.
+
+On **15 million TPC-H SF=10 orders**, with no user-created indexes in either
+database, MyDB 1.0.3 and MySQL 8.0.46 produced these lookup results:
+
+| Lookup | MyDB median (ms) | MySQL median (ms) | Speedup |
+| --- | ---: | ---: | ---: |
+| Order ID (ordered column) | **1.206** | 7,577.824 | **6,281.8x** |
+| Customer ID (scattered column) | **32.466** | 7,678.232 | **236.5x** |
+
+Single-threaded, warm-cache medians cover five random values with three
+executions per value; speedup is MySQL time / MyDB time. See the
+[no-index lookup benchmark](docs/zone-map-no-index-benchmark.md) for the schema,
+SQL, scanned pages, disk space, and full test conditions.
+
+The benefit depends on data layout and selectivity. See the
+[feature overview](docs/feature-overview.md) for the mechanism and fallbacks.
+
+
 **MyDB vs. MySQL 8.0**, measured November 17, 2026:
 
 | Workload | MyDB | MySQL | Advantage |
@@ -270,16 +296,6 @@ SELECT projection, so applications can select the rows to enrich before
 contacting a model. Calls also support a single `SET @variable = AI_...`
 assignment. See [LLM and embedding calls](docs/ai.md) and the
 [AI function reference](docs/function/ai/README.md) for setup and supported SQL contexts.
-
-### Smart indexing: fewer full scans without manual indexes
-
-MyDB enables automatic **Zone Maps** on persistent user tables by default.
-Per-block summaries let eligible scans skip blocks that cannot match a
-predicate, reducing work without requiring a hand-built B-tree index for every
-filtering pattern. Serial, parallel, and vectorized scans retain final
-predicate checks; missing or untrusted summaries fall back to a regular scan.
-The benefit depends on data layout and selectivity. See the
-[feature overview](docs/feature-overview.md) for the mechanism and fallbacks.
 
 ### Online DDL: schemas that evolve with the task
 
