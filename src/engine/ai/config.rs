@@ -408,7 +408,12 @@ fn transport_owned_header(name: &str) -> bool {
 pub(crate) fn validate_connection(c: &Connection) -> Result<(), QueryError> {
     if !matches!(
         c.protocol.as_str(),
-        "ollama" | "openai_chat" | "openai_responses" | "openai_embeddings"
+        "ollama"
+            | "openai_chat"
+            | "openai_responses"
+            | "openai_embeddings"
+            | "dashscope_multimodal_embeddings"
+            | "vllm_embeddings"
     ) {
         return Err(error("ER_AI_INVALID_ARGUMENT", "unsupported protocol"));
     }
@@ -436,7 +441,8 @@ pub(crate) fn validate_connection(c: &Connection) -> Result<(), QueryError> {
             "unsupported adapter profile",
         ));
     }
-    if c.limits.max_input_bytes.is_some()
+    if c.limits.max_image_bytes.is_some()
+        || c.limits.max_input_bytes.is_some()
         || c.limits.max_input_tokens.is_some()
         || c.limits.max_output_tokens.is_some()
         || c.limits.max_batch_items.is_some()
@@ -494,6 +500,7 @@ pub(crate) fn validate_limits(l: &Limits) -> Result<(), QueryError> {
     if [
         l.max_inflight,
         l.max_input_bytes,
+        l.max_image_bytes,
         l.max_input_tokens,
         l.max_batch_items,
     ]
@@ -546,7 +553,9 @@ pub(crate) fn validate_model(m: &Model, c: &Connection) -> Result<(), QueryError
                     "embedding space_options are not supported by these adapters",
                 ));
             }
-            if !matches!(c.protocol.as_str(), "ollama" | "openai_embeddings") {
+            if !matches!(c.protocol.as_str(), "ollama" | "openai_embeddings")
+                && !embedding::image_protocol(&c.protocol)
+            {
                 return Err(error(
                     "ER_AI_INVALID_ARGUMENT",
                     "connection does not support embedding",
@@ -554,7 +563,10 @@ pub(crate) fn validate_model(m: &Model, c: &Connection) -> Result<(), QueryError
             }
         }
         "text_generation" => {
-            if m.embedding.is_some() || c.protocol == "openai_embeddings" {
+            if m.embedding.is_some()
+                || c.protocol == "openai_embeddings"
+                || embedding::image_protocol(&c.protocol)
+            {
                 return Err(error(
                     "ER_AI_INVALID_ARGUMENT",
                     "model kind and connection disagree",
@@ -566,12 +578,28 @@ pub(crate) fn validate_model(m: &Model, c: &Connection) -> Result<(), QueryError
     for k in m.capabilities.keys() {
         if !matches!(
             k.as_str(),
-            "messages" | "json_schema" | "temperature" | "top_p" | "stop" | "seed"
+            "messages" | "json_schema" | "temperature" | "top_p" | "stop" | "seed" | "image"
         ) {
             return Err(error("ER_AI_INVALID_ARGUMENT", "unknown capability"));
         }
     }
-    if m.kind == "embedding" && m.capabilities.values().any(|v| *v) {
+    if m.capabilities.get("image") == Some(&true)
+        && (m.kind != "embedding" || !embedding::image_protocol(&c.protocol))
+    {
+        return Err(error(
+            "ER_AI_INVALID_ARGUMENT",
+            "image capability requires a multimodal embedding adapter",
+        ));
+    }
+    if m.limits.max_image_bytes.is_some()
+        && (m.kind != "embedding" || !embedding::image_protocol(&c.protocol))
+    {
+        return Err(error(
+            "ER_AI_INVALID_ARGUMENT",
+            "max_image_bytes requires a multimodal embedding adapter",
+        ));
+    }
+    if m.kind == "embedding" && m.capabilities.iter().any(|(k, v)| k != "image" && *v) {
         return Err(error(
             "ER_AI_INVALID_ARGUMENT",
             "generation capabilities do not apply to embedding models",
@@ -592,6 +620,9 @@ pub(crate) fn validate_model(m: &Model, c: &Connection) -> Result<(), QueryError
         || m.limits.max_batch_items.is_some_and(|v| v > 64)
         || m.limits.max_output_tokens.is_some_and(|v| v > 4096)
         || m.limits.max_input_bytes.is_some_and(|v| v > 262144)
+        || m.limits
+            .max_image_bytes
+            .is_some_and(|v| v > embedding::MAX_IMAGE_BYTES)
     {
         return Err(error(
             "ER_AI_INVALID_ARGUMENT",

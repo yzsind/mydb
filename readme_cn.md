@@ -253,8 +253,8 @@ MyDB 将事务数据、检索和通过 SQL 访问外部模型的能力结合起�
 ### 在 SQL 中调用模型：生成文本和嵌入向量
 
 - **文本生成**：`AI_GENERATE` 接受提示词或文本消息历史，可对选定数据进行摘要、分类、提取和答案生成。
-- **原生嵌入向量**：`AI_EMBED` 返回经过维度校验的 FLOAT32 `VECTOR`。`AI_EMBED_DETAIL` 还支持显式批量文本输入。
-- **本地和远程服务**：通过 SQL 连接对象和模型对象配置 Ollama、OpenAI Responses、兼容 Chat Completions 的服务以及兼容 Embeddings 的服务。模型权重和推理运行在 MyDB 外部。
+- **原生嵌入向量**：`AI_EMBED` 返回经过维度校验的 FLOAT32 `VECTOR`，支持文本及通过多模态适配器显式传入的图片 URL/BLOB。`AI_EMBED_DETAIL` 还支持批量文本或图片 URL。
+- **本地和远程服务**：通过 SQL 连接对象和模型对象配置 Ollama、OpenAI Responses、兼容 Chat Completions 的服务以及兼容 Embeddings 的服务、DashScope 多模态嵌入和 vLLM Chat Embeddings。模型权重和推理运行在 MyDB 外部。
 - **结构化结果**：配置的部署支持时，可请求符合 JSON Schema 的生成输出；MyDB 在本地解析并验证结果。`_DETAIL` 函数提供模型修订版本、服务方报告的 token 用量、耗时和明确的调用错误。
 
 普通过滤、连接、排序和 `LIMIT` 会在最终 SELECT 投影中的模型调用之前执行，

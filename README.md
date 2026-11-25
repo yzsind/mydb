@@ -287,8 +287,8 @@ An agent's data needs change with every task: add a column, build an index, writ
 ### Model calls in SQL: generate text and embeddings
 
 - **Text generation**: `AI_GENERATE` accepts a prompt or text message history for summarization, classification, extraction, and answer generation over selected data.
-- **Native embeddings**: `AI_EMBED` returns a FLOAT32 `VECTOR` with validated dimensions. `AI_EMBED_DETAIL` also accepts explicit batches of texts.
-- **Local and remote services**: configure SQL connection and model objects for Ollama, OpenAI Responses, Chat Completions-compatible services, and Embeddings-compatible services. Model weights and inference run outside MyDB.
+- **Native embeddings**: `AI_EMBED` returns a FLOAT32 `VECTOR` with validated dimensions. Text and explicit image URL/BLOB inputs are supported through configured adapters; `AI_EMBED_DETAIL` also accepts batches of texts or image URLs.
+- **Local and remote services**: configure SQL connection and model objects for Ollama, OpenAI Responses, Chat Completions-compatible services, Embeddings-compatible services, DashScope multimodal embeddings, and vLLM Chat Embeddings. Model weights and inference run outside MyDB.
 - **Structured results**: generation can request JSON Schema output when the configured deployment supports it; MyDB parses and validates the result locally. `_DETAIL` functions expose model revision, provider-reported token usage, timings, and explicit call errors.
 
 Ordinary filtering, joins, sorting, and `LIMIT` run before calls in the final

@@ -1323,7 +1323,7 @@ fn evaluate_rows(
         if !function_name.eq_ignore_ascii_case("AI_EMBED") {
             continue;
         }
-        let mut groups: Vec<(Value, Value, Vec<(usize, String)>)> = Vec::new();
+        let mut groups: Vec<(Value, Value, Vec<(usize, Value)>)> = Vec::new();
         for (row_index, row) in rows.iter().enumerate() {
             let values = args
                 .iter()
@@ -1331,7 +1331,8 @@ fn evaluate_rows(
                 .collect::<Result<Vec<_>, _>>()?;
             if matches!(values[0], Value::Null)
                 || matches!(values[1], Value::Null)
-                || crate::types::value_str(&values[1]).is_none()
+                || (crate::types::value_str(&values[1]).is_none()
+                    && !matches!(values[1], Value::Bytes(_)))
             {
                 continue;
             }
@@ -1343,10 +1344,8 @@ fn evaluate_rows(
                     groups.push((values[0].clone(), options, Vec::new()));
                     groups.len() - 1
                 });
-            groups[index].2.push((
-                row_index,
-                crate::types::value_str(&values[1]).unwrap().to_owned(),
-            ));
+            charge.grow(values[1].heap_capacity())?;
+            groups[index].2.push((row_index, values[1].clone()));
         }
         for (model, options, members) in groups {
             let raw = crate::types::value_str(&model)
@@ -1358,21 +1357,70 @@ fn evaluate_rows(
             });
             let batch_size = definition
                 .map(|m| {
-                    m.limits.max_batch_items.unwrap_or(64).min(64).min(
-                        (32 * 1024 * 1024usize
-                            / (m.embedding.as_ref().map(|e| e.dimensions).unwrap_or(16383) * 1024
-                                + 1))
-                            .max(1),
-                    )
+                    catalog
+                        .connections
+                        .get(&m.connection)
+                        .map(|c| ai::embedding::batch_limit(m, c))
+                        .unwrap_or(1)
+                        .min(
+                            (32 * 1024 * 1024usize
+                                / (m.embedding.as_ref().map(|e| e.dimensions).unwrap_or(16383)
+                                    * 1024
+                                    + 1))
+                                .max(1),
+                        )
                 })
                 .unwrap_or(1);
-            for chunk in members.chunks(batch_size) {
+            let vllm = definition
+                .and_then(|m| catalog.connections.get(&m.connection))
+                .is_some_and(|c| c.protocol == "vllm_embeddings");
+            if vllm {
+                let values = ai::runtime::call_many(
+                    "AI_EMBED",
+                    members
+                        .iter()
+                        .map(|(_, input)| vec![model.clone(), input.clone(), options.clone()])
+                        .collect(),
+                )?;
+                for ((row, _), value) in members.iter().zip(values) {
+                    charge.grow(value.heap_capacity())?;
+                    ready[*row][column] = Some(value);
+                }
+                continue;
+            }
+            let request_overhead = match definition {
+                Some(model) => ai::embedding::request_overhead_bound(model, Some(&options))?,
+                None => 1024,
+            };
+            let mut offset = 0;
+            while offset < members.len() {
+                let mut end = offset;
+                let mut bytes = request_overhead;
+                while end < members.len() && end - offset < batch_size {
+                    let size = match &members[end].1 {
+                        Value::Bytes(bytes) => {
+                            bytes.len().div_ceil(3).saturating_mul(4).saturating_add(64)
+                        }
+                        value => ai::embedding::json_string_bytes(
+                            crate::types::value_str(value).unwrap(),
+                        )
+                        .saturating_add(64),
+                    };
+                    if end > offset && bytes.saturating_add(size) > ai::embedding::MAX_REQUEST_BYTES
+                    {
+                        break;
+                    }
+                    bytes = bytes.saturating_add(size);
+                    end += 1;
+                }
+                let chunk = &members[offset..end];
+                offset = end;
                 if chunk.len() < 2 {
                     continue;
                 }
                 let vectors = ai::runtime::embed_batch(
                     model.clone(),
-                    chunk.iter().map(|(_, text)| text.clone()).collect(),
+                    chunk.iter().map(|(_, input)| input.clone()).collect(),
                     options.clone(),
                 )?;
                 for ((row, _), value) in chunk.iter().zip(vectors) {

@@ -233,6 +233,20 @@ fn validate_options(model: &Model, options: &Json) -> Result<(), QueryError> {
         .ok_or_else(|| error("ER_AI_INVALID_ARGUMENT", "options must be an object"))?;
     for (k, v) in map {
         match k.as_str() {
+            "type" => {
+                if model.kind != "embedding" || !matches!(v.as_str(), Some("text" | "image")) {
+                    return Err(error(
+                        "ER_AI_INVALID_ARGUMENT",
+                        "type requires an embedding input type of text or image",
+                    ));
+                }
+                if v == "image" && model.capabilities.get("image") != Some(&true) {
+                    return Err(error(
+                        "ER_AI_INVALID_ARGUMENT",
+                        "model does not support image embeddings",
+                    ));
+                }
+            }
             "temperature" | "top_p" => {
                 if model.kind != "text_generation"
                     || !model.capabilities.get(k).copied().unwrap_or(false)
@@ -567,7 +581,47 @@ fn request_body(
     let embed = model.kind == "embedding";
     let protocol = connection.protocol.as_str();
     let mut body = json!({"model":model.remote_model});
-    let path = if embed {
+    let path = if embed && protocol == "dashscope_multimodal_embeddings" {
+        let key = if options["type"] == "image" {
+            "image"
+        } else {
+            "text"
+        };
+        let contents: Vec<Json> = match input.as_array() {
+            Some(items) => items.iter().map(|v| json!({key:v})).collect(),
+            None => vec![json!({key:input})],
+        };
+        body["input"] = json!({"contents":contents});
+        body["parameters"] = json!({"enable_fusion":false});
+        let e = model.embedding.as_ref().unwrap();
+        if e.request_dimensions {
+            body["parameters"]["dimension"] = json!(e.dimensions);
+        }
+        "/services/embeddings/multimodal-embedding/multimodal-embedding"
+    } else if embed && protocol == "vllm_embeddings" {
+        let scalar = match input.as_array() {
+            Some(items) if items.len() == 1 => &items[0],
+            Some(_) => {
+                return Err(error(
+                    "ER_AI_INVALID_ARGUMENT",
+                    "vLLM requires one independent input per request",
+                ))
+            }
+            None => input,
+        };
+        let content = if options["type"] == "image" {
+            json!({"type":"image_url","image_url":{"url":scalar}})
+        } else {
+            json!({"type":"text","text":scalar})
+        };
+        body["messages"] = json!([{"role":"user","content":[content]}]);
+        body["encoding_format"] = json!("float");
+        let e = model.embedding.as_ref().unwrap();
+        if e.request_dimensions {
+            body["dimensions"] = json!(e.dimensions);
+        }
+        "/embeddings"
+    } else if embed {
         body["input"] = input.clone();
         let e = model.embedding.as_ref().unwrap();
         if e.request_dimensions {
@@ -666,6 +720,7 @@ struct Dispatch {
     auth: crate::engine::auth::AuthorizationContext,
     model_name: String,
     model: Model,
+    image_input: bool,
     connection_id: u64,
     connection_generation: u64,
     namespace: String,
@@ -708,6 +763,12 @@ impl Dispatch {
             .get(&self.model_name)
             .filter(|m| m.id == self.model.id && m.enabled)
             .ok_or_else(|| error("ER_AI_DISABLED", "model was disabled or dropped"))?;
+        if self.image_input && model.capabilities.get("image") != Some(&true) {
+            return Err(error(
+                "ER_AI_INVALID_ARGUMENT",
+                "model image capability was disabled",
+            ));
+        }
         if !state.connections.get(&model.connection).is_some_and(|c| {
             c.enabled && c.id == self.connection_id && c.generation == self.connection_generation
         }) {
@@ -1070,6 +1131,21 @@ async fn http_inner(
             e
         }
     })?;
+    if connection.protocol == "dashscope_multimodal_embeddings"
+        && body.get("code").is_some_and(|v| !v.is_null())
+    {
+        return Err(error(
+            "ER_AI_UPSTREAM_ERROR",
+            "embedding provider returned an error envelope",
+        )
+        .into());
+    }
+    let provider_request_id = provider_request_id.or_else(|| {
+        body.get("request_id")
+            .and_then(Json::as_str)
+            .filter(|s| s.len() <= 256)
+            .map(str::to_owned)
+    });
     Ok(ProviderReply {
         body,
         request_id: provider_request_id,
@@ -1190,7 +1266,12 @@ fn vectors(
             ordered[i] = Some(v);
         }
     } else {
-        let a = response["data"]
+        let data = if connection.protocol == "dashscope_multimodal_embeddings" {
+            &response["output"]["embeddings"]
+        } else {
+            &response["data"]
+        };
+        let a = data
             .as_array()
             .ok_or_else(|| error("ER_AI_INVALID_RESPONSE", "missing embedding data"))?;
         if a.len() != count {
@@ -1498,7 +1579,9 @@ pub(crate) fn call(name: &str, args: &[Value]) -> Result<Value, QueryError> {
 enum PreparedOutcome {
     Immediate(Value),
     Call(PreparedCall),
+    Batch(Vec<PreparedCall>),
 }
+#[derive(Clone)]
 struct PreparedCall {
     model: Model,
     connection: Connection,
@@ -1702,12 +1785,21 @@ fn run_call(scope: &mut CallScope, name: &str, args: &[Value]) -> Result<Value, 
     match prepare_call(scope, name, args)? {
         PreparedOutcome::Immediate(value) => Ok(value),
         PreparedOutcome::Call(call) => execute_prepared(scope, call),
+        PreparedOutcome::Batch(calls) => execute_embedding_batch(scope, calls),
     }
 }
 fn prepare_call(
     scope: &mut CallScope,
     name: &str,
     args: &[Value],
+) -> Result<PreparedOutcome, QueryError> {
+    prepare_call_inner(scope, name, args, None)
+}
+fn prepare_call_inner(
+    scope: &mut CallScope,
+    name: &str,
+    args: &[Value],
+    batch: Option<&[Value]>,
 ) -> Result<PreparedOutcome, QueryError> {
     let started = Instant::now();
     if scope.control.cancelled.load(Ordering::Acquire) {
@@ -1750,7 +1842,7 @@ fn prepare_call(
     if !model.enabled {
         return Err(error("ER_AI_DISABLED", "model is disabled"));
     }
-    if matches!(args[1], Value::Null) {
+    if batch.is_none() && matches!(args[1], Value::Null) {
         return Ok(PreparedOutcome::Immediate(Value::Null));
     }
     let connection = state
@@ -1768,7 +1860,13 @@ fn prepare_call(
     if !supplied.is_object() {
         return Err(error("ER_AI_INVALID_ARGUMENT", "options must be an object"));
     }
-    for field in ["timeout_ms", "max_retries", "retry_ambiguous", "on_error"] {
+    for field in [
+        "timeout_ms",
+        "max_retries",
+        "retry_ambiguous",
+        "on_error",
+        "type",
+    ] {
         if supplied.get(field).is_some_and(Json::is_null) {
             return Err(error(
                 "ER_AI_INVALID_ARGUMENT",
@@ -1785,7 +1883,106 @@ fn prepare_call(
             "on_error=return requires a DETAIL function",
         ));
     }
-    let (input, count) = input_json(&args[1], embed, detail, &model)?;
+    let mut input_memory = None;
+    let mut input_reserved = 0usize;
+    let (input, count) = if embed && (options["type"] == "image" || batch.is_some()) {
+        use super::embedding::EmbeddingInput;
+        let decoded;
+        let values: &[Value] = if let Some(batch) = batch {
+            batch
+        } else if let Value::Json(bytes) = &args[1] {
+            if !detail || bytes.len() > 256 * 1024 {
+                return Err(error("ER_AI_INVALID_ARGUMENT", "invalid image URL array"));
+            }
+            input_reserved = bytes.len().saturating_mul(32);
+            input_memory = Some(super::admission::Memory::reserve(input_reserved)?);
+            let json = crate::engine::json::to_serde(bytes)?;
+            let array = json.as_array().ok_or_else(|| {
+                error(
+                    "ER_AI_INVALID_ARGUMENT",
+                    "image input JSON must be a URL array",
+                )
+            })?;
+            decoded = array
+                .iter()
+                .map(|item| {
+                    item.as_str()
+                        .map(|s| Value::String(s.to_owned()))
+                        .ok_or_else(|| {
+                            error("ER_AI_INVALID_ARGUMENT", "image arrays require URL strings")
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            &decoded
+        } else {
+            std::slice::from_ref(&args[1])
+        };
+        if values.is_empty() || values.len() > super::embedding::batch_limit(&model, &connection) {
+            return Err(error(
+                "ER_AI_INVALID_ARGUMENT",
+                "embedding batch exceeds model item limit",
+            ));
+        }
+        let typed = values
+            .iter()
+            .map(|value| {
+                if options["type"] == "image" {
+                    EmbeddingInput::image(value, &model)
+                } else {
+                    let text = crate::types::value_str(value).ok_or_else(|| {
+                        error("ER_AI_INVALID_ARGUMENT", "embedding input must be text")
+                    })?;
+                    if text.is_empty()
+                        || text.len() > model.limits.max_input_bytes.unwrap_or(262144).min(262144)
+                    {
+                        return Err(error(
+                            "ER_AI_INVALID_ARGUMENT",
+                            "invalid embedding text length",
+                        ));
+                    }
+                    Ok(EmbeddingInput::Text(text))
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let encoded = typed
+            .iter()
+            .map(EmbeddingInput::encoded_bound)
+            .sum::<usize>()
+            .saturating_add(super::embedding::request_overhead_bound(
+                &model,
+                args.get(2),
+            )?);
+        if encoded > super::embedding::MAX_REQUEST_BYTES {
+            return Err(error(
+                "ER_AI_BUDGET_EXCEEDED",
+                "embedding request exceeds 8 MiB",
+            ));
+        }
+        let needed = encoded.saturating_mul(4);
+        if let Some(memory) = &mut input_memory {
+            Arc::get_mut(memory)
+                .unwrap()
+                .grow(needed.saturating_sub(input_reserved))?;
+        } else {
+            input_memory = Some(super::admission::Memory::reserve(needed)?);
+        }
+        input_reserved = needed.max(input_reserved);
+        let count = typed.len();
+        let input = if batch.is_some() || matches!(args[1], Value::Json(_)) {
+            Json::Array(typed.iter().map(EmbeddingInput::json).collect())
+        } else {
+            typed[0].json()
+        };
+        (input, count)
+    } else {
+        input_json(&args[1], embed, detail, &model)?
+    };
+    if embed && count > super::embedding::batch_limit(&model, &connection) {
+        return Err(error(
+            "ER_AI_INVALID_ARGUMENT",
+            "embedding batch exceeds model item limit",
+        ));
+    }
     let input_bytes = if let Some(s) = input.as_str() {
         s.len()
     } else {
@@ -1853,6 +2050,7 @@ fn prepare_call(
         auth: scope.auth.clone(),
         model_name: model_name.clone(),
         model: model.clone(),
+        image_input: options["type"] == "image",
         connection_id: connection.id,
         connection_generation: connection.generation,
         namespace: scope.control.namespace.clone(),
@@ -1882,7 +2080,13 @@ fn prepare_call(
     } else {
         None
     };
-    let (url, body) = request_body(&model, &connection, &input, &options)?;
+    let vllm_batch = connection.protocol == "vllm_embeddings" && count > 1;
+    let first_input = if vllm_batch {
+        &input.as_array().unwrap()[0]
+    } else {
+        &input
+    };
+    let (url, body) = request_body(&model, &connection, first_input, &options)?;
     let request_bytes = serde_json::to_vec(&body)
         .map_err(|_| error("ER_AI_INVALID_ARGUMENT", "cannot encode request"))?
         .len();
@@ -1910,7 +2114,14 @@ fn prepare_call(
     let reserved = request_bytes
         .saturating_mul(4)
         .saturating_add(response_limit.saturating_mul(3));
-    let memory = super::admission::Memory::reserve(reserved)?;
+    let memory = if let Some(mut memory) = input_memory {
+        Arc::get_mut(&mut memory)
+            .unwrap()
+            .grow(reserved.saturating_sub(input_reserved))?;
+        memory
+    } else {
+        super::admission::Memory::reserve(reserved)?
+    };
     let timeout = positive(&options, "timeout_ms", 30000, 60000)?;
     let deadline = scope.deadline.min(started + Duration::from_millis(timeout));
     use rand::RngCore;
@@ -1918,7 +2129,7 @@ fn prepare_call(
     rand::rngs::OsRng.fill_bytes(&mut id);
     let request_id = id.iter().map(|b| format!("{b:02x}")).collect::<String>();
     let envelope = json!({"ok":true,"model":model_name,"model_revision":model.model_revision,"provider_model":null,"request_id":request_id,"provider_request_id":null,"attempts":1,"cache_hit":false,"timing_ms":{"queue":null,"upstream":null,"total":null},"text":null,"output_json":null,"data":null,"finish_reason":null,"usage":{"input_tokens":null,"output_tokens":null,"total_tokens":null},"error":null});
-    Ok(PreparedOutcome::Call(PreparedCall {
+    let call = PreparedCall {
         model,
         connection,
         options,
@@ -1936,7 +2147,32 @@ fn prepare_call(
         detail,
         count,
         return_error,
-    }))
+    };
+    if vllm_batch {
+        let overhead = super::embedding::request_overhead_bound(&call.model, args.get(2))?;
+        let mut calls = Vec::with_capacity(count);
+        for item in input.as_array().unwrap() {
+            let response_limit = call.model.embedding.as_ref().unwrap().dimensions * 32 + 65536;
+            let request_bound = overhead
+                .saturating_add(super::embedding::json_string_bytes(item.as_str().unwrap()));
+            let memory = super::admission::Memory::reserve(
+                request_bound
+                    .saturating_mul(4)
+                    .saturating_add(response_limit.saturating_mul(3)),
+            )?;
+            let mut child = call.clone();
+            child.memory = memory;
+            child.body = request_body(&child.model, &child.connection, item, &child.options)?.1;
+            child.count = 1;
+            child.response_limit = response_limit;
+            child.dispatch.sent = Arc::new(AtomicU64::new(0));
+            child.envelope["request_id"] = json!(format!("{}-{}", request_id, calls.len()));
+            calls.push(child);
+        }
+        Ok(PreparedOutcome::Batch(calls))
+    } else {
+        Ok(PreparedOutcome::Call(call))
+    }
 }
 /// Network waits never consume the ordinary SQL worker pool.
 pub(crate) fn spawn_coordinator<F, T>(work: F) -> crate::util::blocking_pool::BlockingHandle<T>
@@ -1981,7 +2217,7 @@ pub(crate) fn validate_defaults(model: &Model) -> Result<(), QueryError> {
 /// Conditional expressions retain the ordinary evaluator and its branch masks.
 pub(crate) fn embed_batch(
     model: Value,
-    texts: Vec<String>,
+    inputs: Vec<Value>,
     options: Value,
 ) -> Result<Vec<Value>, QueryError> {
     let options_json = as_json(&options)?;
@@ -1996,15 +2232,26 @@ pub(crate) fn embed_batch(
         .as_object_mut()
         .ok_or_else(|| error("ER_AI_INVALID_ARGUMENT", "options must be an object"))?
         .insert("on_error".into(), json!("error"));
-    let input = Value::Json(crate::engine::json::from_serde(&json!(texts)));
-    let detail = call(
-        "AI_EMBED_DETAIL",
-        &[
-            model,
-            input,
-            Value::Json(crate::engine::json::from_serde(&options_json)),
-        ],
-    )?;
+    let detail = CALLS.with(|slot| {
+        let mut state = slot.borrow_mut();
+        let scope = state
+            .as_mut()
+            .ok_or_else(|| error("ER_AI_UNSUPPORTED_CONTEXT", "missing external scope"))?;
+        match prepare_call_inner(
+            scope,
+            "AI_EMBED_DETAIL",
+            &[
+                model,
+                Value::Null,
+                Value::Json(crate::engine::json::from_serde(&options_json)),
+            ],
+            Some(&inputs),
+        )? {
+            PreparedOutcome::Immediate(value) => Ok(value),
+            PreparedOutcome::Call(call) => execute_prepared(scope, call),
+            PreparedOutcome::Batch(calls) => execute_embedding_batch(scope, calls),
+        }
+    })?;
     let Value::Json(bytes) = detail else {
         return Err(error(
             "ER_AI_INVALID_RESPONSE",
@@ -2046,6 +2293,100 @@ mod codec_tests {
     }
     fn model(embedding: bool) -> Model {
         serde_json::from_value(if embedding{json!({"kind":"embedding","remote_model":"embed","model_revision":"v1","embedding":{"dimensions":3,"request_dimensions":true}})}else{json!({"kind":"text_generation","remote_model":"chat","model_revision":"v1","capabilities":{"temperature":true,"json_schema":true,"messages":true},"limits":{"max_output_tokens":256}})}).unwrap()
+    }
+    #[test]
+    fn ai_embedding_request_budget_covers_merged_and_escaped_options() {
+        let mut m = model(true);
+        m.defaults = json!({"provider_options":{"parameters":{"instruct":"\u{0001}".repeat(128)}}})
+            .as_object()
+            .unwrap()
+            .clone();
+        let supplied =
+            json!({"type":"image","provider_options":{"parameters":{"extra":vec![false;2000]}}});
+        let inputs = json!([
+            "https://images.invalid/a.png",
+            "https://images.invalid/b.png"
+        ]);
+        for value in [
+            Value::Json(crate::engine::json::from_serde(&supplied)),
+            Value::String(supplied.to_string()),
+        ] {
+            let mut options = Json::Object(m.defaults.clone());
+            merge_options(&mut options, as_json(&value).unwrap());
+            let (_, body) = request_body(
+                &m,
+                &connection("dashscope_multimodal_embeddings"),
+                &inputs,
+                &options,
+            )
+            .unwrap();
+            let bound = super::super::embedding::request_overhead_bound(&m, Some(&value)).unwrap()
+                + inputs
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|input| {
+                        super::super::embedding::json_string_bytes(input.as_str().unwrap()) + 32
+                    })
+                    .sum::<usize>();
+            assert!(serde_json::to_vec(&body).unwrap().len() <= bound);
+        }
+    }
+    #[test]
+    fn ai_image_dashscope_vectors_reject_invalid_indexes_dimensions_and_floats() {
+        let c = connection("dashscope_multimodal_embeddings");
+        let m = model(true);
+        let valid = json!({"output":{"embeddings":[{"index":1,"embedding":[1,2,3]},{"index":0,"embedding":[4,5,6]}]}});
+        assert_eq!(
+            vectors(&valid, &c, &m, 2).unwrap(),
+            vec![vec![4., 5., 6.], vec![1., 2., 3.]]
+        );
+        for data in [
+            json!([{"index":0,"embedding":[1,2,3]},{"index":0,"embedding":[1,2,3]}]),
+            json!([{"index":2,"embedding":[1,2,3]}]),
+            json!([{"index":0,"embedding":[1,2]}]),
+            json!([{"index":0,"embedding":[1e39,2,3]}]),
+            json!([{"index":0,"embedding":[null,2,3]}]),
+            json!([]),
+        ] {
+            let count = if data.as_array().unwrap().len() == 2 {
+                2
+            } else {
+                1
+            };
+            assert!(vectors(&json!({"output":{"embeddings":data}}), &c, &m, count).is_err());
+        }
+    }
+    #[test]
+    fn ai_image_embedding_options_and_protocol_contracts() {
+        let mut m = model(true);
+        m.capabilities.insert("image".into(), true);
+        let options = json!({"type":"image"});
+        validate_options(&m, &options).unwrap();
+        for (protocol, field) in [
+            ("dashscope_multimodal_embeddings", "input"),
+            ("vllm_embeddings", "messages"),
+        ] {
+            let (_, body) = request_body(
+                &m,
+                &connection(protocol),
+                &json!("https://images.invalid/cat.png"),
+                &options,
+            )
+            .unwrap();
+            assert!(body[field].is_object() || body[field].is_array());
+            if protocol == "dashscope_multimodal_embeddings" {
+                assert_eq!(
+                    body["input"]["contents"][0]["image"],
+                    "https://images.invalid/cat.png"
+                );
+                assert_eq!(body["parameters"]["enable_fusion"], false);
+                assert_eq!(body["parameters"]["dimension"], 3);
+            } else {
+                assert_eq!(body["messages"][0]["content"][0]["type"], "image_url");
+                assert!(body.get("input").is_none());
+            }
+        }
     }
     #[test]
     fn ai_adapters_map_budget_fields_without_overwriting_base_path() {
@@ -2652,8 +2993,18 @@ fn call_many_in_scope(
         .iter()
         .map(|args| prepare_call(scope, name, args))
         .collect::<Result<Vec<_>, _>>()?;
-    if calls.iter().any(|outcome|matches!(outcome,PreparedOutcome::Call(call) if call.options.get("max_retries").and_then(Json::as_u64).unwrap_or(0)>0)) {
-        return calls.into_iter().map(|outcome|match outcome{PreparedOutcome::Immediate(value)=>Ok(value),PreparedOutcome::Call(call)=>execute_prepared(scope,call)}).collect();
+    execute_many_prepared(scope, calls)
+}
+fn execute_many_prepared(
+    scope: &mut CallScope,
+    calls: Vec<PreparedOutcome>,
+) -> Result<Vec<Value>, QueryError> {
+    if calls.iter().any(|outcome| matches!(outcome, PreparedOutcome::Batch(_)) || matches!(outcome,PreparedOutcome::Call(call) if call.options.get("max_retries").and_then(Json::as_u64).unwrap_or(0)>0)) {
+        return calls.into_iter().map(|outcome|match outcome {
+            PreparedOutcome::Immediate(value)=>Ok(value),
+            PreparedOutcome::Call(call)=>execute_prepared(scope,call),
+            PreparedOutcome::Batch(calls)=>execute_embedding_batch(scope, calls),
+        }).collect();
     }
     let (wake_tx, wake_rx) = std::sync::mpsc::channel();
     let mut values = vec![None; calls.len()];
@@ -2661,6 +3012,7 @@ fn call_many_in_scope(
     for (index, outcome) in calls.into_iter().enumerate() {
         match outcome {
             PreparedOutcome::Immediate(value) => values[index] = Some(value),
+            PreparedOutcome::Batch(_) => unreachable!("batch groups handled above"),
             PreparedOutcome::Call(call) => {
                 count_attempt(scope, &call.dispatch)?;
                 match start_pending(&call, Some(wake_tx.clone())) {
@@ -2700,7 +3052,80 @@ fn call_many_in_scope(
     Ok(values.into_iter().map(Option::unwrap).collect())
 }
 
+fn execute_embedding_batch(
+    scope: &mut CallScope,
+    calls: Vec<PreparedCall>,
+) -> Result<Value, QueryError> {
+    let started = calls[0].started;
+    let count = calls.len();
+    let memory = super::admission::Memory::reserve(
+        count
+            .saturating_mul(calls[0].model.embedding.as_ref().unwrap().dimensions)
+            .saturating_mul(512)
+            .saturating_add(65536),
+    )?;
+    let values = execute_many_prepared(
+        scope,
+        calls.into_iter().map(PreparedOutcome::Call).collect(),
+    )?;
+    scope.outputs.push(memory);
+    let mut envelope = Json::Null;
+    let mut data = Vec::with_capacity(count);
+    let mut attempts = 0u64;
+    let mut usage = [Some(0u64); 3];
+    let mut first_error = None;
+    for value in values {
+        let Value::Json(bytes) = value else {
+            return Err(error("ER_AI_INVALID_RESPONSE", "invalid batch result"));
+        };
+        let mut item = crate::engine::json::to_serde(&bytes)?;
+        attempts = attempts.saturating_add(item["attempts"].as_u64().unwrap_or(0));
+        for (sum, field) in usage
+            .iter_mut()
+            .zip(["input_tokens", "output_tokens", "total_tokens"])
+        {
+            *sum = sum.and_then(|s| item["usage"][field].as_u64().and_then(|n| s.checked_add(n)));
+        }
+        if item["ok"] == false {
+            if first_error.is_none() {
+                first_error = Some(item.clone());
+            }
+        } else {
+            let mut vector = item["data"]
+                .as_array_mut()
+                .and_then(|a| a.pop())
+                .ok_or_else(|| error("ER_AI_INVALID_RESPONSE", "missing batch vector"))?;
+            vector["index"] = json!(data.len());
+            data.push(vector);
+        }
+        if envelope.is_null() {
+            envelope = item;
+        }
+    }
+    if let Some(failed) = first_error {
+        envelope = failed;
+        envelope["data"] = Json::Null;
+    } else {
+        envelope["data"] = Json::Array(data);
+    }
+    envelope["provider_request_id"] = Json::Null;
+    envelope["attempts"] = json!(attempts);
+    for (sum, field) in usage
+        .into_iter()
+        .zip(["input_tokens", "output_tokens", "total_tokens"])
+    {
+        envelope["usage"][field] = json!(sum);
+    }
+    envelope["timing_ms"]["queue"] = Json::Null;
+    envelope["timing_ms"]["upstream"] = Json::Null;
+    envelope["timing_ms"]["total"] = json!(started.elapsed().as_millis());
+    Ok(Value::Json(crate::engine::json::from_serde(&envelope)))
+}
+
 pub(super) fn reserved_provider_path(path: &str) -> bool {
+    if path == "parameters" {
+        return true;
+    }
     path.split('.').any(|p| {
         matches!(
             p,
@@ -2739,6 +3164,11 @@ pub(super) fn reserved_provider_path(path: &str) -> bool {
                 | "max_retries"
                 | "retry_ambiguous"
                 | "on_error"
+                | "type"
+                | "contents"
+                | "image"
+                | "dimension"
+                | "enable_fusion"
                 | "dimensions"
                 | "normalize"
                 | "datatype"
