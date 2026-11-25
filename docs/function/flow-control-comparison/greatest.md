@@ -21,6 +21,10 @@ GREATEST(value1, value2 [, ...])
 
 Returns the greatest candidate using the common comparison domain and collation. Any SQL NULL candidate returns NULL; the result type is derived from the candidate domains.
 
+For string candidates that compare equal under the effective collation,
+GREATEST retains the last equal operand. With `utf8mb4_0900_ai_ci`,
+`GREATEST('a','A')` therefore returns `A`; bytewise equality is not required.
+
 ## Examples
 
 ```sql

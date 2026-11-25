@@ -7,7 +7,7 @@ mydb is a single-node general-purpose relational database designed for HTAP
 retrieval and MySQL-compatible access. Transactional reads and writes and
 analytical queries share the same engine and business data.
 
-**Release maturity.** MyDB 1.0.1 is a public-preview release intended for
+**Release maturity.** MyDB 1.0.2 is a public-preview release intended for
 feature validation, compatibility testing, and evaluation in controlled
 environments. It is not yet a production-grade MySQL replacement in every
 dimension: on-disk formats are not guaranteed to be backward compatible, and
@@ -17,6 +17,9 @@ scope. This page is the canonical statement of release maturity; other
 documents link here rather than restating it.
 
 ## 1. Capability Map
+
+This page describes the current source checkout. See [current source changes](current-source.md)
+for additions after the 1.0.2 release and the required fresh-directory migration.
 
 | Area | Current implementation |
 | --- | --- |
@@ -47,7 +50,7 @@ mydb has a single native transactional storage engine. `ENGINE=InnoDB` and `ENGI
 
 - INSERT supports VALUES, SET, INSERT…SELECT, multiple rows, `IGNORE`, the `DELAYED` compatibility hint, `ON DUPLICATE KEY UPDATE`, and MySQL 8.0.19 row aliases.
 - REPLACE implements the MySQL semantics of "delete all conflicting rows, then insert", covering multiple unique keys, triggers, foreign-key cascades, and auto-increment.
-- UPDATE/DELETE support single-table and multi-table JOIN forms, `ORDER BY`, `LIMIT`, `PARTITION`, CTE-driven sources, and `IGNORE`. The non-preserved side of a LEFT JOIN can be the target, but virtual rows produced by NULL padding are never written.
+- UPDATE/DELETE support single-table and multi-table JOIN forms, `ORDER BY`, `LIMIT`, `PARTITION`, CTE-driven sources, and `IGNORE`. INNER/LEFT/RIGHT chains retain ON-clause scope; real rows on a non-preserved side can be targets, while NULL-padded virtual rows are never written. Uncorrelated derived queries, including grouping and set operations, are read-only sources.
 - `LOAD DATA [LOCAL] INFILE` supports character sets, field/line formats, user variables, SET expressions, sql_mode conversions, and progress; `LOAD XML` supports attributes, nested elements, and `<field name=...>`.
 - `SELECT ... INTO @var`, `SELECT ... INTO OUTFILE|DUMPFILE`, and `DO expr` are available; `LOAD_FILE()` and file exports are uniformly governed by the FILE privilege, `secure_file_priv`, file size limits, and the unified memory governor.
 
@@ -82,6 +85,11 @@ Character sets, collations, PAD SPACE/NO PAD, binary strings, and the `BINARY` a
 
 ### 3.2 Indexes
 
+[Partial indexes](partial-indexes.md) add a `WHERE` membership predicate to
+ordinary/unique B-tree, FULLTEXT, SPATIAL, HNSW, and IVF definitions. Primary
+keys and foreign-key supporting indexes must remain complete. Query use needs
+a conservative proof that the query implies the predicate; hints cannot bypass it.
+
 | Index | Capabilities |
 | --- | --- |
 | B-tree | Primary key, unique, composite, covering with INCLUDE, prefix, descending declarations, invisible, functional/expression indexes |
@@ -104,7 +112,7 @@ Character sets, collations, PAD SPACE/NO PAD, binary strings, and the `BINARY` a
 
 - The CBO uses table/column statistics, histograms, selectivities, function costs, a cache model, a spill model, and subquery costs to choose access paths, join orders, and physical operators.
 - Scan paths include sequential scans, primary/secondary index lookups and ranges, covering/index-only scans, index merge, FULLTEXT, SPATIAL, Zone Map, and vector indexes.
-- Zone Map v8 uses 16 KiB buffer-pool pages (page version 3), typed endpoints, selective membership summaries, physical full-page images and WAL page deltas, and background partition-level rebuilds. When data is missing, corrupted, type-incompatible, untrusted, or the memory budget is insufficient, it deterministically falls back to a full heap scan; the summaries are never allowed to produce false negatives.
+- Zone Map v8 uses 16 KiB buffer-pool pages (page version 3), typed endpoints, selective membership summaries, physical full-page images and WAL page deltas, and background partition-level rebuilds. Missing, type-incompatible, untrusted, or inadmissible optional summaries cause conservative heap scanning; summaries cannot exclude visible qualifying rows, including a transaction's own changes. Incompatible physical formats and storage failures retain their admission/recovery checks. See [Zone Maps](zone-maps.md).
 - Joins include Hash Join, Grace Hash Join, Nested Loop, Index Nested Loop, semi/anti, and outer joins, with adaptive selection where appropriate.
 - Sort, Top-N, Hash Aggregate, Hash Join, DISTINCT, window, and CTE operators support budget-bounded in-memory execution with disk spill.
 - `MYDB_VECTORIZED=off|on|auto` selects scalar or typed/vector kernels inside the same batch operator graph; `off` does not force the legacy row executor. The row-wise evaluator remains the semantic oracle, and expressions unsupported by compiled kernels use the scalar lane before consuming input.
@@ -119,7 +127,7 @@ Character sets, collations, PAD SPACE/NO PAD, binary strings, and the `BINARY` a
 - WAL, group commit, checkpoints, dirty page flushing, redo crash recovery, segmented undo, SAVEPOINT, row locks, and deadlock detection form the transaction durability pipeline.
 - SERIALIZABLE uses table-level shared locks to provide range no-insert semantics; RR intentionally uses MVCC snapshots and heap-row/unique-key locks instead of InnoDB gap/next-key locks to avoid range-lock contention, insert blocking, and the associated deadlock patterns. See [MVCC and locking](mvcc-and-locking.md#snapshot-lifecycle-and-isolation-levels) for the design and semantic boundaries.
 - XA supports START/END/PREPARE/COMMIT/ROLLBACK/RECOVER with crash recovery; JOIN/RESUME/SUSPEND are not supported.
-- Persistent user base tables support `FOR SYSTEM_TIME AS OF <expr>`. Each table reference can bind an independent point in time; JOIN, subquery, CTE, UNION, view definitions, and prepared parameters all work. The commit timeline is recovered from WAL v22 and `commit-ledger.v1`, and old B-tree keys can be accelerated by `history-index.v1`; historical index-only paths and current-state Zone Map/HNSW/IVF/FULLTEXT/SPATIAL paths are never misused for historical results. The history window is controlled by `mydb_undo_retention_ms`, default `0`; targets crossing a structural epoch are rejected explicitly.
+- Persistent user base tables support `FOR SYSTEM_TIME AS OF <expr>`. Each table reference can bind an independent point in time; JOIN, subquery, CTE, UNION, view definitions, and prepared parameters all work. The commit timeline is recovered from WAL and `commit-ledger.v1`, and old B-tree keys can be accelerated by `history-index.v1`; historical index-only paths and current-state Zone Map/HNSW/IVF/FULLTEXT/SPATIAL paths are never misused for historical results. The history window is controlled by `mydb_undo_retention_ms`, default `0`; targets crossing a structural epoch are rejected explicitly. See [time travel](time-travel.md) and the [current format registry](storage-format-versions.md).
 - Heap, B-tree, LOB overflow, vector page, and temporary files each have their own file format; development builds keep no backward-compatibility paths for old formats.
 - `MYDB_MEMORY_TARGET` is an advisory working-set target for caches and spill watermarks. Ordinary governed SQL admission has a separate hard boundary of 80% of effective OS/cgroup memory, with the next 10% reserved for rollback/compensation. Long-lived or bulk allocations such as buffer raw pages, storage scratch, undo, SQL caches, and the executor go through unified reservations billed by allocation capacity; optional caches can be skipped or evicted, spillable operators spill at their watermarks, and unreclaimable admission failures return 1037/HY001.
 

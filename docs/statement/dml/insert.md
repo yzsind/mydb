@@ -44,7 +44,15 @@ Requires INSERT on target, source SELECT for INSERT SELECT or expression subquer
 
 The alias after the table names the target. `VALUES (...) AS incoming(c1,c2)` names the incoming row and its columns for conflict updates; its column-alias count must match. Omitted columns use defaults; an empty VALUES row requests defaults for all columns. Explicit generated-column values are restricted to DEFAULT.
 
-ODKU reports 1 for a new row, 2 for a changed conflict row and 0 for a no-op (CLIENT_FOUND_ROWS makes that no-op 1). Auto-increment/last-insert state and warnings remain separate. Prefer an incoming-row alias to legacy VALUES(column):
+ODKU reports 1 for a new row, 2 for a changed conflict row and 0 for a no-op (CLIENT_FOUND_ROWS makes that no-op 1). Auto-increment/last-insert state and warnings remain separate.
+
+Mixed explicit/generated AUTO_INCREMENT rows allocate generated values as
+needed rather than reserving MySQL-style unused values for the entire batch.
+The first generated ID is recorded for LAST_INSERT_ID; sequence gaps remain
+possible after failures or rollback. Exhausting the declared integer domain
+returns an error, rather than wrapping to a negative or duplicate value.
+
+Prefer an incoming-row alias to legacy VALUES(column):
 
 ```sql
 INSERT INTO counter(id,value) VALUES(1,5) AS incoming

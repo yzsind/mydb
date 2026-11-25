@@ -20,6 +20,10 @@ TO_DAYS(temporal_value)
 
 Returns an integer extracted or calculated from the temporal input. SQL NULL input returns NULL; invalid temporal values produce NULL and the applicable SQL-mode diagnostic.
 
+This is a calendar day number, not a Unix epoch day count. FROM_DAYS maps
+numbers at or below 365 to the zero date, so the two functions are not inverse
+operations for year-0000 dates.
+
 ## Examples
 
 ```sql

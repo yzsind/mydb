@@ -78,7 +78,9 @@ mod rollup_preaggregate;
 
 mod compact_sort_window;
 #[cfg(test)]
-pub(crate) use compact_sort_window::{RESIDENT_WINDOW_HITS, RESIDENT_WINDOW_REPLAYS};
+pub(crate) use compact_sort_window::{
+    RESIDENT_WINDOW_HITS, RESIDENT_WINDOW_REPLAYS, RESIDENT_WINDOW_REPLAYS_WITH_PREFIX,
+};
 mod compact_window;
 mod scan_batch;
 mod scan_workers;

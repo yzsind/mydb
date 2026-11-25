@@ -23,6 +23,10 @@ B-tree semantics. An explicit column SRID is required
 for spatial range access. `CREATE SPATIAL INDEX` and `ALTER TABLE ... ADD SPATIAL INDEX`
 both use the existing index DDL lifecycle; unsupported online lock modes return errors.
 
+SPATIAL indexes support [partial membership](partial-indexes.md) through a
+trailing `WHERE` predicate. The query must imply that predicate before the
+optimizer uses the tree; spatial candidate and residual checks still apply.
+
 ## Queries and transactions
 
 The optimizer recognizes supported MBR and exact spatial predicates over an indexed

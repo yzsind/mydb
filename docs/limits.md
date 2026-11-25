@@ -21,6 +21,7 @@ Limits fall into three classes:
 | Max rows per table | No explicit row-count cap; bounded by physical heap capacity and row layout | Derived |
 | Columns per table | **1017** (`ER_TOO_MANY_FIELDS` 1117) | Fixed |
 | Secondary indexes per table | **64**, plus the primary key (`ER_TOO_MANY_KEYS` 1069) | Fixed |
+| Partial indexes | Count toward the same index limit; primary keys and foreign-key supporting indexes must be complete | Fixed |
 | Columns per index (also composite PK/UNIQUE) | **16** (`ER_TOO_MANY_KEY_PARTS` 1070) | Fixed |
 | B-tree index key width | **3072 bytes** of MySQL DDL width accounting (`ER_TOO_LONG_KEY` 1071); see exceptions below | Fixed |
 | Partitions per table | **8192 physical leaves**; subpartitions replace their logical parents in this count (`ER_TOO_MANY_PARTITIONS_ERROR` 1499) | Fixed |

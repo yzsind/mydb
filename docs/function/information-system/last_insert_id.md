@@ -35,6 +35,7 @@ Result: returns the most recently recorded auto-increment value for the current 
 - Argument-count errors and invalid argument types are SQL errors; consult the function-specific rules above.
 
 - Multirow inserts record the first generated ID, not necessarily the last row's ID. The explicit setter changes session state. A manual rollback does not restore that state; do not infer sequence-gap or failed-insert behavior from it. Use explicit AS aliases for the result column when needed.
+- Stored procedures can update the caller-visible value; stored functions and triggers restore the caller's value when they return. An unrelated statement that generates no ID does not reset a previously recorded ID.
 
 ## Related Functions
 

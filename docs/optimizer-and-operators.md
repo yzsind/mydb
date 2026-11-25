@@ -83,6 +83,18 @@ Covering access still respects heap MVCC visibility. A partition's local
 index order is not automatically a global order; cross-partition results can
 require a Sort.
 
+### Partial Index Eligibility
+
+A [partial index](partial-indexes.md) is an access candidate only when the query
+implies its `WHERE` predicate under the index's captured expression semantics.
+Proofs cover supported matching/conjunction/disjunction, range, IN and non-NULL
+forms; other shapes retain a complete access path. This applies to B-tree and
+special indexes, including filtered vector retrieval. FORCE INDEX cannot make
+an inapplicable index complete. Parameter-dependent eligibility is checked with
+the current execution's bindings rather than reused from a prior value.
+
+See [automatic Zone Maps](zone-maps.md) for pruning and transaction visibility.
+
 ### Safety Boundaries of Special Access Paths
 
 - Zone Maps, spatial indexes, full-text pre-filtering, and runtime Bloom

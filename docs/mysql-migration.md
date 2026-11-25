@@ -60,6 +60,11 @@ The filename/position are illustrative; never use them or the first available lo
 as a substitute for the snapshot boundary. GTID auto-position also requires the
 correct imported executed state, not just SOURCE_AUTO_POSITION=1. See
 [receiver configuration](statement/replication/change-replication-source.md).
+Configuring the channel enables `mydb_replica_read_only` by default, before
+START; finish local snapshot loading before this step. This guard also affects
+root. Treat its saved source password as plaintext credential material: keep
+channel paths and backup copies private to the server account, as described in
+the [security guide](security-deployment.md).
 Resume source writes only after its subsequent history is retained and the
 snapshot boundary is fixed. Inspect both receiver and applier errors. Replication
 SQL success alone does not mean data is caught up.

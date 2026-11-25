@@ -16,6 +16,12 @@ Check physical compatibility before reusing a data directory, restoring a
 backup, or connecting native replication nodes. The product version alone does
 not establish format compatibility.
 
+The current source uses catalog format 75 for partial-index definitions and
+transactional FULLTEXT corpus state. Released 1.0.2 uses catalog format 72 even
+though both builds report the same product version. Follow
+[current source changes](current-source.md) and [changing versions](changing-versions.md)
+before moving data between them.
+
 ## Data Directory Layout
 
 The following are the canonical paths; files are created on demand, and not every data directory contains every item.

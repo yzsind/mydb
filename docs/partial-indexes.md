@@ -3,18 +3,35 @@
 A partial index stores entries only for rows whose `WHERE` predicate evaluates to SQL TRUE. FALSE and NULL do not qualify.
 
 ```sql
-CREATE INDEX active_email ON users(email) WHERE active = 1;
-CREATE UNIQUE INDEX active_username ON users(username) WHERE active = 1;
+DROP TABLE IF EXISTS test.partial_users;
+CREATE TABLE test.partial_users (
+    id INT PRIMARY KEY,
+    email VARCHAR(120),
+    username VARCHAR(40),
+    active INT
+);
+INSERT INTO test.partial_users VALUES
+    (1, 'a@example.com', 'ada', 1),
+    (2, 'old@example.com', 'ada', 0),
+    (3, 'pending@example.com', 'ada', NULL);
 
-CREATE TABLE tasks (
+CREATE INDEX active_email ON test.partial_users(email) WHERE active = 1;
+CREATE UNIQUE INDEX active_username ON test.partial_users(username) WHERE active = 1;
+
+DROP TABLE IF EXISTS test.partial_tasks;
+CREATE TABLE test.partial_tasks (
     id BIGINT PRIMARY KEY,
     owner_id BIGINT,
     active INT,
     INDEX active_owner(owner_id) WHERE active = 1
 );
 
-ALTER TABLE tasks ADD INDEX active_id(id) WHERE active = 1;
+ALTER TABLE test.partial_tasks ADD INDEX active_id(id) WHERE active = 1;
 ```
+
+All three users may have the same username because only row 1 qualifies.
+Changing row 2 or 3 to `active=1` while row 1 is active returns duplicate-key
+error 1062; the rejected statement leaves membership and table rows unchanged.
 
 Put `WHERE` after the other options of the individual index definition. Parentheses are optional. A comma outside the predicate's parentheses starts the next index or ALTER action.
 
@@ -36,10 +53,10 @@ The optimizer may use a partial index only when the query guarantees its predica
 
 ```sql
 -- Eligible for an index WHERE active = 1:
-SELECT email FROM users WHERE active = 1 AND email = 'a@example.com';
+SELECT email FROM test.partial_users WHERE active = 1 AND email = 'a@example.com';
 
 -- Requires a complete access path:
-SELECT email FROM users WHERE email = 'a@example.com';
+SELECT email FROM test.partial_users WHERE email = 'a@example.com';
 ```
 
 `FORCE INDEX` cannot override the membership requirement. Forcing only an inapplicable partial index returns an explicit error. Parameter-dependent access paths are planned again with the current values; prepared statement semantic templates remain reusable.
@@ -48,4 +65,8 @@ FULLTEXT scoring uses the whole visible table as its corpus. Document count, tot
 
 ## Storage format
 
-Partial-index metadata uses development catalog format 75. Earlier data directories are rejected; use a fresh data directory or rebuild the data. See [storage format versions](storage-format-versions.md).
+This checkout uses catalog format 75, including partial-index predicates and
+transactional FULLTEXT metadata. Released 1.0.2 uses format 72; use a fresh data
+directory and logical transfer when moving between them. See
+[current source changes](current-source.md), [changing versions](changing-versions.md),
+and [storage format versions](storage-format-versions.md).

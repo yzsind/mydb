@@ -18,7 +18,7 @@ For teams building business applications and AI agents, this means fewer data
 copies to synchronize, less application code to connect retrieval with business
 data, and more database work expressed through SQL.
 
-MyDB 1.0.1 is a public-preview release intended for feature validation and
+MyDB 1.0.2 is a public-preview release intended for feature validation and
 controlled-environment evaluation. The [Feature Overview](feature-overview.md)
 and [MySQL Compatibility](mysql80-compatibility.md) describe supported behavior,
 release maturity, and detailed boundaries.
@@ -258,6 +258,7 @@ Server 8.0.46 comparison baseline:
 | TABLESAMPLE with row/page and repeatable sampling | Exploring and checking data through explicit sampling |
 | Sequences with nextval / currval / lastval / setval | Allocating identifiers independently of a table's AUTO_INCREMENT |
 | B-tree INCLUDE columns | Expressing covering columns separately from search keys |
+| [Partial indexes](partial-indexes.md) | Indexing an eligible subset and enforcing uniqueness only within that membership |
 | TIMESTAMP through year 9999 | Representing long-lived validity periods with timezone-aware timestamps |
 | SQL ROWID | Locating heap rows directly in suitable workflows; physical addresses can be reused |
 | CREATE OR REPLACE procedures and functions | Replacing parameters, return types, and bodies while retaining routine grants; invalid replacements preserve the existing definition |

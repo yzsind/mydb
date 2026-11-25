@@ -500,6 +500,13 @@ Ordinary arithmetic, bit operations, comparisons, `LIKE`, and regex operations u
 
 ### 13.3 Types and Warnings
 
+Conditional functions and CASE combine branch types before choosing a result.
+For example, an integer branch selected from an integer/DECIMAL combination
+retains the common DECIMAL scale and can display as `128.0`. Only the selected
+result branch executes; type derivation does not imply executing every branch.
+Hex/bit literals retain their numeric-context identity through conditional
+expressions, whereas explicitly binary strings retain byte-string semantics.
+
 Expressions derive MySQL column definition metadata at binding time, including type, length,
 decimals, unsigned, charset/collation, and nullability. When a result is empty, a prepared
 parameter has not yet produced a concrete value, or a constant has been folded, the type is

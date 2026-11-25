@@ -11,4 +11,8 @@
 
 For column types, see [Data Types](../../data-types.md). Triggers, routines, and events are covered in [Stored Programs](../programmatic/README.md).
 
+Index definitions support [partial membership](../../partial-indexes.md) with a
+trailing WHERE predicate. The [Zone Maps guide](../../zone-maps.md) describes
+automatic block pruning independently of manual indexes.
+
 Policy objects are in [Row Security](../security/README.md); AI objects are in [Integration](../integration/README.md). TABLESPACE pages describe recognition followed by rejection, not storage isolation. Check [privileges and implicit commits](../execution-contracts.md) before grouping DDL with user writes; online DDL can still wait at publication barriers.

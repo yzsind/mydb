@@ -235,10 +235,11 @@ fn pagination_resident_sort_window_preserves_typed_keys_and_selection() {
     use std::sync::atomic::Ordering;
     let (_dir, engine) = fixture();
     engine.execute("CREATE TABLE t(id INT PRIMARY KEY,k INT NULL,s VARCHAR(32) COLLATE utf8mb4_0900_ai_ci,d DECIMAL(12,2),stamp DATETIME,f FLOAT NULL,INDEX ki(k,id),INDEX si(s,id),INDEX di(d,id),INDEX ti(stamp,id),INDEX fi(f,id))").unwrap();
+    // Every page goal remains above the 10000-row Top-N boundary.
     insert_fixture_rows(
         &engine,
         "test.t",
-        (0..24000).map(|id| {
+        (0..16384).map(|id| {
             vec![
                 Value::Int(id),
                 if id % 17 == 0 {
@@ -274,7 +275,7 @@ fn pagination_resident_sort_window_preserves_typed_keys_and_selection() {
         // Each order has an id tie-breaker. One full legacy sort supplies the
         // exact slices for all four independent resident-window executions.
         let sorted = with_sort_key_encode(false, || query_rows(&engine, &base));
-        for offset in [12000, 18000, 23995, 30000] {
+        for offset in [10000, 12000, 16379, 20000] {
             let sql = format!("{base} LIMIT 17 OFFSET {offset}");
             let start = offset.min(sorted.len());
             let expected = &sorted[start..(start + 17).min(sorted.len())];
@@ -295,13 +296,17 @@ fn pagination_resident_sort_window_preserves_typed_keys_and_selection() {
 
 #[test]
 fn pagination_resident_window_replays_consumed_batches_on_quota_miss() {
-    use crate::engine::executor::select::vec_bridge::RESIDENT_WINDOW_REPLAYS;
+    use crate::engine::executor::select::vec_bridge::{
+        RESIDENT_WINDOW_REPLAYS, RESIDENT_WINDOW_REPLAYS_WITH_PREFIX,
+    };
     use crate::engine::executor::sort::key_encode::with_sort_key_encode;
     use std::sync::atomic::Ordering;
     let (_dir, engine) = fixture();
     engine
         .execute("CREATE TABLE t(id INT PRIMARY KEY,k INT,INDEX ki(k,id))")
         .unwrap();
+    // Retain the original quota: the spiller's fixed buffer must also fit.
+    // The prefix counter rules out an immediate no-input fallback.
     insert_fixture_rows(
         &engine,
         "test.t",
@@ -313,10 +318,15 @@ fn pagination_resident_window_replays_consumed_batches_on_quota_miss() {
             format!("SELECT id,k FROM t FORCE INDEX(ki) ORDER BY {order} LIMIT 19 OFFSET 54000");
         let expected = with_sort_key_encode(false, || query_rows(&engine, &sql));
         let before = RESIDENT_WINDOW_REPLAYS.load(Ordering::Relaxed);
+        let prefix_before = RESIDENT_WINDOW_REPLAYS_WITH_PREFIX.load(Ordering::Relaxed);
         let budget = Arc::new(MemBudget::new(4 * 1024 * 1024));
         let actual = with_query_budget(budget.clone(), || query_rows(&engine, &sql));
         assert_eq!(actual, expected, "{sql}");
         assert!(RESIDENT_WINDOW_REPLAYS.load(Ordering::Relaxed) > before);
+        assert!(
+            RESIDENT_WINDOW_REPLAYS_WITH_PREFIX.load(Ordering::Relaxed) > prefix_before,
+            "quota miss must replay batches already consumed from the index"
+        );
         assert_eq!(budget.used(), 0);
         // External merge admits a bounded spill buffer above its soft query
         // watermark. Retained input must not turn that into unbounded growth.

@@ -23,6 +23,7 @@ Saves a query definition and creates a logical view.
 - When the view is queried, execution follows SQL SECURITY and the privileges on the underlying objects; the reference chain participates in planning, locking, and dependency resolution.
 - ALGORITHM=TEMPTABLE forces materialization; MERGE/UNDEFINED follow the supported view-planning rules. LOCAL/CASCADED CHECK OPTION is enforced on supported updatable direct-column views (failure 1369); non-updatable or computed-projection shapes that cannot enforce it return 1368.
 - Conflicts between OR REPLACE and IF NOT EXISTS, and already existing objects, are validated per MySQL compatibility rules.
+- OR REPLACE publishes a complete definition without waiting for readers' transactions. An executing statement retains its bound definition; later statements can see the replacement even in the same RR transaction. See [ALTER VIEW](alter-view.md) for publication semantics.
 
 ## Privileges, Transactions, and Dependencies
 

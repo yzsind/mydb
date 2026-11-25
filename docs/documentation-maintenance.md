@@ -1,56 +1,26 @@
-# Documentation Scope and Maintenance
+# Documentation Scope and Versions
 
-This page is for documentation contributors. Documentation in this checkout
-describes its source revision; use the matching release tag for
-release-specific instructions and physical formats. MyDB 1.0.1 is a
-public-preview release (see the [Feature Overview](feature-overview.md) for
-the release-maturity statement). The feature and compatibility references
-describe supported behavior; listing a MySQL-shaped object does not promise an
-implemented subsystem.
+Product guides in this checkout describe its current source behavior. Use the
+documentation from the matching Git tag when operating a downloaded release.
+[Release notes](README.md#getting-started-and-deployment) and dated benchmark
+reports keep their identified versions, settings and evaluation boundaries.
 
-## Sources and publication
+The current package version is `1.0.2`, but development after the release has
+changed physical formats and added features. Read [current source changes](current-source.md)
+and [changing versions](changing-versions.md) before reusing a data directory,
+restoring a physical backup, or connecting native replicas. A product version
+string alone does not establish physical compatibility.
 
-| Reference | Source and update trigger |
-| --- | --- |
-| Startup options | startup_config registry; regenerate option reference after changing registration |
-| Extension errors | error catalog registration; regenerate error table after adding/removing an error |
-| Storage versions | format_versions constants; regenerate whenever physical format changes |
-| Metadata matrix | information_schema registry plus explicit per-object security/replication classification |
-| Protocol matrix | protocol/server/session/binlog sources and named regression suites; refresh evidence after review |
-| REST schema | SQL-service codec/runtime and REST routes; validate schema and live JSON/NDJSON examples |
-| Function index | scalar/math/GIS/vector/aggregate/window registries and explicit internal/unsupported exclusions |
-| Statement index | public parser variants and explicit family-to-reference mapping |
-| Performance claims | one identified experiment, effective settings and public result table |
-| Docker Hub copy | release publication text, updated with README and linked performance evidence |
+The [feature overview](feature-overview.md) states preview maturity, and the
+[MySQL compatibility reference](mysql80-compatibility.md) describes supported
+behavior and intentional differences. A listed MySQL-shaped metadata object
+does not imply that its corresponding subsystem is implemented. Unsupported
+SQL and protocols return explicit errors within the documented boundaries.
 
-Run from the repository root:
-
-```bash
-python3 scripts/check_docs.py
-python3 scripts/check_function_test_coverage.py --check
-python3 scripts/check_documentation_contracts.py
-python3 scripts/generate_mysql80_metadata_compat_matrix.py --check
-python3 scripts/generate_public_references.py --check
-bash scripts/render_storage_format_versions.sh --check
-```
-
-The contract checker requires jsonschema and openapi-spec-validator. The local
-smoke runner additionally requires PyMySQL and cryptography; install them in a
-virtual environment. Run `python3 scripts/test_documentation_examples.py --help`
-for a bounded rehearsal on fresh local instances. It never attaches to an
-existing database. Temporary data and logs go under /tmp/mydb.
-
-## Example classes
-
-Pure expressions may have fixed outputs. Stateful DDL/DML needs a resettable
-schema. File examples need explicit server/client paths. AI/HTTP examples need
-configured services and egress policy. Backup/replication/restart/purge examples
-need isolated instances and asynchronous completion checks. Stored-program body
-snippets are not standalone statements. No tool should execute every fenced block
-indiscriminately; the smoke runner selects named complete examples, while the
-function fixture suites cover the registered pure function surface.
-
-Link validation does not establish SQL correctness, external-link availability,
-benchmark reproducibility, or production readiness. Keep command output and
-remaining environment-specific checks with the change so reviewers can verify
-them.
+Machine-readable [startup options](configuration-registry.md),
+[storage formats](storage-format-versions.md), [extension errors](error-codes.md),
+[metadata](mysql80-metadata-compat-matrix.json),
+[protocol](mysql80-protocol-compat-matrix.json) and [REST contracts](rest-openapi.json)
+accompany the usage guides. When prose and behavior disagree, source code and
+tests are authoritative; include the exact build and a reproducible example
+when [reporting a documentation issue](reporting-issues.md).

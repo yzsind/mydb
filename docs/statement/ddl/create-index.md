@@ -20,10 +20,12 @@ Creates the supported forms of regular, unique, full-text, spatial, functional, 
                    [ 'VISIBLE' | 'INVISIBLE' ]
                    [ 'ALGORITHM' [ '=' ] ( 'DEFAULT' | 'INPLACE' ) ]
                    [ 'LOCK' [ '=' ] ( 'DEFAULT' | 'NONE' | 'SHARED' | 'EXCLUSIVE' ) ]
+                   [ 'WHERE' <expr> ]
 ```
 
 ## Behavior and Limitations
 
+- `WHERE` creates a [partial index](../../partial-indexes.md): only rows whose predicate is TRUE are stored. UNIQUE applies within that membership. Primary keys and foreign-key supporting indexes must remain complete; query hints cannot bypass the membership proof.
 - Vector indexes use `CREATE INDEX name ON table_name(vector_column) USING HNSW` or `USING IVF`; metric, build/search parameters, and quantization use `WITH (...)`, immediately after `USING`. The same options apply to inline `CREATE TABLE` indexes and `ALTER TABLE ... ADD INDEX`. COMMENT is descriptive text. See [vector indexes](../../vector-indexes.md).
 - Regular/unique indexes are persisted as B-trees. USING HASH is normalized to BTREE without a warning, matching the native single-engine compatibility behavior; it does not create a hash access structure.
 - FULLTEXT, SPATIAL, and HNSW/IVF only accept the column types and options implemented by their respective modules.
@@ -48,6 +50,7 @@ Creates the supported forms of regular, unique, full-text, spatial, functional, 
 <index-definition> ::= [ 'UNIQUE' | 'FULLTEXT' | 'SPATIAL' ]
                        ( 'INDEX' | 'KEY' ) [ <identifier> ]
                        '(' <index-key-list> ')' { <index-option> }
+                       [ 'WHERE' <expr> ]
 ```
 
 These are shared structural forms; options remain method/type-specific. Prefix lengths apply only to eligible keys and cannot exceed the column's key domain. Functional keys use an extra expression-parenthesis pair. Multi-valued CAST(... AS ... ARRAY) keys have their own type/access constraints. INCLUDE stores supported non-key payload for covering access, not a second uniqueness key. WITH PARSER does not load arbitrary plugin code.
@@ -67,6 +70,7 @@ CREATE INDEX idx_order_customer ON orders (customer_id, created_at DESC);
 CREATE INDEX idx_order_created ON orders (created_at) ALGORITHM=INPLACE LOCK=NONE;
 CREATE UNIQUE INDEX uk_customer_email ON customer (email);
 CREATE INDEX idx_payload_cover ON event (kind) INCLUDE (created_at, payload);
+CREATE INDEX idx_ready_job ON jobs (created_at) WHERE state = 'ready';
 ```
 
 ## See Also

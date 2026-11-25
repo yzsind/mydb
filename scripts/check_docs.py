@@ -57,7 +57,11 @@ def anchors(source: str) -> set[str]:
 
 
 def main() -> int:
-    pages = [ROOT / 'README.md', *sorted((ROOT / 'docs').rglob('*.md'))]
+    pages = [
+        ROOT / 'README.md', ROOT / 'readme_cn.md',
+        ROOT / 'examples/README.md', ROOT / 'clients/mydb-cli/README.md',
+        *sorted((ROOT / 'docs').rglob('*.md')),
+    ]
     known_anchors = {}
     errors = []
     checked = 0

@@ -382,6 +382,16 @@ explicitly; persistence operations always reject unknown variables.
 `require_secure_transport=ON` rejects new plaintext TCP connections during the
 handshake (3159); TLS connections remain usable.
 
+The default `sql_mode` is
+`ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION`.
+SET GLOBAL changes the inherited default for new sessions; use SET SESSION for
+the current connection. An explicitly empty mode enables non-strict behavior.
+See [type conversion](data-types.md#12-type-conversion-and-sql_mode) before
+changing data validation. `schema_definition_cache` is read-only `0`: catalog
+descriptors are governed automatically. `optimizer_trace_features` reports the
+fixed supported category string; independent category toggles are unsupported
+and assignments are rejected rather than reported as an effective tuning change.
+
 `innodb_deadlock_detect` (alias `mydb_deadlock_detect`) is a dynamic GLOBAL
 boolean with default `ON`. `SET GLOBAL` takes effect for existing sessions and
 transactions as well as new ones; `SET SESSION` and bare `SET` are rejected.

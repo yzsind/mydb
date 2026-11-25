@@ -22,6 +22,9 @@ IF(condition, value_if_true, value_if_false)
 
 Returns the true branch when the condition is true, otherwise the false branch; NULL conditions select the false branch. The result domain combines the two branches, and only the selected result branch is evaluated.
 
+Mixed integer/DECIMAL branches retain the common DECIMAL scale, including when
+the integer branch is selected. For example, `IF(1, 128, 1.5)` returns `128.0`.
+
 ## Examples
 
 ```sql

@@ -3,6 +3,13 @@
 Public product, SQL, deployment, and operations documentation. Start with the
 [project README](../README.md) for downloads and a first query.
 
+These guides describe the current source checkout, including changes after
+the 1.0.2 release. Product version strings alone do not identify compatible
+physical formats. Read [current source changes](current-source.md) before
+using a release data directory with a source build; use the matching tag's
+documentation for release packages. Dated release notes and benchmark reports
+retain their original scope and measurements.
+
 ## Getting Started and Deployment
 
 | Document | Contents |
@@ -13,6 +20,7 @@ Public product, SQL, deployment, and operations documentation. Start with the
 | [MyDB 1.0.0 Release Notes](release-notes-1.0.0.md) | Public-preview scope, features, packages, and compatibility boundaries |
 | [Why MyDB](why-mydb.md) | HTAP mixed workloads, AI capabilities, application benefits, and performance evidence |
 | [Feature Overview](feature-overview.md) | Capabilities, limitations, and release maturity |
+| [Current Source Changes](current-source.md) | Changes after 1.0.2, SQL behavior, credentials, and physical compatibility |
 | [MySQL 8.0 Compatibility](mysql80-compatibility.md) | Supported behavior, intentional differences, and migration boundaries |
 | [MyDB CLI](mydb-cli.md) | Interactive SQL, scripts, output, TLS, and client settings |
 | [Startup Configuration](configuration.md) | Configuration files, CLI, environment variables, system variables, and precedence |
@@ -35,7 +43,8 @@ Public product, SQL, deployment, and operations documentation. Start with the
 | [SQL ROWID](rowid.md) | Physical addresses, direct access, lifetime, and reuse |
 | [generate_series](generate-series.md) | Table function syntax, types, and boundaries |
 | [JSON_TABLE](json-table.md) | Row sources from JSON arrays, nesting, and column mapping |
-| [Time Travel Queries](mysql80-compatibility.md#time-travel-queries) | Historical query semantics and retention boundaries |
+| [Time Travel Queries](time-travel.md) | Historical query examples, retention, diagnostics, and schema boundaries |
+| [Partial Indexes](partial-indexes.md) | Predicate membership, unique enforcement, planning, and special indexes |
 | [XML Functions](xml-functions.md) | XPath support, ExtractValue, UpdateXML, and diagnostics |
 
 ## Search, AI, and APIs
@@ -71,6 +80,7 @@ Public product, SQL, deployment, and operations documentation. Start with the
 | Document | Contents |
 | --- | --- |
 | [Optimizer and Query Execution](optimizer-and-operators.md) | Access paths, join algorithms, execution modes, EXPLAIN, and tuning |
+| [Automatic Zone Maps](zone-maps.md) | Automatic pruning, transaction visibility, maintenance, and verification |
 | [ANALYZE TABLE](statement/admin/analyze-table.md) | Statistics collection and concurrency boundaries |
 | [Performance Schema](performance-schema.md) | Runtime tables, collection, memory, and diagnostics |
 | [Metadata Naming](metadata-naming.md) | Canonical result names, native metadata views, and column units |
@@ -79,6 +89,9 @@ Public product, SQL, deployment, and operations documentation. Start with the
 | [Performance Comparison](performance-comparison.md) | Published measurements, test conditions, and interpretation |
 | [Sysbench: 100M Rows, 300 Clients](sysbench-100m-300clients-2026-11-16.md) | Four five-minute OLTP measurements over a private network, November 16, 2026 |
 | [Cohere 1M HNSW vs. pgvector, November 24](vector-cohere-1m-hnsw-benchmark-2026-11-24.md) | Query-candidate memoization disabled; 32 GiB and 2 GiB throughput, build time, recall, and latency |
+
+The [earlier Cohere benchmark link](vector-cohere-1m-hnsw-benchmark-2026-11-14.md)
+redirects to the November 24 report; it does not establish a separate measurement.
 
 ## Machine-Readable References and Licenses
 
@@ -94,5 +107,8 @@ Public product, SQL, deployment, and operations documentation. Start with the
 - [Operations troubleshooting](operations-troubleshooting.md)
 - [Changing versions](changing-versions.md)
 - [Startup option registry](configuration-registry.md)
+- [Resource configuration](configuration-resources.md)
+- [Operations configuration](configuration-operations.md)
+- [AI, HTTP, REST, and MCP configuration](configuration-services.md)
 - [Docker Hub publication copy](dockerhub.md)
-- [Documentation scope and maintenance](documentation-maintenance.md)
+- [Documentation scope and versions](documentation-maintenance.md)

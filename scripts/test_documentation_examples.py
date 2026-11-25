@@ -137,6 +137,96 @@ def main():
             script(c, blocks("docs/statement/examples.md")[0])
             script(c, blocks("docs/statement/ddl/alter-table.md")[0])
         checks.append("shared-setup-alter-reset-twice")
+        script(c, blocks("docs/partial-indexes.md")[0])
+        assert query(
+            c, "SELECT id FROM test.partial_users WHERE active=1 ORDER BY id"
+        ) == ((1,),)
+        try:
+            query(c, "UPDATE test.partial_users SET active=1 WHERE id=2")
+        except pymysql.Error as error:
+            assert error.args[0] == 1062, error
+        else:
+            raise AssertionError("partial uniqueness did not reject new member")
+        assert query(
+            c, "SELECT active FROM test.partial_users WHERE id=2"
+        ) == ((0,),)
+        script(c, blocks("docs/partial-indexes.md")[1])
+        checks.append("partial-index-membership-uniqueness-and-atomic-error")
+        script(c, blocks("docs/time-travel.md")[0])
+        assert query(
+            c, "EXECUTE history_read USING @history_time"
+        ) == ((10,),)
+        assert query(c, "SELECT value FROM test.history_demo") == ((20,),)
+        for sql in blocks("docs/time-travel.md")[1:]:
+            script(c, sql)
+        assert query(
+            c,
+            "EXECUTE history_compare USING @history_time",
+        ) == ((1, 10, 20),)
+        checks.append("time-travel-retention-history-current-join-and-diagnostics")
+        script(c, blocks("docs/zone-maps.md")[0])
+        assert query(
+            c, "SELECT id,amount FROM test.zone_map_demo WHERE region=2 ORDER BY id"
+        ) == ((2, 20), (3, 30))
+        # Observe the example's read-your-writes result before its ROLLBACK.
+        with c.cursor() as cur:
+            statements = blocks("docs/zone-maps.md")[1].strip().split(";")
+            for statement in statements:
+                if statement.strip():
+                    cur.execute(statement)
+                    if statement.lstrip().startswith("SELECT"):
+                        assert cur.fetchall() == ((1,), (2,), (3,))
+        assert query(
+            c, "SELECT id FROM test.zone_map_demo WHERE region=2 ORDER BY id"
+        ) == ((2,), (3,))
+        script(c, blocks("docs/zone-maps.md")[2])
+        checks.append("zone-map-results-own-writes-rollback-and-diagnostics")
+        script(c, blocks("docs/statement/dml/update.md")[-1])
+        assert query(c, "SELECT id,total FROM test.dml_accounts ORDER BY id") == (
+            (1, 15), (2, 0)
+        )
+        with c.cursor() as cur:
+            selects = []
+            for statement in blocks("docs/statement/dml/delete.md")[-1].split(";"):
+                if statement.strip():
+                    cur.execute(statement)
+                    if statement.lstrip().startswith("SELECT"):
+                        selects.append(cur.fetchall())
+            assert selects == [((1,),), ((3,),), ()], selects
+        for table, expected in [
+            ("dml_left", ((1,), (2,))),
+            ("dml_middle", ((2,), (3,))),
+            ("dml_right", ((2,), (3,), (4,))),
+        ]:
+            assert query(c, f"SELECT id FROM test.{table} ORDER BY id") == expected
+        checks.append("derived-update-outer-delete-null-padding-and-rollback")
+        default_modes = set(query(c, "SELECT @@GLOBAL.sql_mode")[0][0].split(","))
+        assert default_modes == {
+            "ONLY_FULL_GROUP_BY", "STRICT_TRANS_TABLES", "NO_ZERO_IN_DATE",
+            "NO_ZERO_DATE", "ERROR_FOR_DIVISION_BY_ZERO", "NO_ENGINE_SUBSTITUTION",
+        }, default_modes
+        query(c, "SET NAMES utf8mb4 COLLATE utf8mb4_0900_ai_ci")
+        expression_values = query(
+            c, "SELECT IF(1,128,1.5),GREATEST('a','A'),LEAST('b','B'),"
+            "CONVERT(X'61' USING utf8mb4) COLLATE utf8mb4_bin,"
+            "CAST(FROM_DAYS(1) AS CHAR)"
+        )
+        assert str(expression_values[0][0]) == "128.0", expression_values
+        assert expression_values[0][1:] == ("A", "b", "a", "0000-00-00"), expression_values
+        try:
+            query(c, "SELECT X'61' COLLATE utf8mb4_bin")
+        except pymysql.Error as error:
+            assert error.args[0] == 1253, error
+        else:
+            raise AssertionError("binary COLLATE bypassed charset validation")
+        query(c, "CREATE TABLE test.doc_text_width("
+              "u TEXT(100) CHARACTER SET utf8mb4,l TEXT(100) CHARACTER SET latin1)")
+        assert query(
+            c, "SELECT COLUMN_NAME,DATA_TYPE FROM information_schema.columns "
+            "WHERE TABLE_SCHEMA='test' AND TABLE_NAME='doc_text_width' "
+            "ORDER BY ORDINAL_POSITION"
+        ) == (("u", "text"), ("l", "tinytext"))
+        checks.append("sql-mode-decimal-scale-collation-calendar-and-text-width")
         for sql in blocks("docs/json-table.md")[1:]:
             if sql.lstrip().startswith("JSON_TABLE"):
                 continue
