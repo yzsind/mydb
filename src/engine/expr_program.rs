@@ -1098,7 +1098,88 @@ pub(crate) enum CompiledNumericExpr {
     },
 }
 
+#[derive(Clone, Copy)]
+enum IntegerLeaf {
+    Column(usize),
+    Constant(i64),
+}
+
+impl IntegerLeaf {
+    #[inline]
+    fn read(&self, row: &impl RowSource) -> Option<i64> {
+        match self {
+            Self::Column(index) => match row.value_ref(*index)? {
+                Value::Int(value) => Some(*value),
+                _ => None,
+            },
+            Self::Constant(value) => Some(*value),
+        }
+    }
+}
+
+/// Execution-local scalar binding. Checked native results bypass tree
+/// dispatch; all other types, overflow and diagnostics retain the program.
+pub(crate) struct BoundIntegerBinary {
+    left: IntegerLeaf,
+    right: IntegerLeaf,
+    op: BinaryOp,
+}
+
+impl BoundIntegerBinary {
+    #[inline]
+    pub(crate) fn evaluate(&self, row: &impl RowSource) -> Option<Value> {
+        let left = self.left.read(row)?;
+        let right = self.right.read(row)?;
+        let value = match self.op {
+            BinaryOp::Add => left.checked_add(right),
+            BinaryOp::Sub => left.checked_sub(right),
+            BinaryOp::Mul => left.checked_mul(right),
+            BinaryOp::Mod => left.checked_rem(right),
+            _ => return None,
+        }?;
+        PROGRAM_EVAL_ROWS.fetch_add(1, AtomicOrdering::Relaxed);
+        Some(Value::Int(value))
+    }
+}
+
 impl ExprProgram {
+    /// Bind immutable integer leaves for this opened execution only. In
+    /// particular, parameter Values must never enter the shared program cache.
+    pub(crate) fn bind_integer_binary(&self) -> Option<BoundIntegerBinary> {
+        let ExprNode::Binary {
+            left,
+            op,
+            right,
+            semantics,
+        } = &self.root
+        else {
+            return None;
+        };
+        if !matches!(
+            op,
+            BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Mod
+        ) || semantics.unsigned_operands
+            || semantics.unsigned_subtraction
+            || semantics.unsigned_decimal_subtraction
+        {
+            return None;
+        }
+        let leaf = |node: &ExprNode| match node {
+            ExprNode::Column(index) => Some(IntegerLeaf::Column(*index)),
+            ExprNode::Const(Value::Int(value)) => Some(IntegerLeaf::Constant(*value)),
+            ExprNode::Placeholder(index) => match crate::engine::params::current_param(*index)? {
+                Value::Int(value) => Some(IntegerLeaf::Constant(value)),
+                _ => None,
+            },
+            _ => None,
+        };
+        Some(BoundIntegerBinary {
+            left: leaf(left)?,
+            right: leaf(right)?,
+            op: *op,
+        })
+    }
+
     pub(crate) fn rounds_decimal_result(&self) -> bool {
         self.round_decimal_result
     }
@@ -1300,6 +1381,72 @@ impl ExprProgram {
             ExprNode::Column(index) => Some(*index),
             _ => None,
         }
+    }
+
+    /// Operator-local constants may depend on the current SQL mode/charset,
+    /// so they must never replace nodes in the shared compiled-program cache.
+    pub(crate) fn is_statement_constant_escape(&self) -> bool {
+        let ExprNode::LegacyEscape { expr, .. } = &self.root else {
+            return false;
+        };
+        crate::parser::visit::try_inspect_value_expr::<()>(expr, |node| {
+            let closed = match node {
+                Expr::Literal(_) | Expr::BoundValue(_) => true,
+                Expr::Placeholder(index) => crate::engine::params::has_active_param(*index),
+                Expr::Unary { .. }
+                | Expr::Binary { .. }
+                | Expr::IsNull(_)
+                | Expr::IsNotNull(_)
+                | Expr::InList { .. }
+                | Expr::Between { .. }
+                | Expr::Like { .. }
+                | Expr::Case { .. } => true,
+                Expr::Function {
+                    name,
+                    distinct: false,
+                    ..
+                } => {
+                    // Only proven pure builtins may run ahead. These string
+                    // constructors depend on stable session packet/charset
+                    // settings, so they cannot fold in a shared cached tree.
+                    // Opaque calls and effectful/session-counter kernels stay
+                    // on their ordered runtime oracle.
+                    FunctionRegistry::global()
+                        .resolve(name)
+                        .is_some_and(|kernel| {
+                            kernel.is_deterministic()
+                                || matches!(
+                                    kernel,
+                                    FunctionKernel::Repeat
+                                        | FunctionKernel::Space
+                                        | FunctionKernel::Lpad
+                                        | FunctionKernel::Rpad
+                                )
+                        })
+                }
+                _ => false,
+            };
+            if closed {
+                Ok(true)
+            } else {
+                Err(())
+            }
+        })
+        .is_ok()
+    }
+
+    pub(crate) fn try_statement_constant(&self) -> Option<Value> {
+        if !self.is_statement_constant_escape() {
+            return None;
+        }
+        let diagnostics = crate::engine::api::StatementWarningSink::default();
+        let empty: &[Value] = &[];
+        let value = crate::engine::api::with_statement_warning_sink(diagnostics.clone(), || {
+            self.eval_source(&empty, &mut EvalScratch::default())
+        })
+        .ok()?;
+        let warning_free = diagnostics.lock().is_empty();
+        warning_free.then_some(value)
     }
 
     pub(crate) fn as_string_length_column(&self) -> Option<(StringLengthKind, usize)> {
@@ -10241,6 +10388,144 @@ mod cache_tests {
             collation_id: None,
         }]);
         ExprCompiler::compile(&expr, &schema).expect("compile")
+    }
+
+    #[test]
+    fn bound_integer_binary_matches_program_and_keeps_fallback_diagnostics() {
+        let schema = InputSchema::new(
+            ["x", "y"]
+                .into_iter()
+                .map(|name| InputColumn {
+                    table: "t".into(),
+                    alias: None,
+                    name: name.into(),
+                    column_type: ColumnType::LongLong,
+                    unsigned: false,
+                    collation_id: None,
+                })
+                .collect(),
+        );
+        let session = crate::engine::api::SessionContext::default();
+        crate::engine::expr::with_session_expr_info(&session, || {
+            for op in ["+", "-", "*", "%"] {
+                let program = ExprCompiler::compile(
+                    &crate::parser::parse_expr_fragment(&format!("x {op} y")).unwrap(),
+                    &schema,
+                )
+                .unwrap();
+                let kernel = program.bind_integer_binary().expect("signed leaf kernel");
+                for left in [i64::MIN, i64::MIN + 1, -1, 0, 1, i64::MAX - 1, i64::MAX] {
+                    for right in [i64::MIN, -1, 0, 1, i64::MAX] {
+                        let row = [Value::Int(left), Value::Int(right)];
+                        let source = row.as_slice();
+                        let diagnostics = crate::engine::api::StatementWarningSink::default();
+                        crate::engine::api::with_statement_warning_sink(
+                            diagnostics.clone(),
+                            || {
+                                let fast = kernel.evaluate(&source);
+                                assert!(diagnostics.lock().is_empty());
+                                let full =
+                                    program.eval_source(&source, &mut EvalScratch::default());
+                                if let Some(fast) = fast {
+                                    assert_eq!(full.unwrap(), fast, "{left} {op} {right}");
+                                }
+                            },
+                        );
+                    }
+                }
+                for value in [
+                    Value::Null,
+                    Value::UInt(u64::MAX),
+                    Value::Double(1.5),
+                    Value::DecimalCompact(15, 1),
+                    Value::String("12".into()),
+                ] {
+                    let row = [value, Value::Int(1)];
+                    assert!(kernel.evaluate(&row.as_slice()).is_none());
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn bound_integer_binary_parameters_are_execution_local() {
+        let schema = InputSchema::new(vec![InputColumn {
+            table: "t".into(),
+            alias: None,
+            name: "x".into(),
+            column_type: ColumnType::LongLong,
+            unsigned: false,
+            collation_id: None,
+        }]);
+        let expr = crate::parser::parse_expr_fragment("x + ?").unwrap();
+        let program = crate::engine::params::with_params_slice(&[Value::Int(2)], || {
+            ExprCompiler::compile(&expr, &schema).unwrap()
+        });
+        for (parameter, expected) in [(2, 5), (7, 10), (-4, -1)] {
+            crate::engine::params::with_params_slice(&[Value::Int(parameter)], || {
+                let kernel = program.bind_integer_binary().unwrap();
+                assert_eq!(
+                    kernel.evaluate(&[Value::Int(3)].as_slice()),
+                    Some(Value::Int(expected))
+                );
+            });
+        }
+        crate::engine::params::with_params_slice(&[Value::Double(0.5)], || {
+            assert!(program.bind_integer_binary().is_none());
+        });
+        assert!(program.bind_integer_binary().is_none());
+    }
+
+    #[test]
+    fn statement_constant_escapes_rebind_and_preserve_diagnostics() {
+        let session = crate::engine::api::SessionContext::default();
+        crate::engine::expr::with_session_expr_info(&session, || {
+            let compile = |sql| {
+                ExprCompiler::compile_legacy_oracle(
+                    &crate::parser::parse_expr_fragment(sql).unwrap(),
+                    &InputSchema::default(),
+                )
+                .unwrap()
+            };
+            let program = compile("CAST(REPEAT(?,?) AS CHAR(16))");
+            for (text, count, expected) in [("中文", 2, "中文中文"), ("ab", 3, "ababab")] {
+                crate::engine::params::with_params_slice(
+                    &[Value::String(text.into()), Value::Int(count)],
+                    || {
+                        assert!(program.is_statement_constant_escape());
+                        assert_eq!(
+                            program
+                                .try_statement_constant()
+                                .unwrap()
+                                .to_display_string(),
+                            expected
+                        );
+                    },
+                );
+            }
+            assert!(!program.is_statement_constant_escape());
+            for sql in [
+                "RAND()",
+                "SLEEP(0)",
+                "@constant_test",
+                "GET_LOCK('constant_test',0)",
+                "RELEASE_ALL_LOCKS()",
+                "IS_FREE_LOCK('constant_test')",
+            ] {
+                assert!(!compile(sql).is_statement_constant_escape(), "{sql}");
+            }
+            let diagnostics = crate::engine::api::StatementWarningSink::default();
+            let warning = compile("CAST('invalid' AS SIGNED)");
+            crate::engine::api::with_statement_warning_sink(diagnostics.clone(), || {
+                assert!(warning.try_statement_constant().is_none());
+                assert!(diagnostics.lock().is_empty());
+                let empty: &[Value] = &[];
+                warning
+                    .eval_source(&empty, &mut EvalScratch::default())
+                    .unwrap();
+            });
+            assert!(!diagnostics.lock().is_empty());
+        });
     }
 
     #[test]
