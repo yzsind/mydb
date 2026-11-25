@@ -18937,6 +18937,109 @@ fn direct_bulk_builder_failure_before_meta_restores_empty_usable_index() {
 }
 
 #[test]
+fn prelogged_bulk_stream_failure_restores_wal_scope_and_reusable_empty_index() {
+    for durability in [DurabilityMode::Memory, DurabilityMode::Strict] {
+        for kind in ["stream", "single-int", "date", "pair-int"] {
+            let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+            let log = test_log(dir.path());
+            let pool = BufferPool::new_with_options(
+                16,
+                Arc::clone(&log),
+                durability,
+                Duration::ZERO,
+                1,
+                0,
+            );
+            let path = dir.path().join("prelogged.idx");
+            let index =
+                IndexFile::open_with_durability(path.clone(), Arc::clone(&log), durability, pool)
+                    .unwrap();
+            let outer_lsn = log
+                .lock()
+                .append(91, WalPayload::BeginTxn { start_scn: 1 })
+                .unwrap();
+            let build_lsn = log
+                .lock()
+                .append(92, WalPayload::BeginTxn { start_scn: 2 })
+                .unwrap();
+            let previous_lsn = btree_logical_wal::current();
+            btree_logical_wal::set(Some(outer_lsn));
+            let build = |input: Vec<Result<(i64, RowId), QueryError>>| {
+                let entries = input.into_iter().inspect(|_| {
+                    assert_eq!(btree_logical_wal::current(), Some(build_lsn));
+                });
+                match kind {
+                    "stream" => index.bulk_load_prelogged_sorted_stream(
+                        92,
+                        Some(build_lsn),
+                        entries.map(|entry| {
+                            let (value, row_id) = entry?;
+                            Ok(single_int_index_entry(value, row_id))
+                        }),
+                    ),
+                    "single-int" => index.bulk_load_prelogged_sorted_single_int_stream(
+                        92,
+                        Some(build_lsn),
+                        entries,
+                    ),
+                    "date" => index.bulk_load_prelogged_sorted_date_stream(
+                        92,
+                        Some(build_lsn),
+                        entries.map(|entry| entry.map(|(value, row_id)| (value as i32, row_id))),
+                    ),
+                    "pair-int" => index.bulk_load_prelogged_sorted_pair_int_stream(
+                        92,
+                        Some(build_lsn),
+                        entries.map(|entry| entry.map(|(value, row_id)| ((value, -value), row_id))),
+                    ),
+                    _ => unreachable!(),
+                }
+            };
+            let mut input = (0..2048)
+                .map(|value| {
+                    Ok((
+                        value,
+                        RowId {
+                            page_id: value as u32,
+                            slot_id: 0,
+                        },
+                    ))
+                })
+                .collect::<Vec<_>>();
+            input.push(Err(error(
+                crate::error::catalog::ER_GET_ERRNO,
+                "injected sorted stream failure",
+            )));
+            let failure = build(input).unwrap_err();
+            assert_eq!(
+                failure.message(),
+                "injected sorted stream failure",
+                "{kind} {durability:?}"
+            );
+            assert_eq!(btree_logical_wal::current(), Some(outer_lsn));
+            assert!(index.is_empty().unwrap(), "{kind} {durability:?}");
+            assert!(index.range(None, None, false).unwrap().is_empty());
+            if durability != DurabilityMode::Memory {
+                IndexFile::validate(path).unwrap();
+            }
+
+            let row_id = RowId {
+                page_id: 7,
+                slot_id: 3,
+            };
+            build(vec![Ok((42, row_id))]).unwrap();
+            assert_eq!(btree_logical_wal::current(), Some(outer_lsn));
+            assert_eq!(index.range(None, None, false).unwrap(), vec![row_id]);
+            let rejected = build(vec![Ok((43, row_id))]).unwrap_err();
+            assert!(rejected.message().contains("requires an empty index"));
+            assert_eq!(btree_logical_wal::current(), Some(outer_lsn));
+            assert_eq!(index.range(None, None, false).unwrap(), vec![row_id]);
+            btree_logical_wal::set(previous_lsn);
+        }
+    }
+}
+
+#[test]
 fn specialized_single_int_direct_builder_matches_buffered_oracle() {
     let dir = tempfile::tempdir().unwrap();
     let strict_dir = dir.path().join("strict-int");

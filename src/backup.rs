@@ -20,7 +20,7 @@ use sha2::{Digest, Sha256};
 use crate::engine::api::{QueryResponse, ResultSet};
 use crate::engine::executor::mem_budget::{ControlledMemoryCategory, ControlledMemoryCharge};
 use crate::parser::Statement;
-use crate::storage::image::validate_restore_path;
+use crate::storage::image::{classify_file, validate_restore_path};
 use crate::storage::{error, Database, DurabilityMode, StartupValidationMode, StorageConfig};
 use crate::types::{Column, ColumnType, QueryError, Value};
 
@@ -809,16 +809,6 @@ fn snapshot_wal_files(db: &Database) -> Result<WalSnapshot, QueryError> {
         captured_unix_us,
         hint,
     })
-}
-
-fn classify_file(relative: &str) -> FileClass {
-    match Path::new(relative).extension().and_then(|ext| ext.to_str()) {
-        Some("idx") => FileClass::Index,
-        Some("hnsw" | "hvec" | "vmanifest" | "vpub") => FileClass::VectorIndex,
-        Some("zm") => FileClass::Derived,
-        Some("log") if relative.starts_with("system/wal/") => FileClass::RecoveryWal,
-        _ => FileClass::Authoritative,
-    }
 }
 
 struct InstanceCaptureGuard<'a> {

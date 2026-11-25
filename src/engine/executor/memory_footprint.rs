@@ -49,6 +49,7 @@ impl AllocatedBytes for Value {
     fn allocated_bytes(&self) -> usize {
         match self {
             Value::Decimal(value) | Value::String(value) => value.capacity(),
+            Value::SmallString(value) if value.spilled() => value.capacity(),
             Value::DecimalWide(_) => self.decimal_heap_bytes(),
             Value::Bytes(value) | Value::Json(value) | Value::Geometry(value) => value.capacity(),
             Value::Vector(value) => value.capacity(),
@@ -107,6 +108,10 @@ mod tests {
         assert_eq!(value(Value::Geometry).allocated_bytes(), 128);
         assert_eq!(value(|v| Value::Vector(v.into())).allocated_bytes(), 128);
         assert_eq!(Value::Int(1).allocated_bytes(), 0);
+        let mut small = crate::types::SmallStringBuf::new();
+        small.extend_from_slice(&[b'x'; 128]);
+        let capacity = small.capacity();
+        assert_eq!(Value::SmallString(small).allocated_bytes(), capacity);
     }
 
     #[test]

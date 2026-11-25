@@ -398,6 +398,22 @@ fn rewrite_image_refs(
     target_name: &str,
     default_image: DefaultImage,
 ) -> Result<(), QueryError> {
+    // The row-image rules own their expression scope. Expand recursive calls
+    // in place so sharing their context adds no runtime traversal layer.
+    macro_rules! rewrite_child {
+        ($child:expr) => {
+            rewrite_image_refs(
+                $child,
+                table,
+                old_name,
+                new_name,
+                hidden_old,
+                hidden_new,
+                target_name,
+                default_image,
+            )
+        };
+    }
     match expr {
         Expr::CompoundIdentifier(parts) if parts.len() >= 2 => {
             let qualifier = &parts[parts.len() - 2];
@@ -445,112 +461,31 @@ fn rewrite_image_refs(
         Expr::Unary { expr, .. }
         | Expr::IsNull(expr)
         | Expr::IsNotNull(expr)
-        | Expr::GroupKeyRef { expr, .. } => rewrite_image_refs(
-            expr,
-            table,
-            old_name,
-            new_name,
-            hidden_old,
-            hidden_new,
-            target_name,
-            default_image,
-        )?,
+        | Expr::GroupKeyRef { expr, .. } => rewrite_child!(expr)?,
         Expr::Binary { left, right, .. } => {
-            rewrite_image_refs(
-                left,
-                table,
-                old_name,
-                new_name,
-                hidden_old,
-                hidden_new,
-                target_name,
-                default_image,
-            )?;
-            rewrite_image_refs(
-                right,
-                table,
-                old_name,
-                new_name,
-                hidden_old,
-                hidden_new,
-                target_name,
-                default_image,
-            )?;
+            rewrite_child!(left)?;
+            rewrite_child!(right)?;
         }
         Expr::InList { expr, list, .. } => {
-            rewrite_image_refs(
-                expr,
-                table,
-                old_name,
-                new_name,
-                hidden_old,
-                hidden_new,
-                target_name,
-                default_image,
-            )?;
+            rewrite_child!(expr)?;
             for item in list {
-                rewrite_image_refs(
-                    item,
-                    table,
-                    old_name,
-                    new_name,
-                    hidden_old,
-                    hidden_new,
-                    target_name,
-                    default_image,
-                )?;
+                rewrite_child!(item)?;
             }
         }
         Expr::Between {
             expr, low, high, ..
         } => {
             for item in [expr, low, high] {
-                rewrite_image_refs(
-                    item,
-                    table,
-                    old_name,
-                    new_name,
-                    hidden_old,
-                    hidden_new,
-                    target_name,
-                    default_image,
-                )?;
+                rewrite_child!(item)?;
             }
         }
         Expr::Like { expr, pattern, .. } => {
-            rewrite_image_refs(
-                expr,
-                table,
-                old_name,
-                new_name,
-                hidden_old,
-                hidden_new,
-                target_name,
-                default_image,
-            )?;
-            rewrite_image_refs(
-                pattern,
-                table,
-                old_name,
-                new_name,
-                hidden_old,
-                hidden_new,
-                target_name,
-                default_image,
-            )?;
+            rewrite_child!(expr)?;
+            rewrite_child!(pattern)?;
         }
         Expr::Function { args, .. } | Expr::Tuple(args) => {
             for item in args {
-                rewrite_image_refs(
-                    item,
-                    table,
-                    old_name,
-                    new_name,
-                    hidden_old,
-                    hidden_new,
-                    target_name,
-                    default_image,
-                )?;
+                rewrite_child!(item)?;
             }
         }
         Expr::Case {
@@ -560,40 +495,13 @@ fn rewrite_image_refs(
             else_result,
         } => {
             if let Some(v) = operand {
-                rewrite_image_refs(
-                    v,
-                    table,
-                    old_name,
-                    new_name,
-                    hidden_old,
-                    hidden_new,
-                    target_name,
-                    default_image,
-                )?;
+                rewrite_child!(v)?;
             }
             for v in conditions.iter_mut().chain(results.iter_mut()) {
-                rewrite_image_refs(
-                    v,
-                    table,
-                    old_name,
-                    new_name,
-                    hidden_old,
-                    hidden_new,
-                    target_name,
-                    default_image,
-                )?;
+                rewrite_child!(v)?;
             }
             if let Some(v) = else_result {
-                rewrite_image_refs(
-                    v,
-                    table,
-                    old_name,
-                    new_name,
-                    hidden_old,
-                    hidden_new,
-                    target_name,
-                    default_image,
-                )?;
+                rewrite_child!(v)?;
             }
         }
         _ => {}

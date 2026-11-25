@@ -5109,23 +5109,8 @@ impl IndexFile {
                 }
             }
         }
-        let elapsed_us = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
         if result.is_ok() {
-            let pages = self
-                .meta_state
-                .lock()
-                .meta
-                .next_page_id
-                .saturating_sub(INDEX_EMPTY_ROOT);
-            if direct {
-                BULK_INDEX_DIRECT_BUILDS.fetch_add(1, Ordering::Relaxed);
-                BULK_INDEX_DIRECT_PAGES.fetch_add(pages, Ordering::Relaxed);
-                BULK_INDEX_DIRECT_US.fetch_add(elapsed_us, Ordering::Relaxed);
-            } else {
-                BULK_INDEX_BUFFERED_BUILDS.fetch_add(1, Ordering::Relaxed);
-                BULK_INDEX_BUFFERED_PAGES.fetch_add(pages, Ordering::Relaxed);
-                BULK_INDEX_BUFFERED_US.fetch_add(elapsed_us, Ordering::Relaxed);
-            }
+            record_bulk_index_build(self, direct, started);
         }
         btree_logical_wal::set(previous_lsn);
         result
@@ -5191,6 +5176,49 @@ impl IndexFile {
         Ok(())
     }
 
+    /// Keep WAL scoping, failure cleanup and accounting identical for every
+    /// typed bulk builder. The callback retains its allocation-free key format.
+    #[inline]
+    fn with_prelogged_bulk_build(
+        &self,
+        lsn: Option<u64>,
+        empty_error: &'static str,
+        failure_context: &'static str,
+        build: impl FnOnce(bool) -> Result<(), QueryError>,
+    ) -> Result<(), QueryError> {
+        if !self.is_empty()? {
+            return Err(error(crate::error::catalog::ER_GET_ERRNO, empty_error));
+        }
+        let previous_lsn = btree_logical_wal::current();
+        btree_logical_wal::set(lsn);
+        let direct = self.durability != DurabilityMode::Memory;
+        let started = Instant::now();
+        let mut result = build(direct);
+        if result.is_err() {
+            let cleanup = if direct {
+                self.reset_empty_index_direct()
+            } else {
+                self.reset_empty_index_buffered()
+            };
+            if let Err(cleanup) = cleanup {
+                let original = result.expect_err("streamed bulk build failed");
+                result = Err(error(
+                    crate::error::catalog::ER_GET_ERRNO,
+                    format!(
+                        "{failure_context} ({}); empty-index cleanup failed ({})",
+                        original.message(),
+                        cleanup.message()
+                    ),
+                ));
+            }
+        }
+        if result.is_ok() {
+            record_bulk_index_build(self, direct, started);
+        }
+        btree_logical_wal::set(previous_lsn);
+        result
+    }
+
     /// Build an empty index from a sorted stream whose logical IndexBatch WAL
     /// was appended incrementally by the LOAD DATA pipeline. Keeping WAL
     /// emission ahead of page publication preserves write-ahead ordering
@@ -5205,48 +5233,22 @@ impl IndexFile {
     where
         I: Iterator<Item = Result<IndexEntry, QueryError>>,
     {
-        if !self.is_empty()? {
-            return Err(error(
-                crate::error::catalog::ER_GET_ERRNO,
-                "prelogged bulk index stream requires an empty index",
-            ));
-        }
-        let previous_lsn = btree_logical_wal::current();
-        btree_logical_wal::set(lsn);
-        let direct = self.durability != DurabilityMode::Memory;
-        let started = Instant::now();
-        let mut result = if direct {
-            self.bulk_load_sorted_direct_stream_with_lsn(txn_id, entries)
-        } else {
-            self.bulk_load_sorted_stream_with_lsn(txn_id, entries)
-        };
-        if result.is_err() {
-            let cleanup = if direct {
-                self.reset_empty_index_direct()
-            } else {
-                self.reset_empty_index_buffered()
-            };
-            if let Err(cleanup) = cleanup {
-                let original = result.expect_err("direct streamed bulk build failed");
-                result = Err(error(
-                    crate::error::catalog::ER_GET_ERRNO,
-                    format!(
-                        "streamed bulk index build failed ({}); empty-index cleanup failed ({})",
-                        original.message(),
-                        cleanup.message()
-                    ),
-                ));
-            }
-        }
-        if result.is_ok() {
-            record_bulk_index_build(self, direct, started);
-        }
-        btree_logical_wal::set(previous_lsn);
-        result
+        self.with_prelogged_bulk_build(
+            lsn,
+            "prelogged bulk index stream requires an empty index",
+            "streamed bulk index build failed",
+            |direct| {
+                if direct {
+                    self.bulk_load_sorted_direct_stream_with_lsn(txn_id, entries)
+                } else {
+                    self.bulk_load_sorted_stream_with_lsn(txn_id, entries)
+                }
+            },
+        )
     }
 
     /// Fixed-width counterpart of `bulk_load_prelogged_sorted_stream` for a
-    /// resident, sorted two-INT key set.  Keeping `(i64, i64, RowId)` compact
+    /// resident, sorted single-INT key set.  Keeping `(i64, RowId)` compact
     /// through leaf construction avoids materialising and dropping millions
     /// of transient `IndexEntry`/`KeyPart` values after LOAD DATA has already
     /// paid for a compact sorter.  Memory durability stays on the generic
@@ -5260,48 +5262,22 @@ impl IndexFile {
     where
         I: Iterator<Item = Result<(i64, RowId), QueryError>>,
     {
-        if !self.is_empty()? {
-            return Err(error(
-                crate::error::catalog::ER_GET_ERRNO,
-                "prelogged bulk index single-int stream requires an empty index",
-            ));
-        }
-        let previous_lsn = btree_logical_wal::current();
-        btree_logical_wal::set(lsn);
-        let direct = self.durability != DurabilityMode::Memory;
-        let started = Instant::now();
-        let mut result = if direct {
-            self.bulk_load_sorted_single_int_direct_stream_with_lsn(txn_id, entries)
-        } else {
-            let stream = entries.map(|entry| {
-                let (value, row_id) = entry?;
-                Ok(single_int_index_entry(value, row_id))
-            });
-            self.bulk_load_sorted_stream_with_lsn(txn_id, stream)
-        };
-        if result.is_err() {
-            let cleanup = if direct {
-                self.reset_empty_index_direct()
-            } else {
-                self.reset_empty_index_buffered()
-            };
-            if let Err(cleanup) = cleanup {
-                let original = result.expect_err("direct single-int stream build failed");
-                result = Err(error(
-                    crate::error::catalog::ER_GET_ERRNO,
-                    format!(
-                        "single-int stream build failed ({}); empty-index cleanup failed ({})",
-                        original.message(),
-                        cleanup.message()
-                    ),
-                ));
-            }
-        }
-        if result.is_ok() {
-            record_bulk_index_build(self, direct, started);
-        }
-        btree_logical_wal::set(previous_lsn);
-        result
+        self.with_prelogged_bulk_build(
+            lsn,
+            "prelogged bulk index single-int stream requires an empty index",
+            "single-int stream build failed",
+            |direct| {
+                if direct {
+                    self.bulk_load_sorted_single_int_direct_stream_with_lsn(txn_id, entries)
+                } else {
+                    let stream = entries.map(|entry| {
+                        let (value, row_id) = entry?;
+                        Ok(single_int_index_entry(value, row_id))
+                    });
+                    self.bulk_load_sorted_stream_with_lsn(txn_id, stream)
+                }
+            },
+        )
     }
 
     fn bulk_load_prelogged_sorted_date_stream<I>(
@@ -5313,48 +5289,22 @@ impl IndexFile {
     where
         I: Iterator<Item = Result<(i32, RowId), QueryError>>,
     {
-        if !self.is_empty()? {
-            return Err(error(
-                crate::error::catalog::ER_GET_ERRNO,
-                "prelogged bulk index date stream requires an empty index",
-            ));
-        }
-        let previous_lsn = btree_logical_wal::current();
-        btree_logical_wal::set(lsn);
-        let direct = self.durability != DurabilityMode::Memory;
-        let started = Instant::now();
-        let mut result = if direct {
-            self.bulk_load_sorted_date_direct_stream_with_lsn(txn_id, entries)
-        } else {
-            let stream = entries.map(|entry| {
-                let (days, row_id) = entry?;
-                Ok(date_index_entry(days, row_id))
-            });
-            self.bulk_load_sorted_stream_with_lsn(txn_id, stream)
-        };
-        if result.is_err() {
-            let cleanup = if direct {
-                self.reset_empty_index_direct()
-            } else {
-                self.reset_empty_index_buffered()
-            };
-            if let Err(cleanup) = cleanup {
-                let original = result.expect_err("direct date stream build failed");
-                result = Err(error(
-                    crate::error::catalog::ER_GET_ERRNO,
-                    format!(
-                        "date stream build failed ({}); empty-index cleanup failed ({})",
-                        original.message(),
-                        cleanup.message()
-                    ),
-                ));
-            }
-        }
-        if result.is_ok() {
-            record_bulk_index_build(self, direct, started);
-        }
-        btree_logical_wal::set(previous_lsn);
-        result
+        self.with_prelogged_bulk_build(
+            lsn,
+            "prelogged bulk index date stream requires an empty index",
+            "date stream build failed",
+            |direct| {
+                if direct {
+                    self.bulk_load_sorted_date_direct_stream_with_lsn(txn_id, entries)
+                } else {
+                    let stream = entries.map(|entry| {
+                        let (days, row_id) = entry?;
+                        Ok(date_index_entry(days, row_id))
+                    });
+                    self.bulk_load_sorted_stream_with_lsn(txn_id, stream)
+                }
+            },
+        )
     }
 
     /// Spill-run counterpart of the resident pair-int builder. Ordered LOAD
@@ -5370,48 +5320,22 @@ impl IndexFile {
     where
         I: Iterator<Item = Result<((i64, i64), RowId), QueryError>>,
     {
-        if !self.is_empty()? {
-            return Err(error(
-                crate::error::catalog::ER_GET_ERRNO,
-                "prelogged bulk index pair-int stream requires an empty index",
-            ));
-        }
-        let previous_lsn = btree_logical_wal::current();
-        btree_logical_wal::set(lsn);
-        let direct = self.durability != DurabilityMode::Memory;
-        let started = Instant::now();
-        let mut result = if direct {
-            self.bulk_load_sorted_pair_int_direct_stream_with_lsn(txn_id, entries)
-        } else {
-            let stream = entries.map(|entry| {
-                let ((left, right), row_id) = entry?;
-                Ok(pair_int_index_entry(left, right, row_id))
-            });
-            self.bulk_load_sorted_stream_with_lsn(txn_id, stream)
-        };
-        if result.is_err() {
-            let cleanup = if direct {
-                self.reset_empty_index_direct()
-            } else {
-                self.reset_empty_index_buffered()
-            };
-            if let Err(cleanup) = cleanup {
-                let original = result.expect_err("direct pair-int stream build failed");
-                result = Err(error(
-                    crate::error::catalog::ER_GET_ERRNO,
-                    format!(
-                        "pair-int stream build failed ({}); empty-index cleanup failed ({})",
-                        original.message(),
-                        cleanup.message()
-                    ),
-                ));
-            }
-        }
-        if result.is_ok() {
-            record_bulk_index_build(self, direct, started);
-        }
-        btree_logical_wal::set(previous_lsn);
-        result
+        self.with_prelogged_bulk_build(
+            lsn,
+            "prelogged bulk index pair-int stream requires an empty index",
+            "pair-int stream build failed",
+            |direct| {
+                if direct {
+                    self.bulk_load_sorted_pair_int_direct_stream_with_lsn(txn_id, entries)
+                } else {
+                    let stream = entries.map(|entry| {
+                        let ((left, right), row_id) = entry?;
+                        Ok(pair_int_index_entry(left, right, row_id))
+                    });
+                    self.bulk_load_sorted_stream_with_lsn(txn_id, stream)
+                }
+            },
+        )
     }
 
     fn reset_empty_index_buffered(&self) -> Result<(), QueryError> {

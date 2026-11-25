@@ -94,6 +94,28 @@ fn recursive_cte_working_delta_and_total_spools_round_trip() {
 }
 
 #[test]
+fn recursive_cte_packed_wide_rows_preserve_types_when_spilled() {
+    let sql = "WITH RECURSIVE t(n,u,d,s,b,dt,z) AS (\
+        SELECT 1, CAST(18446744073709550000 AS UNSIGNED), CAST(1.25 AS DECIMAL(10,2)), \
+            CAST(REPEAT('中文',512) AS CHAR(1024)), CAST(X'00FF' AS BINARY(2)), \
+            CAST('2024-01-01' AS DATE), NULL \
+        UNION ALL SELECT n+1,u+1,d+0.25,s,b,DATE_ADD(dt,INTERVAL 1 DAY),z \
+            FROM t WHERE n<65) \
+        SELECT n,u,d,s,HEX(b),dt,z FROM t ORDER BY n";
+    let in_memory = rows_with_env(&[("MYDB_CTE_SPILL_THRESHOLD_MB", None)], &[], sql);
+    let spilled = rows_with_env(&[("MYDB_CTE_SPILL_THRESHOLD_MB", Some("0"))], &[], sql);
+    let display = |rows: Vec<Vec<Value>>| {
+        rows.into_iter()
+            .map(|row| row.iter().map(Value::to_display_string).collect::<Vec<_>>())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(in_memory.len(), 65);
+    assert_eq!(in_memory[64][1], Value::UInt(18446744073709550064));
+    assert_eq!(in_memory[64][2].to_display_string(), "17.25");
+    assert_eq!(display(spilled), display(in_memory));
+}
+
+#[test]
 fn recursive_union_distinct_uses_spillable_history_set() {
     let setup = [
         "CREATE TABLE recursive_dupe (x INT NOT NULL)",

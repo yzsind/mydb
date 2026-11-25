@@ -431,7 +431,7 @@ pub(crate) fn validate_restore_path(relative: &str) -> Result<(), QueryError> {
     Ok(())
 }
 
-fn classify_file(relative: &str) -> FileClass {
+pub(crate) fn classify_file(relative: &str) -> FileClass {
     match Path::new(relative).extension().and_then(|ext| ext.to_str()) {
         Some("idx") => FileClass::Index,
         Some("hnsw" | "hvec" | "vmanifest" | "vpub") => FileClass::VectorIndex,

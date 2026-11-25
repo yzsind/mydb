@@ -74,6 +74,7 @@ pub(crate) mod count_witness;
 pub(in crate::engine::executor) mod group_input_filter;
 pub(in crate::engine::executor) mod join_domain;
 mod projection_parallel;
+pub(in crate::engine::executor) mod recursive_step;
 mod rollup_preaggregate;
 
 mod compact_sort_window;
@@ -3211,7 +3212,18 @@ pub(in crate::engine::executor) fn try_stream_analyzed_select(
     plan: &PhysicalPlan,
     filter: Option<crate::planner::RuntimeFilter>,
 ) -> Result<Option<crate::engine::api::StreamingResultSet>, QueryError> {
-    let output = if final_projection(plan).is_some() {
+    let output = analyzed_select_output(select, plan);
+    let budget =
+        mem_budget::current_budget().unwrap_or_else(|| Arc::new(mem_budget::MemBudget::from_env()));
+    let context = super::execution_context::ExecutionContext::capture_with_budget(txn, budget);
+    try_stream_native_plan_with_group_filter(db.clone(), txn, output, context, filter)
+}
+
+fn analyzed_select_output(
+    select: &crate::parser::Select,
+    plan: &PhysicalPlan,
+) -> Arc<PhysicalPlan> {
+    if final_projection(plan).is_some() {
         let output = Arc::new(plan.clone());
         analyze_stats::bind_plan_clone(&output, plan);
         output
@@ -3225,11 +3237,44 @@ pub(in crate::engine::executor) fn try_stream_analyzed_select(
             estimated_rows: crate::planner::estimated_rows(plan),
             cost: crate::planner::plan_cost(plan),
         })
+    }
+}
+
+/// Consume an internal SELECT on the caller's thread. Materialization already
+/// pulls the entire child before returning, so a protocol worker and channel
+/// only add a thread lifecycle per child (and per recursive CTE iteration).
+/// Capability checks complete before opening the graph, just as at the
+/// streaming boundary; execution errors never restart the child.
+pub(in crate::engine::executor) fn try_consume_analyzed_select<T>(
+    db: &Arc<Database>,
+    txn: TxnView,
+    select: &crate::parser::Select,
+    plan: &PhysicalPlan,
+    consume: impl FnOnce(Vec<crate::types::Column>, &mut dyn BatchOperator) -> Result<T, QueryError>,
+) -> Result<Option<T>, QueryError> {
+    let output = analyzed_select_output(select, plan);
+    preflight_runtime_parameters(&output)?;
+    let Some(template) = preflight_query_output_template(&output)? else {
+        return Ok(None);
     };
-    let budget =
-        mem_budget::current_budget().unwrap_or_else(|| Arc::new(mem_budget::MemBudget::from_env()));
-    let context = super::execution_context::ExecutionContext::capture_with_budget(txn, budget);
-    try_stream_native_plan_with_group_filter(db.clone(), txn, output, context, filter)
+    analyze_stats::register_execution_plan(&output)?;
+    let Some(mut input) = try_build_query_output_batch(db, txn, &output)? else {
+        return Err(crate::error::catalog::ER_INTERNAL_ERROR
+            .error("physical batch graph changed capability after preflight"));
+    };
+    NATIVE_RESULT_BATCH_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if output.any(|node| matches!(node, PhysicalPlan::SetOp { .. })) {
+        SETOP_BATCH_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    let columns = template
+        .iter()
+        .map(|field| crate::types::Column {
+            name: field.column.clone(),
+            column_type: field.column_type,
+            source: field.source.clone(),
+        })
+        .collect();
+    consume(columns, input.stream.as_mut()).map(Some)
 }
 
 /// Convert a fully lowered physical graph to the sole protocol row boundary.

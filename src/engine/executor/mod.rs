@@ -4139,22 +4139,6 @@ impl QueryEngine for StorageQueryEngine {
         self.sql_log.flush(kind)
     }
 
-    fn authenticate(
-        &self,
-        username: &str,
-        host: &str,
-        auth_response: &[u8],
-        auth_plugin: Option<&str>,
-    ) -> Result<AuthorizationContext, QueryError> {
-        self.authenticate_request(AuthRequest::legacy(
-            username,
-            host,
-            auth_response,
-            auth_plugin,
-        ))
-        .map(|outcome| outcome.context)
-    }
-
     fn auth_plugin_for_user(
         &self,
         username: &str,

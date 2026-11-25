@@ -4825,6 +4825,21 @@ pub(super) fn resolve_batch_constant_scalar_subqueries(
         fully_resolved: &mut bool,
         retained_bytes: &mut usize,
     ) -> Result<(), QueryError> {
+        // Keep this hot binder's original recursion and call ABI, with its
+        // shared context declared once instead of repeated at every edge.
+        macro_rules! rewrite_child {
+            ($child:expr) => {
+                rewrite(
+                    db,
+                    txn,
+                    $child,
+                    outer_template,
+                    eval_ctx,
+                    fully_resolved,
+                    retained_bytes,
+                )
+            };
+        }
         match expr {
             Expr::Subquery(subquery) => {
                 // mydb statement semantics deliberately materialize every
@@ -4864,15 +4879,7 @@ pub(super) fn resolve_batch_constant_scalar_subqueries(
             | Expr::IsNull(expr)
             | Expr::IsNotNull(expr)
             | Expr::GroupKeyRef { expr, .. } => {
-                rewrite(
-                    db,
-                    txn,
-                    expr,
-                    outer_template,
-                    eval_ctx,
-                    fully_resolved,
-                    retained_bytes,
-                )?;
+                rewrite_child!(expr)?;
             }
             Expr::Binary { left, right, .. }
                 if matches!(
@@ -4883,97 +4890,25 @@ pub(super) fn resolve_batch_constant_scalar_subqueries(
                 *fully_resolved = false;
             }
             Expr::Binary { left, right, .. } => {
-                rewrite(
-                    db,
-                    txn,
-                    left,
-                    outer_template,
-                    eval_ctx,
-                    fully_resolved,
-                    retained_bytes,
-                )?;
-                rewrite(
-                    db,
-                    txn,
-                    right,
-                    outer_template,
-                    eval_ctx,
-                    fully_resolved,
-                    retained_bytes,
-                )?;
+                rewrite_child!(left)?;
+                rewrite_child!(right)?;
             }
             Expr::InList { expr, list, .. } => {
-                rewrite(
-                    db,
-                    txn,
-                    expr,
-                    outer_template,
-                    eval_ctx,
-                    fully_resolved,
-                    retained_bytes,
-                )?;
+                rewrite_child!(expr)?;
                 for item in list {
-                    rewrite(
-                        db,
-                        txn,
-                        item,
-                        outer_template,
-                        eval_ctx,
-                        fully_resolved,
-                        retained_bytes,
-                    )?;
+                    rewrite_child!(item)?;
                 }
             }
             Expr::Between {
                 expr, low, high, ..
             } => {
-                rewrite(
-                    db,
-                    txn,
-                    expr,
-                    outer_template,
-                    eval_ctx,
-                    fully_resolved,
-                    retained_bytes,
-                )?;
-                rewrite(
-                    db,
-                    txn,
-                    low,
-                    outer_template,
-                    eval_ctx,
-                    fully_resolved,
-                    retained_bytes,
-                )?;
-                rewrite(
-                    db,
-                    txn,
-                    high,
-                    outer_template,
-                    eval_ctx,
-                    fully_resolved,
-                    retained_bytes,
-                )?;
+                rewrite_child!(expr)?;
+                rewrite_child!(low)?;
+                rewrite_child!(high)?;
             }
             Expr::Like { expr, pattern, .. } => {
-                rewrite(
-                    db,
-                    txn,
-                    expr,
-                    outer_template,
-                    eval_ctx,
-                    fully_resolved,
-                    retained_bytes,
-                )?;
-                rewrite(
-                    db,
-                    txn,
-                    pattern,
-                    outer_template,
-                    eval_ctx,
-                    fully_resolved,
-                    retained_bytes,
-                )?;
+                rewrite_child!(expr)?;
+                rewrite_child!(pattern)?;
             }
             Expr::Case {
                 operand,
@@ -4982,61 +4917,21 @@ pub(super) fn resolve_batch_constant_scalar_subqueries(
                 else_result,
             } => {
                 if let Some(operand) = operand {
-                    rewrite(
-                        db,
-                        txn,
-                        operand,
-                        outer_template,
-                        eval_ctx,
-                        fully_resolved,
-                        retained_bytes,
-                    )?;
+                    rewrite_child!(operand)?;
                 }
                 for condition in conditions {
-                    rewrite(
-                        db,
-                        txn,
-                        condition,
-                        outer_template,
-                        eval_ctx,
-                        fully_resolved,
-                        retained_bytes,
-                    )?;
+                    rewrite_child!(condition)?;
                 }
                 for result in results {
-                    rewrite(
-                        db,
-                        txn,
-                        result,
-                        outer_template,
-                        eval_ctx,
-                        fully_resolved,
-                        retained_bytes,
-                    )?;
+                    rewrite_child!(result)?;
                 }
                 if let Some(else_result) = else_result {
-                    rewrite(
-                        db,
-                        txn,
-                        else_result,
-                        outer_template,
-                        eval_ctx,
-                        fully_resolved,
-                        retained_bytes,
-                    )?;
+                    rewrite_child!(else_result)?;
                 }
             }
             Expr::Function { args, .. } | Expr::Tuple(args) => {
                 for arg in args {
-                    rewrite(
-                        db,
-                        txn,
-                        arg,
-                        outer_template,
-                        eval_ctx,
-                        fully_resolved,
-                        retained_bytes,
-                    )?;
+                    rewrite_child!(arg)?;
                 }
             }
             Expr::WindowFunction { args, spec, .. } => {
@@ -5047,37 +4942,13 @@ pub(super) fn resolve_batch_constant_scalar_subqueries(
                 } = spec.as_mut();
 
                 for arg in args {
-                    rewrite(
-                        db,
-                        txn,
-                        arg,
-                        outer_template,
-                        eval_ctx,
-                        fully_resolved,
-                        retained_bytes,
-                    )?;
+                    rewrite_child!(arg)?;
                 }
                 for partition in partition_by {
-                    rewrite(
-                        db,
-                        txn,
-                        partition,
-                        outer_template,
-                        eval_ctx,
-                        fully_resolved,
-                        retained_bytes,
-                    )?;
+                    rewrite_child!(partition)?;
                 }
                 for order in order_by {
-                    rewrite(
-                        db,
-                        txn,
-                        &mut order.expr,
-                        outer_template,
-                        eval_ctx,
-                        fully_resolved,
-                        retained_bytes,
-                    )?;
+                    rewrite_child!(&mut order.expr)?;
                 }
             }
             Expr::InSubquery {
@@ -5089,15 +4960,7 @@ pub(super) fn resolve_batch_constant_scalar_subqueries(
                     *fully_resolved = false;
                     return Ok(());
                 }
-                rewrite(
-                    db,
-                    txn,
-                    tested_expr,
-                    outer_template,
-                    eval_ctx,
-                    fully_resolved,
-                    retained_bytes,
-                )?;
+                rewrite_child!(tested_expr)?;
                 // The compiled set is retained for this operator's lifetime.
                 // Admit it by accounted bytes, rather than a fixed row count
                 // that forces otherwise small sets onto the per-row lane.
@@ -5201,28 +5064,12 @@ pub(super) fn resolve_batch_constant_scalar_subqueries(
                 };
             }
             Expr::QuantifiedComparison { left, right, .. } => {
-                rewrite(
-                    db,
-                    txn,
-                    left,
-                    outer_template,
-                    eval_ctx,
-                    fully_resolved,
-                    retained_bytes,
-                )?;
+                rewrite_child!(left)?;
                 match right {
                     QuantifiedComparisonRight::Subquery(_) => *fully_resolved = false,
                     QuantifiedComparisonRight::List(list) => {
                         for item in list {
-                            rewrite(
-                                db,
-                                txn,
-                                item,
-                                outer_template,
-                                eval_ctx,
-                                fully_resolved,
-                                retained_bytes,
-                            )?;
+                            rewrite_child!(item)?;
                         }
                     }
                 }
