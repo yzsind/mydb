@@ -78,7 +78,7 @@ Public product, SQL, deployment, and operations documentation. Start with the
 | [Error Codes](error-codes.md) | Error catalog and diagnostic details |
 | [Performance Comparison](performance-comparison.md) | Published measurements, test conditions, and interpretation |
 | [Sysbench: 100M Rows, 300 Clients](sysbench-100m-300clients-2026-11-16.md) | Four five-minute OLTP measurements over a private network, November 16, 2026 |
-| [Cohere 1M HNSW vs. PostgreSQL, November 14](vector-cohere-1m-hnsw-benchmark-2026-11-14.md) | Comparison record: search throughput, build time, recall, and latency |
+| [Cohere 1M HNSW vs. pgvector, November 24](vector-cohere-1m-hnsw-benchmark-2026-11-24.md) | Query-candidate memoization disabled; 32 GiB and 2 GiB throughput, build time, recall, and latency |
 
 ## Machine-Readable References and Licenses
 

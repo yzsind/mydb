@@ -58,7 +58,9 @@ def statement(cfg):
     return f"SELECT id FROM {table} ORDER BY {column} <=> %s::vector LIMIT {k}"
 
 
-def vector(q):
+def vector(q, precision=0):
+    if precision:
+        return "[" + ",".join(format(x, f".{precision}g") for x in q["vector"]) + "]"
     return json.dumps(q["vector"], separators=(",", ":"))
 
 
@@ -69,20 +71,54 @@ def worker(payload):
     with connect(cfg) as c, c.cursor() as cur:
         setup(cur, cfg)
         sql = statement(cfg)
+        encoded = (
+            [vector(q, cfg["precision"]) for q in queries]
+            if cfg["preencode"] else None
+        )
+
+        def parameter(qi):
+            return encoded[qi] if encoded is not None else vector(queries[qi], cfg["precision"])
+
         for _ in range(3):
-            cur.execute(sql, (vector(queries[index % len(queries)]),))
+            cur.execute(sql, (parameter(index % len(queries)),))
             cur.fetchall()
         while time.time() < start:
             time.sleep(0.001)
         begin = time.perf_counter()
         while time.perf_counter() - begin < cfg["duration"]:
-            q = queries[(index + count) % len(queries)]
+            qi = (index + count) % len(queries)
             t = time.perf_counter()
-            cur.execute(sql, (vector(q),))
+            cur.execute(sql, (parameter(qi),))
             cur.fetchall()
             latencies.append((time.perf_counter() - t) * 1000)
             count += 1
         return count, time.perf_counter() - begin, latencies
+
+
+def run_rounds(cfg, queries):
+    rounds = []
+    for _ in range(cfg["rounds"]):
+        with ProcessPoolExecutor(max_workers=cfg["clients"]) as pool:
+            start = time.time() + (6 if cfg["preencode"] else 3)
+            runs = list(
+                pool.map(
+                    worker, [(cfg, queries, i, start) for i in range(cfg["clients"])]
+                )
+            )
+        samples = sorted(t for _, _, ts in runs for t in ts)
+        percentile = lambda q, samples=samples: samples[
+            min(len(samples) - 1, int((len(samples) - 1) * q))
+        ]
+        rounds.append(
+            {
+                "qps": sum(n for n, _, _ in runs)
+                / max(elapsed for _, elapsed, _ in runs),
+                "p50_ms": percentile(0.5),
+                "p95_ms": percentile(0.95),
+                "p99_ms": percentile(0.99),
+            }
+        )
+    return rounds
 
 
 def main():
@@ -102,6 +138,9 @@ def main():
     p.add_argument("--clients", type=int, default=16)
     p.add_argument("--duration", type=float, default=10)
     p.add_argument("--rounds", type=int, default=3)
+    p.add_argument("--preencode", action="store_true", help="Encode query vectors before timed replay")
+    p.add_argument("--precision", type=int, choices=range(10), default=0,
+                   help="Query text significant digits; 0 preserves the full JSON representation")
     args = p.parse_args()
     cfg = vars(args).copy()
     for name in ["table", "column"]:
@@ -122,35 +161,14 @@ def main():
         setup(cur, cfg)
         cur.execute("SELECT VERSION()")
         version = cur.fetchone()[0]
-        cur.execute("EXPLAIN " + statement(cfg), (vector(queries[0]),))
+        cur.execute("EXPLAIN " + statement(cfg), (vector(queries[0], args.precision),))
         plan = [list(row) for row in cur.fetchall()]
         recall = []
         for q in queries:
-            cur.execute(statement(cfg), (vector(q),))
+            cur.execute(statement(cfg), (vector(q, args.precision),))
             ids = {int(row[0]) for row in cur.fetchall()}
             recall.append(len(ids & set(q["neighbors"][: args.k])) / args.k)
-    rounds = []
-    for _ in range(args.rounds):
-        with ProcessPoolExecutor(max_workers=args.clients) as pool:
-            start = time.time() + 3
-            runs = list(
-                pool.map(
-                    worker, [(cfg, queries, i, start) for i in range(args.clients)]
-                )
-            )
-        samples = sorted(t for _, _, ts in runs for t in ts)
-        percentile = lambda q, samples=samples: samples[
-            min(len(samples) - 1, int((len(samples) - 1) * q))
-        ]
-        rounds.append(
-            {
-                "qps": sum(n for n, _, _ in runs)
-                / max(elapsed for _, elapsed, _ in runs),
-                "p50_ms": percentile(0.5),
-                "p95_ms": percentile(0.95),
-                "p99_ms": percentile(0.99),
-            }
-        )
+    rounds = run_rounds(cfg, queries)
     result = {
         "engine_version": version,
         "configuration": {
