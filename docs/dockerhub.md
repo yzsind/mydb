@@ -78,17 +78,19 @@ on 16 vCPU cores. It used a separate client host, sysbench's `special` access
 distribution, and one 300-second run; see the public
 [sysbench record](https://github.com/yzsind/mydb/blob/main/docs/sysbench-100m-300clients-2026-11-16.md).
 
-The public [November 14 Cohere HNSW result record](https://github.com/yzsind/mydb/blob/main/docs/vector-cohere-1m-hnsw-benchmark-2026-11-14.md)
-reports 5,200 vs 1,954 queries/s at 16 clients (2.7x) for MyDB and PostgreSQL
-18.6 + pgvector 0.8.7. Recall@100 was 94.8% vs 94.4%; p99 latency was
-5.6 vs 14.7 ms. HNSW build times were 53 vs 118 seconds, and single-client
-throughput was 670 vs 179 queries/s.
+The [November 24 Cohere 1M HNSW benchmark](https://github.com/yzsind/mydb/blob/main/docs/vector-cohere-1m-hnsw-benchmark-2026-11-24.md)
+reports **5,121 vs 2,142 queries/s (2.39x)** at 16 clients with a
+32 GiB database memory limit, and **458 vs 139 queries/s (3.29x)**
+with a 2 GiB limit, for MyDB and PostgreSQL 18.6 + pgvector 0.8.7.
+MyDB query-candidate memoization was disabled. Recall@100 was
+94.741% vs 94.395% at 32 GiB and
+95.331% vs 94.341% at 2 GiB.
 
-Both engines used the same 16-vCPU host, `m=16`, `ef_construction=64`,
-`ef_search=200`, unquantized FLOAT32 indexes, and durable commits. MyDB uses
-auxiliary 8-bit navigation codes with exact candidate rescoring. These are
-historical development measurements; the result record identifies the source
-commits and reporting limits.
+Both engines used the same 16-vCPU host, cosine Top-100, `m=16`,
+`ef_construction=64`, effective `ef_search=200`, FLOAT32 storage, and durable
+commits. The report provides build times, latency, and measurement details.
+It identifies the tested development build and does not benchmark the current
+Docker image.
 
 ## Quick start
 

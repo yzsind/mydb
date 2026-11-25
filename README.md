@@ -71,20 +71,19 @@ historical three-engine subset. TPC-derived results are unaudited. See the
 [detailed comparison](docs/performance-comparison.md) for results, test
 conditions, result differences, and limitations.
 
-**Cohere 1M HNSW**, November 14, 2026, 768-dimensional FLOAT32 cosine top-100:
+**Cohere 1M HNSW**, November 24, 2026: 768-dimensional FLOAT32 cosine Top-100,
+with MyDB query-candidate memoization disabled.
 
-| Measurement | MyDB | PostgreSQL 18.6 + pgvector 0.8.7 | Advantage |
+| Database memory limit | MyDB, 16 clients | PostgreSQL 18.6 + pgvector 0.8.7 | MyDB throughput |
 | --- | ---: | ---: | ---: |
-| Search, 1 client | 670 queries/s | 179 queries/s | **3.7x throughput** |
-| Search, 16 clients | 5,200 queries/s | 1,954 queries/s | **2.7x throughput** |
-| Search p99 latency, 16 clients | 5.6 ms | 14.7 ms | **2.6x lower latency** |
-| Recall@100 | 94.8% | 94.4% | Comparable (+0.4 pp) |
-| HNSW build | 53 s | 118 s | **2.2x speedup** |
+| 32 GiB | 5,121 queries/s | 2,142 queries/s | **2.39x** |
+| 2 GiB | 458 queries/s | 139 queries/s | **3.29x** |
 
-The reported search throughput ratio is 2.7x at 16 clients. Both engines used
-the same 16-vCPU host,and durable commits. Sources, exact settings, and
-reporting limits are documented in the
-[November 14 Cohere 1M result record](docs/vector-cohere-1m-hnsw-benchmark-2026-11-14.md).
+Both engines used the same 16-vCPU host and durable commits. At 32 GiB,
+Recall@100 was 94.741% vs 94.395%; at 2 GiB it was
+95.331% vs 94.341%. See the
+[Cohere 1M benchmark](docs/vector-cohere-1m-hnsw-benchmark-2026-11-24.md) for index-build times,
+latency, settings, and all query rounds.
 
 ## Testing
 

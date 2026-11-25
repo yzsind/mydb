@@ -118,20 +118,19 @@ PITR described under [HTAP mixed workloads](#htap-mixed-workloads).
 
 ### Published vector-search evidence
 
-The November 14, 2026 HNSW comparison used one million 768-dimensional
-FLOAT32 vectors and cosine Top-100 retrieval. Reported throughput at 16
-clients was **5,200 queries/s** for MyDB, compared with **1,954 queries/s**
-for PostgreSQL 18.6 with pgvector 0.8.7: **2.7x**. Recall@100 was **94.8%**
-and **94.4%**, respectively; p99 latency was **5.6 ms vs 14.7 ms**.
-HNSW build time was **53 s vs 118 s**.
+The November 24, 2026 Cohere HNSW benchmark compares one million
+768-dimensional FLOAT32 vectors with cosine Top-100 retrieval and MyDB
+query-candidate memoization disabled. At 16 clients, MyDB delivered
+**5,121 vs 2,142 queries/s (2.39x)** under a 32 GiB database memory
+limit, and **458 vs 139 queries/s (3.29x)** under a 2 GiB limit,
+compared with PostgreSQL 18.6 and pgvector 0.8.7.
 
-Both engines used the same 16-vCPU host, `m=16`, `ef_construction=64`,
-`ef_search=200`, unquantized FLOAT32 indexes, and durable commits. MyDB uses
-auxiliary 8-bit navigation codes with exact candidate rescoring. Sources,
-exact settings, and reporting limits are documented in the
-[November 14 Cohere 1M result record](vector-cohere-1m-hnsw-benchmark-2026-11-14.md);
-results on other datasets, recall targets, and write workloads should be
-measured on the application's own data.
+Recall@100 was 94.741% vs 94.395% at 32 GiB and
+95.331% vs 94.341% at 2 GiB. Both engines used the same
+16-vCPU host, `m=16`, `ef_construction=64`, effective `ef_search=200`, and
+durable commits. MyDB uses auxiliary 8-bit navigation codes with exact candidate
+rescoring. See the [Cohere 1M benchmark](vector-cohere-1m-hnsw-benchmark-2026-11-24.md) for build times,
+latency, measurement details, and per-round results.
 
 ## HTAP mixed workloads
 
