@@ -438,9 +438,7 @@ pub(crate) struct NativeHnsw {
     lineage: u64,
     generation: std::sync::atomic::AtomicU64,
     persisted_lsn: std::sync::atomic::AtomicU64,
-    candidates_returned: std::sync::atomic::AtomicU64,
-    heap_reranks: std::sync::atomic::AtomicU64,
-    exact_fallbacks: std::sync::atomic::AtomicU64,
+    query_counters: super::query_stats::QueryCounters,
     #[cfg(test)]
     csr_build_failure: Mutex<Option<QueryError>>,
 }
@@ -488,9 +486,7 @@ impl NativeHnsw {
             lineage: 0,
             generation: std::sync::atomic::AtomicU64::new(0),
             persisted_lsn: std::sync::atomic::AtomicU64::new(0),
-            candidates_returned: std::sync::atomic::AtomicU64::new(0),
-            heap_reranks: std::sync::atomic::AtomicU64::new(0),
-            exact_fallbacks: std::sync::atomic::AtomicU64::new(0),
+            query_counters: super::query_stats::QueryCounters::default(),
             #[cfg(test)]
             csr_build_failure: Mutex::new(None),
         })
@@ -1025,22 +1021,15 @@ impl NativeHnsw {
         self.quantizer = quantizer;
     }
     pub(crate) fn query_stats(&self) -> (u64, u64, u64, u64) {
-        (
-            self.generation.load(Ordering::Acquire),
-            self.candidates_returned.load(Ordering::Relaxed),
-            self.heap_reranks.load(Ordering::Relaxed),
-            self.exact_fallbacks.load(Ordering::Relaxed),
-        )
+        let generation = self.generation.load(Ordering::Acquire);
+        let (candidates, heap, fallbacks) = self.query_counters.snapshot();
+        (generation, candidates, heap, fallbacks)
     }
     pub(crate) fn record_query_stats(&self, candidates: u64, heap: u64, fallback: bool) {
         if !self.quantization_requested {
             return;
         }
-        self.candidates_returned
-            .fetch_add(candidates, Ordering::Relaxed);
-        self.heap_reranks.fetch_add(heap, Ordering::Relaxed);
-        self.exact_fallbacks
-            .fetch_add(u64::from(fallback), Ordering::Relaxed);
+        self.query_counters.record(candidates, heap, fallback);
     }
     pub(crate) fn quantization_pending(&self) -> bool {
         self.quantization_requested && self.quantizer().is_none()

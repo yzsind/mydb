@@ -25,6 +25,7 @@ mod aggregate_existence;
 mod consumer_domain;
 pub(super) mod grouped_domain;
 mod grouped_share;
+mod packed_rows;
 pub(crate) mod spool;
 
 thread_local! {
@@ -2783,16 +2784,25 @@ pub(super) fn materialize_cte_from_physical(
     // in `prepare_select_for_planning` before reaching the executor.
     let mut execution_select = select.clone();
     crate::planner::bind_rollup_select_for_execution(db, &mut execution_select)?;
-    if let Some(stream) = with_cte_materialization(|| {
-        super::select::vec_bridge::try_stream_analyzed_select(
+    if let Some(mut result) = with_cte_materialization(|| {
+        super::select::vec_bridge::try_consume_analyzed_select(
             db,
             txn,
             &execution_select,
             plan,
-            None,
+            |columns, stream| {
+                let mut builder =
+                    CteSpillBuilder::new_with_stats(columns, db.data_dir().to_path_buf());
+                while let Some(batch) = stream.next_batch()? {
+                    crate::engine::cancel::check_cancelled()?;
+                    builder.push_batch(&batch)?;
+                }
+                builder.finish()
+            },
         )
     })? {
-        return route_response_to_cte_result(db, QueryResponse::StreamingResultSet(stream), cte);
+        apply_column_aliases(&mut result, &cte.columns, &cte.name)?;
+        return Ok(result);
     }
     // A large estimate selects bounded consumption, not a different join
     // executor. Keep native batches for supported projections, including FULL
@@ -3752,7 +3762,7 @@ fn materialize_recursive(
         Arc::new(builder.finish()?)
     };
     let mut total_builder =
-        CteSpillBuilder::new_with_stats(total_columns.clone(), db.data_dir().to_path_buf());
+        packed_rows::PackedRows::new(total_columns.clone(), db.data_dir().to_path_buf());
     let mut emitted_rows = 0usize;
     let mut anchor_rows = CteResultRowCursor::open(Arc::clone(&working))?;
     while emitted_rows < row_cap {
@@ -3764,6 +3774,7 @@ fn materialize_recursive(
         }
         emitted_rows += 1;
     }
+    drop(anchor_rows);
     if emitted_rows >= row_cap {
         return total_builder.finish();
     }
@@ -3801,7 +3812,7 @@ fn materialize_recursive(
             }
         })
         .collect();
-    let coerce_row = |mut row: Vec<Value>| -> Result<Vec<Value>, QueryError> {
+    let coerce_row = |row: &mut [Value]| -> Result<(), QueryError> {
         if row.len() != total_columns.len() {
             return Err(error(
                 crate::error::catalog::ER_WRONG_NUMBER_OF_COLUMNS_IN_SELECT,
@@ -3857,7 +3868,7 @@ fn materialize_recursive(
                 }
             }
         }
-        Ok(row)
+        Ok(())
     };
     let owned_recursive_plans = recursive_selects
         .iter()
@@ -3872,6 +3883,114 @@ fn materialize_recursive(
             }
         })
         .collect::<Result<Vec<_>, QueryError>>()?;
+    // A unary recursive term cannot fan out a single-row delta. Bind its
+    // existing scalar kernels once and alternate two admitted row buffers,
+    // rather than reopening a batch graph and publishing a new working spool
+    // on every iteration. SQL-visible ordering and assignment stay unchanged.
+    if union_all
+        && recursive_selects.len() == 1
+        && working.spill.is_none()
+        && working.store.nrows() == 1
+        && cte_spill_threshold_bytes() > 0
+    {
+        let plan = supplied_branches
+            .map(|(_, plan)| plan)
+            .or(owned_recursive_plans[0].as_ref());
+        if let Some(step) = plan
+            .map(|plan| {
+                super::select::vec_bridge::recursive_step::RecursiveStep::compile(
+                    &recursive_selects[0],
+                    plan,
+                    &cte.name,
+                )
+            })
+            .transpose()?
+            .flatten()
+        {
+            if step.columns.len() != total_columns.len() {
+                return Err(error(
+                    crate::error::catalog::ER_WRONG_NUMBER_OF_COLUMNS_IN_SELECT,
+                    "The used SELECT statements have a different number of columns",
+                ));
+            }
+            use crate::engine::executor::memory_footprint::AllocatedBytes;
+            let mut row = working
+                .store
+                .copy_row(0)?
+                .expect("single-row recursive delta");
+            let mut next = crate::engine::executor::mem_budget::try_vec_with_capacity(
+                total_columns.len(),
+                "recursive scalar delta",
+            )?;
+            let mut admitted_payload = row.iter().map(Value::allocated_bytes).sum::<usize>();
+            let mut charge = crate::engine::executor::mem_budget::force_charge_scoped(
+                (row.capacity() + next.capacity()) * std::mem::size_of::<Value>()
+                    + admitted_payload,
+            )?;
+            let variable_payload = total_columns.iter().chain(&step.columns).any(|column| {
+                matches!(
+                    column.column_type,
+                    ColumnType::VarString
+                        | ColumnType::Blob
+                        | ColumnType::Json
+                        | ColumnType::Geometry
+                        | ColumnType::Vector
+                        | ColumnType::Decimal { .. }
+                )
+            });
+            return with_cte_materialization(|| {
+                let mut depth = 0;
+                loop {
+                    crate::engine::cancel::check_cancelled()?;
+                    if depth >= depth_limit {
+                        return Err(error(
+                            crate::error::catalog::ER_CTE_MAX_RECURSION_DEPTH,
+                            format!(
+                                "recursive CTE '{}' exceeded cte_max_recursion_depth ({})",
+                                cte.name, depth_limit
+                            ),
+                        ));
+                    }
+                    if !step.evaluate(&row, &mut next)? {
+                        break;
+                    }
+                    if variable_payload {
+                        let payload = row
+                            .iter()
+                            .chain(&next)
+                            .map(Value::allocated_bytes)
+                            .sum::<usize>();
+                        if payload > admitted_payload {
+                            charge.add_force(payload - admitted_payload)?;
+                            admitted_payload = payload;
+                        }
+                    }
+                    coerce_row(&mut next)?;
+                    if variable_payload {
+                        let payload = row
+                            .iter()
+                            .chain(&next)
+                            .map(Value::allocated_bytes)
+                            .sum::<usize>();
+                        if payload > admitted_payload {
+                            charge.add_force(payload - admitted_payload)?;
+                            admitted_payload = payload;
+                        }
+                    }
+                    if emitted_rows >= offset {
+                        total_builder.push_values(&next)?;
+                    }
+                    emitted_rows += 1;
+                    if emitted_rows >= row_cap {
+                        return total_builder.finish();
+                    }
+                    std::mem::swap(&mut row, &mut next);
+                    depth += 1;
+                }
+                total_builder.finish()
+            });
+        }
+    }
     // Step 2: iterate.
     let mut depth: u32 = 0;
     let depth_first = union_all && recursive_selects.len() > 1;
@@ -3925,6 +4044,77 @@ fn materialize_recursive(
             let recursive_plan = supplied_branches
                 .map(|(_, plan)| plan)
                 .or(owned_plan.as_ref());
+            let mut consume_row = |mut row: Vec<Value>| -> Result<bool, QueryError> {
+                coerce_row(&mut row)?;
+                if let Some(builder) = produced_builder.as_mut() {
+                    builder.push(row)?;
+                } else {
+                    if emitted_rows >= offset {
+                        total_builder.push(row.clone())?;
+                    }
+                    emitted_rows += 1;
+                    if emitted_rows >= row_cap {
+                        return Ok(true);
+                    }
+                    next_builder.push(row)?;
+                }
+                Ok(false)
+            };
+            if let Some(plan) = recursive_plan {
+                let consumed = with_cte_materialization(|| {
+                    super::select::vec_bridge::try_consume_analyzed_select(
+                        db,
+                        txn,
+                        recursive_select,
+                        plan,
+                        |columns, stream| {
+                            if columns.len() != total_columns.len() {
+                                return Err(error(
+                                    crate::error::catalog::ER_WRONG_NUMBER_OF_COLUMNS_IN_SELECT,
+                                    "The used SELECT statements have a different number of columns",
+                                ));
+                            }
+                            while let Some(batch) = stream.next_batch()? {
+                                crate::engine::cancel::check_cancelled()?;
+                                for index in batch.visible_indices() {
+                                    let mut row = batch.row(index);
+                                    // Preserve the child SELECT's result boundary
+                                    // before assignment to the anchor's types.
+                                    for (value, column) in row.iter_mut().zip(&columns) {
+                                        if column.column_type == ColumnType::Float {
+                                            if let Value::Double(number) = value {
+                                                *value = Value::Float(*number as f32);
+                                            }
+                                        } else if matches!(
+                                            column.column_type,
+                                            ColumnType::Decimal { .. }
+                                        ) {
+                                            if let std::borrow::Cow::Owned(shaped) =
+                                                crate::engine::expr::decimal_result_value(
+                                                    value,
+                                                    column.column_type,
+                                                )
+                                            {
+                                                *value = shaped;
+                                            }
+                                        }
+                                    }
+                                    if consume_row(row)? {
+                                        return Ok(true);
+                                    }
+                                }
+                            }
+                            Ok(false)
+                        },
+                    )
+                })?;
+                if let Some(reached_cap) = consumed {
+                    if reached_cap {
+                        return total_builder.finish();
+                    }
+                    continue;
+                }
+            }
             let recursive_def = CteDef {
                 name: cte.name.clone(),
                 columns: total_columns
@@ -3951,18 +4141,8 @@ fn materialize_recursive(
             }
             let mut cursor = CteResultRowCursor::open(Arc::new(produced))?;
             while let Some(row) = cursor.next_row()? {
-                let row = coerce_row(row)?;
-                if let Some(builder) = produced_builder.as_mut() {
-                    builder.push(row)?;
-                } else {
-                    if emitted_rows >= offset {
-                        total_builder.push(row.clone())?;
-                    }
-                    emitted_rows += 1;
-                    if emitted_rows >= row_cap {
-                        return total_builder.finish();
-                    }
-                    next_builder.push(row)?;
+                if consume_row(row)? {
+                    return total_builder.finish();
                 }
             }
         }

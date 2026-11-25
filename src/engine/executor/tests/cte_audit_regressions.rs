@@ -60,6 +60,142 @@ fn cte_audit_recursive_assignment() {
 }
 
 #[test]
+fn recursive_cte_large_depth_preserves_projection_types_and_multiple_consumers() {
+    let (_dir, e) = engine();
+    let mut session = SessionContext::default();
+    e.execute_with_session(&mut session, "SET cte_max_recursion_depth=20000")
+        .unwrap();
+    let sql = "WITH RECURSIVE t AS (SELECT 1 a UNION ALL SELECT a+1 FROM t WHERE a<10000) \
+        SELECT SUM(a), COUNT(*), MIN(a), MAX(a) FROM t";
+    let result = e
+        .execute_with_session(&mut session, sql)
+        .unwrap()
+        .materialize()
+        .unwrap();
+    let QueryResponse::ResultSet(result) = result else {
+        panic!("expected rows")
+    };
+    assert_eq!(
+        result.rows[0]
+            .iter()
+            .map(Value::to_display_string)
+            .collect::<Vec<_>>(),
+        ["50005000", "10000", "1", "10000"]
+    );
+
+    let sql = "WITH RECURSIVE t(n,u,d,s,b,dt,z) AS (\
+        SELECT 1, CAST(18446744073709551600 AS UNSIGNED), CAST(1.25 AS DECIMAL(10,2)), \
+            CAST('中文' AS CHAR(16)), CAST(X'00FF' AS BINARY(2)), CAST('2024-01-01' AS DATE), NULL \
+        UNION ALL SELECT n+1,u+1,d+0.25,CONCAT(s,'a'),b,DATE_ADD(dt,INTERVAL 1 DAY),z \
+            FROM t WHERE n<4) \
+        SELECT a.n,a.u,a.d,a.s,HEX(a.b),a.dt,a.z,b.n FROM t a JOIN t b ON a.n=b.n ORDER BY a.n";
+    let result = rows(&e, sql);
+    let display = result
+        .iter()
+        .map(|row| row.iter().map(Value::to_display_string).collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        display,
+        vec![
+            vec![
+                "1",
+                "18446744073709551600",
+                "1.25",
+                "中文",
+                "00FF",
+                "2024-01-01",
+                "NULL",
+                "1"
+            ],
+            vec![
+                "2",
+                "18446744073709551601",
+                "1.50",
+                "中文a",
+                "00FF",
+                "2024-01-02",
+                "NULL",
+                "2"
+            ],
+            vec![
+                "3",
+                "18446744073709551602",
+                "1.75",
+                "中文aa",
+                "00FF",
+                "2024-01-03",
+                "NULL",
+                "3"
+            ],
+            vec![
+                "4",
+                "18446744073709551603",
+                "2.00",
+                "中文aaa",
+                "00FF",
+                "2024-01-04",
+                "NULL",
+                "4"
+            ],
+        ]
+    );
+}
+
+#[test]
+fn recursive_cte_delta_batches_keep_filters_offsets_and_depth_errors() {
+    let (_dir, e) = engine();
+    let sql = "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT 10 UNION ALL \
+        SELECT n+1 FROM t WHERE n<3 OR (n>=10 AND n<12) LIMIT 4 OFFSET 1) SELECT n FROM t";
+    assert_eq!(
+        rows(&e, sql),
+        vec![
+            vec![Value::Int(10)],
+            vec![Value::Int(2)],
+            vec![Value::Int(11)],
+            vec![Value::Int(3)]
+        ]
+    );
+    let err = e
+        .execute(
+            "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM t) SELECT SUM(n) FROM t",
+        )
+        .unwrap_err();
+    assert_eq!(err.code(), 3636);
+    assert_eq!(rows(&e, "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM t WHERE n<3) SELECT SUM(n) FROM t")[0][0].to_display_string(), "6");
+}
+
+#[test]
+fn recursive_cte_reuses_compiled_steps_with_aliases_pruning_and_row_goals() {
+    use crate::engine::executor::select::vec_bridge::recursive_step::RECURSIVE_STEP_HITS;
+    use std::sync::atomic::Ordering;
+    let (_dir, e) = engine();
+    let before = RECURSIVE_STEP_HITS.load(Ordering::Relaxed);
+    let result = rows(
+        &e,
+        "WITH RECURSIVE t(n,pad,x,z) AS (\
+        SELECT 1,999,2,NULL UNION ALL SELECT r.n+1,999,r.x*2,r.z FROM t r WHERE r.n<10\
+        ) SELECT SUM(n),SUM(pad),SUM(x),COUNT(z) FROM t",
+    );
+    assert_eq!(
+        result[0]
+            .iter()
+            .map(Value::to_display_string)
+            .collect::<Vec<_>>(),
+        ["55", "9990", "2046", "0"]
+    );
+    assert!(RECURSIVE_STEP_HITS.load(Ordering::Relaxed) > before);
+    let result = rows(
+        &e,
+        "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL \
+        SELECT n+1 FROM t WHERE n<31 LIMIT 5 OFFSET 7) SELECT n FROM t",
+    );
+    assert_eq!(
+        result,
+        (8..=12).map(|n| vec![Value::Int(n)]).collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn cte_audit_validation() {
     let (_dir, e) = engine();
     for (sql, code) in [

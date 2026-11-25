@@ -15,6 +15,7 @@ pub(crate) mod ivf;
 pub(crate) mod native_hnsw;
 pub(crate) mod native_ivf;
 pub(crate) mod persistence;
+mod query_stats;
 pub(crate) mod scan_codes;
 pub(crate) mod selection;
 pub(crate) mod session;
@@ -27,6 +28,9 @@ mod hnsw_bug_audit_tests;
 
 #[cfg(test)]
 mod hnsw_nav_recall_tests;
+
+#[cfg(test)]
+mod query_stats_tests;
 
 use crate::types::QueryError;
 
