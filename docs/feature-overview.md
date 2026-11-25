@@ -7,7 +7,7 @@ mydb is a single-node general-purpose relational database designed for HTAP
 retrieval and MySQL-compatible access. Transactional reads and writes and
 analytical queries share the same engine and business data.
 
-**Release maturity.** MyDB 1.0.2 is a public-preview release intended for
+**Release maturity.** MyDB 1.0.3 is a public-preview release intended for
 feature validation, compatibility testing, and evaluation in controlled
 environments. It is not yet a production-grade MySQL replacement in every
 dimension: on-disk formats are not guaranteed to be backward compatible, and

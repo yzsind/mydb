@@ -1,10 +1,11 @@
 # Current Source Changes
 
-This page describes the source checkout as reviewed on November 24, 2026,
-after the `v1.0.2` release. The package version remains `1.0.2`; that string
-does not mean a source build has the same features or physical formats as the
-release archive. For release behavior, use the documentation at its Git tag.
-MyDB remains a public preview for controlled evaluation.
+This page describes the source checkout as reviewed on November 24, 2026.
+The package version is `1.0.3`; see the [1.0.3 release notes](release-notes-1.0.3.md)
+for changes since `v1.0.2` and migration requirements. A product version string
+alone does not identify compatible physical formats. For release behavior,
+use the documentation at its Git tag. MyDB remains a public preview for
+controlled evaluation.
 
 ## Physical compatibility
 

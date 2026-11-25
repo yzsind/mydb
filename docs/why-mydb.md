@@ -18,7 +18,7 @@ For teams building business applications and AI agents, this means fewer data
 copies to synchronize, less application code to connect retrieval with business
 data, and more database work expressed through SQL.
 
-MyDB 1.0.2 is a public-preview release intended for feature validation and
+MyDB 1.0.3 is a public-preview release intended for feature validation and
 controlled-environment evaluation. The [Feature Overview](feature-overview.md)
 and [MySQL Compatibility](mysql80-compatibility.md) describe supported behavior,
 release maturity, and detailed boundaries.

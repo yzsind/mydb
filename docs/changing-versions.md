@@ -7,11 +7,12 @@ describes that source revision. Use the docs from the matching Git tag when
 operating a release; the [format registry](storage-format-versions.md) on main
 must not be assumed to describe an older downloaded binary.
 
-In particular, the current source still reports product version `1.0.2`, but
-its catalog format is 75, compared with 72 in the released 1.0.2 archive.
+In particular, the current source reports product version `1.0.3` and uses
+catalog format 75, compared with 72 in the released 1.0.2 archive.
 These builds cannot share a data directory, physical backup upgrade path or
 native replication stream. Use the logical-transfer path below when moving
-from that archive to this checkout; see [current source changes](current-source.md).
+from 1.0.2 to 1.0.3; see the [1.0.3 release notes](release-notes-1.0.3.md)
+and [current source changes](current-source.md).
 
 ## Choose a path
 

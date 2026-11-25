@@ -1,6 +1,6 @@
 # Security Deployment
 
-MyDB 1.0.2 is a public-preview release for controlled evaluation; see the
+MyDB 1.0.3 is a public-preview release for controlled evaluation; see the
 [Feature Overview](feature-overview.md) for release maturity. Keep the default quick-start
 commands unchanged: the MySQL listener binds all IPv4 interfaces on port 8738.
 Account matching and listener binding are separate controls. A fresh root account

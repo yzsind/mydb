@@ -15,6 +15,7 @@ retain their original scope and measurements.
 | Document | Contents |
 | --- | --- |
 | [Project README](../README.md) | Downloads, quick start, building, and client examples |
+| [MyDB 1.0.3 Release Notes](release-notes-1.0.3.md) | Partial indexes, transactional full-text statistics, SQL and recovery fixes, and required logical migration |
 | [MyDB 1.0.2 Release Notes](release-notes-1.0.2.md) | Public preview, changes since 1.0.1, and the required logical migration |
 | [MyDB 1.0.1 Release Notes](release-notes-1.0.1.md) | Public preview, changes since 1.0.0, and migration requirements |
 | [MyDB 1.0.0 Release Notes](release-notes-1.0.0.md) | Public-preview scope, features, packages, and compatibility boundaries |
