@@ -50,9 +50,17 @@ AI credentials and TLS keys have distinct storage and rotation procedures:
 | AI secrets and encryption key | [AI credentials](ai.md#encrypted-api-keys) |
 | TLS certificate/private key and CA | [TLS configuration](configuration.md#tls) |
 | Backup encryption key | [Encrypted backups](backup-and-recovery.md#92-configure-encrypted-archiving) |
+| MySQL receiver source password | [Private channel metadata](statement/replication/change-replication-source.md#privileges-results-and-operational-details); plaintext at rest, protected by filesystem ownership and permissions |
+| Native replication token and peer certificates | [Native replication configuration](native-replication.md#configuration); protected token on both peers and mTLS for remote links |
 
 Back up required keys separately in protected storage before rotation or recovery.
 A data backup alone does not recreate external key files or node-local policy.
+For logical channel metadata, protect the entire path and copies of the files:
+Unix credential files must be server-owned regular files without group/other
+access or hard links, and private metadata directories must not be symlinks.
+Windows deployments require server-account ACLs and reject reparse points below
+the data root. A configured data-root alias is allowed. Unsafe metadata is
+rejected during configuration or restart; repair permissions before retrying.
 Rehearse reopening encrypted credentials after restart and recovery before
 retiring old keys. Never paste secret material into issue reports or SQL logs.
 

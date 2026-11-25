@@ -70,9 +70,10 @@ results or affected-row counts with MySQL:
 - Nonrecursive CTEs can reference a CTE defined later in the same `WITH` clause.
   Window position functions return signed integers, so subtracting two
   `ROW_NUMBER()` results can produce a negative number.
-- Valid year-0000 dates use the proleptic Gregorian calendar. Date arithmetic
-  preserves valid dates, and `FROM_DAYS(TO_DAYS(date))` round-trips them. Week
-  functions and zero-date clamping can therefore differ from MySQL.
+- Valid year-0000 dates use the proleptic Gregorian calendar for date arithmetic;
+  boundary behavior can differ from MySQL. `FROM_DAYS` separately maps day
+  numbers at or below 365 to the zero date, so it is not a year-0000 inverse
+  of `TO_DAYS`. See [temporal rules](function/date-time/README.md#temporal-inputs-and-precision).
 - `REPLACE` counts the actual deleted and inserted rows. Replacing one
   conflicting row reports two affected rows even when its values are unchanged.
 - Mixed explicit/generated `AUTO_INCREMENT` inserts allocate generated values
@@ -1201,8 +1202,11 @@ The history window is controlled by `mydb_undo_retention_ms`, default `0`; struc
 
 The persistent commit ledger and undo restart recovery are implemented; transaction-level `HistoryIndexBatch`, the persistent
 `history-index.v1`, WAL tail repair, and corruption degradation let ordinary B-trees still hit historical old keys after restart.
-On-disk sorted-run LSM, partition storage_ids, versioned FULLTEXT BM25, and the full performance gates are not
-included in 1.0.1, so this item remains marked partially supported.
+Historical FULLTEXT queries compute membership and BM25 from MVCC-visible text
+rather than current postings. This is a retained-history feature: it cannot
+recover already-purged undo or cross structural schema epochs, and historical
+special-index queries can require a full scan. See [time travel](time-travel.md)
+for examples and operational boundaries.
 
 ---
 

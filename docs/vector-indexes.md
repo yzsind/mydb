@@ -36,6 +36,10 @@ CREATE INDEX signature_ivf ON embeddings(signature)
 ```
 
 HNSW and IVF require one fixed-dimension, non-null, non-unique vector column.
+Both accept a [partial-index predicate](partial-indexes.md) after their other
+index options. Queries must imply that predicate before the optimizer can use
+the index. The non-null column declaration is still required; index-specific
+metric checks apply to qualifying rows.
 Vector indexes on temporary tables are rejected at DDL time, including indexes
 copied by `CREATE TEMPORARY TABLE ... LIKE`.
 Numeric indexes default to L2; BINARY indexes default to HAMMING. Unsupported
@@ -207,6 +211,17 @@ scan. This does not make every ANN result globally exact. See [vector hints](hin
 and [configuration](configuration.md) for the related controls.
 
 ## Storage and recovery
+
+Navigation memory is governed separately from the native vector values stored
+in the table. Eligible native HNSW snapshots pack graph ordinals and native
+payloads; large immutable payload/code buffers can use reclaimable read-only
+mappings. Build workers release temporary buffers after construction, and
+navigation publication can retire redundant mapped source-cache pages. Memory
+use therefore depends on datatype, dimensions, M, row count, storage mode and
+active queries, rather than only the table's raw vector bytes. A mapping's
+virtual extent is not its resident working set. Use [memory diagnostics](configuration-resources.md)
+and the identified [benchmark conditions](vector-cohere-1m-hnsw-benchmark-2026-11-24.md)
+when sizing; these representations do not change the ANN recall contract.
 
 `MYDB_VECTOR_STORAGE=memory` keeps native or compressed payloads resident.
 `paged` places payloads in the shared WAL-protected vector container.

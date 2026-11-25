@@ -22,6 +22,7 @@ Replaces the query definition or attributes of an existing view.
 - The target must be an existing view; a regular table is not converted into a view.
 - The new definition is parsed, column-derived, and dependency-checked before commit; on failure, the old definition is kept.
 - After the catalog is updated, dependent plan caches are invalidated.
+- Publication does not wait for existing readers' transactions to end. Each statement binds a complete immutable definition before execution; a later statement in the same transaction can observe the replacement. REPEATABLE READ protects data snapshots, not view-definition identity across statements.
 
 ## Privileges, Transactions, and Dependencies
 

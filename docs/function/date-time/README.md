@@ -86,6 +86,12 @@ Unix conversions; UTC variants do not use its wall-clock display. lc_time_names
 controls localized output names. Day-number conversions use MySQL's proleptic
 calendar convention, not Unix epoch days; they are not historical-calendar tools.
 
+Valid year-0000 arithmetic uses a proleptic Gregorian calendar and can differ
+from MySQL at that boundary. `FROM_DAYS` has a separate lower-bound rule:
+numbers at or below 365 return `0000-00-00`, while 366 returns `0001-01-01`.
+It therefore does not round-trip year-0000 dates through TO_DAYS. A leap second
+such as `23:59:60` is invalid and is not normalized into the next day.
+
 CONVERT_TZ accepts fixed offsets and supported IANA zone names without requiring
 MySQL timezone tables. Fixed-offset forms and named zones are validated; unknown
 zones return NULL. DST gaps/folds follow the zone transition rules, so local time

@@ -21,6 +21,14 @@ expr COLLATE collation_name
 
 Returns the expression with an explicit collation and coercibility 0, preserving SQL NULL. The collation must belong to the expression character set; incompatible assignments raise 1253. This is expression syntax, not a two-argument SQL function.
 
+Binary strings, hex literals, BIT values and NULL have a binary source charset;
+applying a utf8mb4 collation directly does not decode them. Use explicit
+`CONVERT(value USING utf8mb4)` before a utf8mb4 COLLATE when conversion is intended.
+For example, `CONVERT(X'61' USING utf8mb4) COLLATE utf8mb4_bin` is valid, while
+`X'61' COLLATE utf8mb4_bin` returns 1253. Numeric values use the connection
+character domain when collated. Prepared execution checks parameter domains
+on each execution; a prior text value does not authorize a later binary value.
+
 ## Examples
 
 ```sql

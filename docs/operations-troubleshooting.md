@@ -16,6 +16,10 @@ disabled collector does not prove absence of a problem.
 | Replica behind | SHOW MYDB REPLICA STATUS / SHOW REPLICA STATUS | Inspect error and progress watermarks; do not compare a native LSN to a binlog position |
 | Backup failed | SHOW MYDB BACKUP JOBS; SHOW MYDB BACKUP STATUS | Inspect Error/Phase and archive health, then rehearse recovery |
 | Recycle-bin pressure | SHOW RECYCLEBIN; Mydb_recyclebin counters | Inspect expiration, pressure and cleanup failures; retention is not a backup guarantee |
+| Historical read fails | MYDB_TEMPORAL_HISTORY; mydb_undo_retention_ms | Check the earliest available time and structural epoch; retention increases cannot restore purged versions. See [time travel](time-travel.md) |
+| Zone Map pruning absent | EXPLAIN; MYDB_ZONE_MAP_STORAGE | Check coverage, LAST_ERROR, switches and selectivity; conservative fallback preserves results. See [Zone Maps](zone-maps.md) |
+| Local writes rejected after receiver setup | @@GLOBAL.mydb_replica_read_only; SHOW REPLICA STATUS | Configuring a channel enables the guard before START; STOP alone can leave it enabled. Finish [cutover checks](mysql-migration.md#validate-and-switch) before allowing independent writes |
+| Source-build startup rejects a released directory | Exact binary identity and storage-format registry | Current source and released 1.0.2 differ in catalog format despite sharing a version string; use [logical migration](changing-versions.md) |
 
 ## Ready-to-run snapshots
 

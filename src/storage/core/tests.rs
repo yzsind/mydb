@@ -28711,22 +28711,18 @@ fn replica_savepoint_stream_keeps_committed_before_images() {
 fn rls_replica_replays_exchange_with_cold_policy_descriptors() {
     use crate::engine::StorageQueryEngine;
 
-    fn copy_tree(source: &Path, target: &Path) {
-        fs::create_dir_all(target).unwrap();
-        for entry in fs::read_dir(source).unwrap() {
-            let entry = entry.unwrap();
-            let target = target.join(entry.file_name());
-            if entry.file_type().unwrap().is_dir() {
-                copy_tree(&entry.path(), &target);
-            } else {
-                fs::copy(entry.path(), target).unwrap();
-            }
-        }
-    }
-
+    // Copy a stable checkpoint without idle maintenance creating or retiring
+    // files while the fixture is traversed. Replay and reopen remain strict.
+    let open = |path: &Path| {
+        StorageQueryEngine::open_with_storage_config_without_background_workers(
+            path,
+            test_storage_config(DurabilityMode::Strict, true),
+        )
+        .unwrap()
+    };
     let master_dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
     let replica_dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
-    let master = StorageQueryEngine::open(master_dir.path()).unwrap();
+    let master = open(master_dir.path());
     for sql in [
         "CREATE TABLE part(id INT PRIMARY KEY,tenant INT) PARTITION BY RANGE(id)(PARTITION p0 VALUES LESS THAN(10),PARTITION p1 VALUES LESS THAN MAXVALUE)",
         "CREATE TABLE stage(id INT PRIMARY KEY,tenant INT)",
@@ -28741,7 +28737,7 @@ fn rls_replica_replays_exchange_with_cold_policy_descriptors() {
     }
     let source = master.database_for_replication();
     source.checkpoint().unwrap();
-    copy_tree(master_dir.path(), replica_dir.path());
+    crate::util::file::copy_fixture_tree(master_dir.path(), replica_dir.path()).unwrap();
     let mut role = crate::repl::role::RoleState::new_standalone();
     role.role = crate::repl::role::Role::Replica;
     crate::repl::role::save(replica_dir.path(), &role).unwrap();
@@ -28749,7 +28745,7 @@ fn rls_replica_replays_exchange_with_cold_policy_descriptors() {
     for phase in 0..3 {
         // Reopening leaves only compact headers, including a policy version
         // marker with no payload. Replay must retain the old DD snapshot.
-        let replica = StorageQueryEngine::open(replica_dir.path()).unwrap();
+        let replica = open(replica_dir.path());
         let target = replica.database_for_replication().clone();
         assert!(target.catalog.read().unwrap().tables["test.stage"]
             .columns
@@ -28814,30 +28810,27 @@ fn rls_replica_replays_exchange_with_cold_policy_descriptors() {
 fn audit13_replica_restart_catchup_visibility_and_catalog_ids() {
     use crate::engine::api::QueryResponse;
     use crate::engine::StorageQueryEngine;
-    fn copy_tree(source: &Path, target: &Path) {
-        fs::create_dir_all(target).unwrap();
-        for entry in fs::read_dir(source).unwrap() {
-            let entry = entry.unwrap();
-            let target = target.join(entry.file_name());
-            if entry.file_type().unwrap().is_dir() {
-                copy_tree(&entry.path(), &target);
-            } else {
-                fs::copy(entry.path(), target).unwrap();
-            }
-        }
-    }
+    // Copy a stable checkpoint without idle maintenance creating or retiring
+    // files while the fixture is traversed. Replay and reopen remain strict.
+    let open = |path: &Path| {
+        StorageQueryEngine::open_with_storage_config_without_background_workers(
+            path,
+            test_storage_config(DurabilityMode::Strict, true),
+        )
+        .unwrap()
+    };
     let master_dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
     let replica_dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
-    let master = StorageQueryEngine::open(master_dir.path()).unwrap();
+    let master = open(master_dir.path());
     let source = master.database_for_replication();
     source.checkpoint().unwrap();
-    copy_tree(master_dir.path(), replica_dir.path());
+    crate::util::file::copy_fixture_tree(master_dir.path(), replica_dir.path()).unwrap();
     let mut role = crate::repl::role::RoleState::new_standalone();
     role.role = crate::repl::role::Role::Replica;
     crate::repl::role::save(replica_dir.path(), &role).unwrap();
     let mut start = source.wal_log().lock().next_lsn();
     for phase in 0..2 {
-        let replica = StorageQueryEngine::open(replica_dir.path()).unwrap();
+        let replica = open(replica_dir.path());
         let target = replica.database_for_replication().clone();
         if phase == 0 {
             master

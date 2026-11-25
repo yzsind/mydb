@@ -255,6 +255,12 @@ reference. See [quantization and recall](vector-indexes.md#interpreting-recall).
 
 ## 8. Filters, transactions, and query shape
 
+For a fixed subset such as active documents, a [partial vector index](partial-indexes.md)
+can store only rows satisfying its creation-time `WHERE` predicate. HNSW/IVF
+use still requires a query implication proof, matching dimensions/metric and
+ordinary snapshot eligibility. A partial index does not supply missing rows
+for an unfiltered query; FORCE INDEX cannot override that boundary.
+
 Business filters stay in SQL:
 
 ```sql

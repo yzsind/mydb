@@ -432,6 +432,7 @@ The full coverage map, transactional differences, and unsupported features are l
 | **`generate_series()`** | Integer, decimal, and datetime series for time axes, gap filling, and data generation. |
 | **TABLESAMPLE** | Explore data with row/page sampling, percentage or exact row counts, and repeatable samples. |
 | **B-tree INCLUDE** | Cover query columns without adding them to the search key. |
+| **Partial indexes** | Index only rows satisfying a WHERE predicate, including conditional uniqueness and supported retrieval indexes. |
 | **`CREATE OR REPLACE` routines** | Replace procedure and function definitions while preserving routine grants. |
 | **SQL ROWID** | Locate heap rows directly; physical addresses can be reused. |
 
@@ -475,6 +476,11 @@ Unimplemented SQL or protocol capabilities return clear errors rather than faili
 
 ## Documentation
 
+The guides in this checkout follow the current source, which includes changes
+after the 1.0.2 release. Start with [current source changes](docs/current-source.md)
+for new capabilities and physical-format requirements. Use documentation from
+the matching Git tag when running a downloaded release.
+
 | Entry point | Contents |
 | --- | --- |
 | [Why MyDB](docs/why-mydb.md) | HTAP mixed workloads, AI capabilities, application benefits, and performance evidence |
@@ -482,6 +488,8 @@ Unimplemented SQL or protocol capabilities return clear errors rather than faili
 | [Feature overview](docs/feature-overview.md) | Capability map and implementation boundaries |
 | [AI model calls](docs/ai.md) / [Hybrid search](docs/hybrid-search.md) | Model setup, embeddings, generation, permissions, and retrieval fusion |
 | [SQL statements](docs/statement/README.md) / [Functions](docs/function/README.md) | Syntax, semantics, and usage examples |
+| [Partial indexes](docs/partial-indexes.md) / [Zone Maps](docs/zone-maps.md) | Predicate-qualified indexes and automatic scan pruning |
+| [Time travel](docs/time-travel.md) | Historical reads, retention, and schema boundaries |
 | [Configuration guide](docs/configuration.md) / [Config template](mydb.cnf.example) | Startup options, environment variables, and runtime settings |
 | [Data directory and recovery](docs/storage-format.md) | File roles, format compatibility, durability, and crash recovery |
 

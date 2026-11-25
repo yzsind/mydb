@@ -49,6 +49,7 @@ The table lists canonical statement entry points; slash-separated names share a 
 | Database | [CREATE DATABASE/SCHEMA](ddl/create-database.md), [ALTER DATABASE/SCHEMA](ddl/alter-database.md), [DROP DATABASE/SCHEMA](ddl/drop-database.md) |
 | Table | [CREATE TABLE](ddl/create-table.md), [CREATE TABLE LIKE](ddl/create-table-like.md), [CREATE TABLE AS SELECT](ddl/create-table-as-select.md), [ALTER TABLE](ddl/alter-table.md), [DROP TABLE](ddl/drop-table.md), [TRUNCATE TABLE](ddl/truncate-table.md), [RENAME TABLE](ddl/rename-table.md) |
 | Index | [CREATE INDEX](ddl/create-index.md), [DROP INDEX](ddl/drop-index.md) |
+| Partial index predicates | [Membership, planning and examples](../partial-indexes.md); WHERE on CREATE INDEX, inline keys and ALTER ADD INDEX |
 | View | [CREATE VIEW](ddl/create-view.md), [ALTER VIEW](ddl/alter-view.md), [DROP VIEW](ddl/drop-view.md) |
 | Sequence | [CREATE SEQUENCE](ddl/create-sequence.md), [ALTER SEQUENCE](ddl/alter-sequence.md), [DROP SEQUENCE](ddl/drop-sequence.md) |
 | Tablespace (unsupported: 1235) | [CREATE TABLESPACE / UNDO TABLESPACE](ddl/create-tablespace.md), [ALTER TABLESPACE / UNDO TABLESPACE](ddl/alter-tablespace.md), [DROP TABLESPACE / UNDO TABLESPACE](ddl/drop-tablespace.md) |

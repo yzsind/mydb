@@ -270,4 +270,4 @@ This file is the Docker Hub publication copy. Update it together with the projec
 README and linked public reports when publishing; the
 [Docker guide](https://github.com/yzsind/mydb/blob/main/docs/docker.md) is the
 canonical deployment guide. See
-[documentation maintenance](https://github.com/yzsind/mydb/blob/main/docs/documentation-maintenance.md).
+[current source changes](https://github.com/yzsind/mydb/blob/main/docs/current-source.md).

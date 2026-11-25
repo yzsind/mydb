@@ -17,6 +17,9 @@ returns an error before the statement changes data, never a silent no-op.
 | Mixed Unicode identifiers | Mixed Unicode names are recognized consistently across supported statements |
 | Executable comments | MySQL 8.0 five-digit gate; missing separator emits warning 4164; inactive payload excluded |
 | Index options | CREATE/ALTER preserve supported primary-key options; UNIQUE constraint symbol supplies fallback index name |
+| Partial indexes | Trailing WHERE on CREATE INDEX, inline keys and ALTER ADD INDEX; deterministic local expressions only, no partial primary/FK supporting keys. [Predicate rules](partial-indexes.md) |
+| Joined DML sources | INNER/LEFT/RIGHT chains retain each ON scope; uncorrelated grouped/set-operation derived queries are read-only. LATERAL sources and derived write targets are rejected |
+| Historical reads | FOR SYSTEM_TIME AS OF accepts statement-constant temporal scalars, prepared parameters and supported deterministic arithmetic; direct user variables, locking reads and DML targets are rejected. [Examples](time-travel.md) |
 | Function names and identifiers | Keyword functions support optional parentheses where MySQL allows them. Quoting, qualification, whitespace, comments, and IGNORE_SPACE govern native calls, routine lookup, and identifier positions. Temporal precision is checked during parsing |
 | Diagnostics | Errors refer to byte offsets and Unicode coordinates in the submitted SQL, including supported normalized syntax |
 | SQL batches | Each next statement parses using mode left by preceding statement; completed prefix retained on later failure |

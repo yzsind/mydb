@@ -21,6 +21,10 @@ LEAST(value1, value2 [, ...])
 
 Returns the least candidate using the common comparison domain and collation. Any SQL NULL candidate returns NULL; the result type is derived from the candidate domains.
 
+For string candidates that compare equal under the effective collation,
+LEAST retains the first equal operand. With `utf8mb4_0900_ai_ci`,
+`LEAST('b','B')` therefore returns `b`; bytewise equality is not required.
+
 ## Examples
 
 ```sql

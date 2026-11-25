@@ -55,6 +55,36 @@ WHERE created_at < '2025-01-01'
 RETURNING OLD.id, OLD.created_at;
 ```
 
+## Complete outer-chain example
+
+This example uses disposable tables and rolls back the joined deletion:
+
+```sql
+DROP TABLE IF EXISTS test.dml_left;
+DROP TABLE IF EXISTS test.dml_middle;
+DROP TABLE IF EXISTS test.dml_right;
+CREATE TABLE test.dml_left(id INT PRIMARY KEY);
+CREATE TABLE test.dml_middle(id INT PRIMARY KEY);
+CREATE TABLE test.dml_right(id INT PRIMARY KEY);
+INSERT INTO test.dml_left VALUES (1), (2);
+INSERT INTO test.dml_middle VALUES (2), (3);
+INSERT INTO test.dml_right VALUES (2), (3), (4);
+
+START TRANSACTION;
+DELETE a, b, c FROM test.dml_left AS a
+LEFT JOIN test.dml_middle AS b ON a.id = b.id
+RIGHT JOIN test.dml_right AS c ON b.id = c.id;
+SELECT id FROM test.dml_left ORDER BY id;
+SELECT id FROM test.dml_middle ORDER BY id;
+SELECT id FROM test.dml_right ORDER BY id;
+ROLLBACK;
+```
+
+Before rollback, the left table retains `1`, the middle table retains `3`, and
+the right table is empty. The first LEFT JOIN never produced a middle row for
+`3`; the RIGHT JOIN preserves its right-side rows without creating writable
+left/middle rows. Rollback restores all three original tables.
+
 ## Related Statements
 
 - [TRUNCATE TABLE](../ddl/truncate-table.md)

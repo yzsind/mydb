@@ -254,20 +254,22 @@ fn native_vector_rank_matrix(backend: &str) {
                 v.iter().map(f64::to_string).collect::<Vec<_>>().join(",")
             )
         };
+        // Each metric/algorithm keeps a fresh index over identical typed rows.
+        // Reuse the immutable heap, not an earlier graph or its model state.
+        let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let engine = open_test_engine(dir.path());
+        engine.execute(&format!("CREATE TABLE vector_ranks(seq INT PRIMARY KEY,entity INT,v VECTOR({dim},{datatype}) NOT NULL)")).unwrap();
+        let values = vectors
+            .iter()
+            .enumerate()
+            .map(|(i, v)| format!("({},{},'{}')", i + 1, i % 11 + 1, text(v)))
+            .collect::<Vec<_>>()
+            .join(",");
+        engine
+            .execute(&format!("INSERT INTO vector_ranks VALUES {values}"))
+            .unwrap();
         for &metric in metrics {
             for algorithm in ["HNSW", "IVF"] {
-                let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
-                let engine = open_test_engine(dir.path());
-                engine.execute(&format!("CREATE TABLE vector_ranks(seq INT PRIMARY KEY,entity INT,v VECTOR({dim},{datatype}) NOT NULL)")).unwrap();
-                let values = vectors
-                    .iter()
-                    .enumerate()
-                    .map(|(i, v)| format!("({},{},'{}')", i + 1, i % 11 + 1, text(v)))
-                    .collect::<Vec<_>>()
-                    .join(",");
-                engine
-                    .execute(&format!("INSERT INTO vector_ranks VALUES {values}"))
-                    .unwrap();
                 let (options, hint) = if algorithm == "HNSW" {
                     ("m=4,ef_construction=64", "HNSW_EF(64)")
                 } else {
@@ -378,6 +380,7 @@ fn native_vector_rank_matrix(backend: &str) {
                     expected,
                     "scalar {datatype}/{metric}/{algorithm}"
                 );
+                engine.execute("DROP INDEX vx ON vector_ranks").unwrap();
             }
         }
     }

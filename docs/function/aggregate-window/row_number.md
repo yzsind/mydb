@@ -18,6 +18,9 @@ This function takes no arguments.
 
 Returns a BIGINT row position starting at 1 within the partition. Ties in the ordering still receive different positions; add a unique ordering key for deterministic tie order.
 
+The result is signed in MyDB. Subtracting two ROW_NUMBER results can therefore
+produce a negative value without unsigned-subtraction overflow.
+
 ## Examples
 
 ```sql

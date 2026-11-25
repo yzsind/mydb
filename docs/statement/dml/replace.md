@@ -21,6 +21,7 @@ Inserts a new row; on a primary-key or unique-key conflict, it first deletes all
 
 - Requires the INSERT and DELETE privileges on the target table, and fires DELETE/INSERT-related triggers and foreign key actions.
 - There may be more than one conflicting old row; affected rows typically includes both the deleted and inserted counts.
+- Replacing one conflicting row with identical values still counts one deletion plus one insertion (two affected rows), an intentional difference from MySQL's possible no-change shortcut.
 - Columns that are not provided are handled as a newly inserted row and do not inherit the old row's values.
 - RETURNING returns NEW by default. OLD is always SQL NULL for REPLACE because one new row can replace several conflicting old rows; NEW is the final inserted image.
 - `DELAYED` is compatibility syntax and produces deprecation warning 1287.

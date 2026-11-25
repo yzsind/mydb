@@ -53,6 +53,31 @@ SET c.value = c.value + d.amount
 RETURNING OLD.value, NEW.value;
 ```
 
+## Complete derived-source example
+
+This example uses disposable tables. The derived result is read-only; the LEFT
+JOIN preserves accounts without entries and COALESCE supplies their zero total.
+
+```sql
+DROP TABLE IF EXISTS test.dml_accounts;
+DROP TABLE IF EXISTS test.dml_entries;
+CREATE TABLE test.dml_accounts(id INT PRIMARY KEY, total INT);
+CREATE TABLE test.dml_entries(account_id INT, amount INT);
+INSERT INTO test.dml_accounts VALUES (1, 0), (2, 0);
+INSERT INTO test.dml_entries VALUES (1, 10), (1, 5), (3, 7);
+
+UPDATE test.dml_accounts AS a
+LEFT JOIN (
+    SELECT account_id, SUM(amount) AS amount
+    FROM test.dml_entries GROUP BY account_id
+) AS totals ON totals.account_id = a.id
+SET a.total = COALESCE(totals.amount, 0);
+SELECT id, total FROM test.dml_accounts ORDER BY id;
+```
+
+The result is `(1, 15)` and `(2, 0)`. No account is inserted for the unmatched
+entry with `account_id=3`. Use INSERT or an explicit upsert for that behavior.
+
 ## Related Statements
 
 - [SELECT](../query/select.md)

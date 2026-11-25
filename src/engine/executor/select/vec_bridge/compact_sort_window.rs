@@ -12,6 +12,9 @@ pub(crate) static RESIDENT_WINDOW_HITS: std::sync::atomic::AtomicU64 =
 #[cfg(test)]
 pub(crate) static RESIDENT_WINDOW_REPLAYS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+#[cfg(test)]
+pub(crate) static RESIDENT_WINDOW_REPLAYS_WITH_PREFIX: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 fn signed_interval(expr: &Expr, template: &[PlanField]) -> Option<(i128, i128)> {
     if let Some(column) = expr_column_index_in_template(expr, template) {
@@ -410,6 +413,10 @@ impl<'a> Window<'a> {
     ) {
         #[cfg(test)]
         RESIDENT_WINDOW_REPLAYS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        #[cfg(test)]
+        if !prefix.is_empty() {
+            RESIDENT_WINDOW_REPLAYS_WITH_PREFIX.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         let sources = self
             .keys
             .sources

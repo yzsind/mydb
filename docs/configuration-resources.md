@@ -242,6 +242,10 @@ enabled, undo history is synced as well, and replica restartpoints always sync
 undo. Outside of checkpoints, relaxed mode keeps its original weaker durability
 semantics.
 
+### Undo and History
+
+See [time travel queries](time-travel.md) for a complete historical-read example.
+
 `mydb_undo_retention_ms` is both the undo retention window and the history
 retention window for `FOR SYSTEM_TIME AS OF`; the default is `0` (reading past
 points in time is not allowed). It can be adjusted dynamically with
@@ -723,6 +727,10 @@ Vector retrieval separates persisted index configuration from query-time setting
   `mydb_ivf_rerank_mult` session values override the index `rerank_mult`.
   An explicit SET to the built-in default also takes precedence. See
   [query tuning](vector-indexes.md#query-tuning) for defaults and examples.
+
+### Automatic Zone Maps
+
+See the [Zone Maps guide](zone-maps.md) for query behavior and verification.
 
 Zone Map is an optional skip-scan structure enabled by default for persistent
 user tables; temporary and system tables do not enable it. Table creation or

@@ -34,7 +34,7 @@ Top-level `TABLE name` and `VALUES (...)` are executed as query expressions; the
 - `OF` names table aliases in the query block; multiple locking clauses may assign different modes and NOWAIT/SKIP LOCKED policies to different sources. Ambiguous, unknown or duplicate targets fail explicitly. NATURAL/USING, lateral and grouped locking-join shapes retain restrictions; see [parser capabilities](../../sql-parser-capabilities.md).
 - An ordinary query is a read-only statement; `FOR UPDATE/FOR SHARE` enters the transaction lock path and requires the corresponding privileges.
 - The same SQL, schema, statistics, hints, and session semantics produce a stable physical plan; live memory pressure only adjusts operator batch sizes or spill.
-- `FOR SYSTEM_TIME AS OF expr` binds to each table; see the time-travel documentation for history retention and cross-DDL-epoch limitations.
+- `FOR SYSTEM_TIME AS OF expr` binds to each table; see [time travel](../../time-travel.md) for retention, prepared parameters, examples and schema-epoch boundaries. Direct user variables are not accepted as AS OF expressions.
 - Row execution is the semantic baseline; `MYDB_VECTORIZED=on|auto` can select vectorized execution; both should return the same results.
 - Unsupported expression forms or MySQL syntax return explicit errors; execution never continues after silently dropping a clause.
 
@@ -76,7 +76,7 @@ The first example returns one row; the recursive example returns 1 through 5; th
 | CTEs | WITH [RECURSIVE] name[(columns)] AS (query); recursive execution is bounded and unsupported recursive shapes fail explicitly |
 | TABLE/VALUES | TABLE table_name and VALUES ROW(...),ROW(...) are query sources, with ordinary outer ORDER/LIMIT |
 | Order/limit | ORDER BY expression [ASC/DESC]; LIMIT count OFFSET offset or LIMIT offset,count. Without ORDER BY no delivery order is guaranteed |
-| Historical source | table FOR SYSTEM_TIME AS OF expression; [history retention](../../mysql80-compatibility.md#time-travel-queries) and DDL epochs limit availability |
+| Historical source | table FOR SYSTEM_TIME AS OF expression; [history retention](../../time-travel.md) and DDL epochs limit availability |
 | Plan modifiers | STRAIGHT_JOIN preserves the query block's join order; [hints](../../hints.md) select supported optimizer controls |
 
 `SQL_CALC_FOUND_ROWS` preserves the qualifying count for FOUND_ROWS() despite LIMIT. Result-size/priority/cache compatibility words do not imply a separate MySQL result cache or native scheduling engine; use EXPLAIN for the actual plan. All expression types use the [operator and function rules](../../operators-and-expressions.md). Unqualified objects resolve through the current schema with temporary-table shadowing where supported.

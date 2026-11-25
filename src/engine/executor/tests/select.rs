@@ -5921,6 +5921,7 @@ fn long_select_does_not_block_unrelated_table_write() {
 
     let reader_engine = std::sync::Arc::clone(&engine);
     let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
     let reader = std::thread::spawn(move || {
         let mut result = reader_engine
             .execute_streaming_for_test("SELECT id FROM a ORDER BY id")
@@ -5930,23 +5931,32 @@ fn long_select_does_not_block_unrelated_table_write() {
         };
         assert_eq!(stream.cursor.next_row().unwrap(), Some(vec![Value::Int(1)]));
         started_tx.send(()).unwrap();
-        std::thread::sleep(Duration::from_millis(150));
+        resume_rx.recv().unwrap();
         result.materialize().unwrap()
     });
 
-    started_rx
-        .recv_timeout(Duration::from_secs(1))
-        .expect("reader should produce first row");
-    let started = Instant::now();
-    engine.execute("INSERT INTO b VALUES (1, 10)").unwrap();
-    assert!(
-        started.elapsed() < Duration::from_millis(100),
-        "unrelated table write waited behind streaming read"
-    );
+    if let Err(error) = started_rx.recv_timeout(Duration::from_secs(5)) {
+        let _ = resume_tx.send(());
+        reader.join().unwrap();
+        panic!("reader should produce first row: {error}");
+    }
+    // Prove that the write completes while the cursor is still parked.
+    // The timeout is only a deadlock watchdog, not a latency assertion.
+    let writer_engine = std::sync::Arc::clone(&engine);
+    let (written_tx, written_rx) = std::sync::mpsc::channel();
+    let writer = std::thread::spawn(move || {
+        let _ = written_tx.send(writer_engine.execute("INSERT INTO b VALUES (1, 10)"));
+    });
+    let written = written_rx.recv_timeout(Duration::from_secs(5));
+    let _ = resume_tx.send(());
+    writer.join().unwrap();
 
     let QueryResponse::ResultSet(rows) = reader.join().unwrap() else {
         panic!("expected materialized reader result");
     };
+    written
+        .expect("unrelated table write waited behind streaming read")
+        .unwrap();
     assert_eq!(rows.rows.len(), 199);
     let QueryResponse::ResultSet(b) = engine.execute("SELECT * FROM b").unwrap() else {
         panic!("expected result set");

@@ -817,8 +817,12 @@ mod tests {
                 scale: 2,
             },
             ColumnType::LongLong,
+            ColumnType::Decimal {
+                precision: 38,
+                scale: 0,
+            },
         ];
-        let fields = ["g", "t", "v", "__mydb_prefix_window_ordinal"]
+        let fields = ["g", "t", "v", "__mydb_prefix_window_ordinal", "payload"]
             .into_iter()
             .zip(types)
             .map(|(name, column_type)| BatchField {
@@ -835,9 +839,10 @@ mod tests {
             .iter()
             .map(batch_field_template)
             .collect::<Vec<_>>();
-        // Stay above the parallel admission threshold with compact integer
-        // spill encoding as well as the legacy fixed-width encoding.
-        let rows = (0..80_000)
+        // A carried fixed-width decimal keeps serialized spills above 1 MiB
+        // with fewer rows. The hit assertion below still requires real parallel
+        // admission with the original worker and work-area settings.
+        let rows = (0..32_768)
             .rev()
             .map(|id| {
                 vec![
@@ -857,6 +862,7 @@ mod tests {
                         Value::DecimalCompact(id % 17 - 8, 2)
                     },
                     Value::Int(id),
+                    Value::Decimal128((1i128 << 120) + id as i128, 0),
                 ]
             })
             .collect::<Vec<_>>();

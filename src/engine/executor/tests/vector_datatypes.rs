@@ -1452,11 +1452,13 @@ fn hnsw_retirements_survive_checkpoint_with_old_reader_and_process_exit() {
         engine
             .execute("CREATE TABLE items(id INT PRIMARY KEY,v VECTOR(4) NOT NULL)")
             .unwrap();
-        for id in 1..=40 {
-            engine
-                .execute(&format!("INSERT INTO items VALUES({id},'[{id},1,2,3]')"))
-                .unwrap();
-        }
+        let values = (1..=40)
+            .map(|id| format!("({id},'[{id},1,2,3]')"))
+            .collect::<Vec<_>>()
+            .join(",");
+        engine
+            .execute(&format!("INSERT INTO items VALUES {values}"))
+            .unwrap();
         engine
             .execute(
                 "CREATE INDEX vx ON items(v) USING HNSW WITH(m=4,ef_construction=32,ef_search=128)",
@@ -2133,17 +2135,18 @@ fn copy_checkpoint_between_decision_and_graph_transfer_preserves_index_journal()
         let root = tempfile::tempdir_in("/tmp/mydb").unwrap();
         let source = root.path().join("source");
         let recovered = root.path().join("recovered");
+        let preparation = crate::platform::fs::FixtureSyncBatch::new(root.path()).unwrap();
         let engine = std::sync::Arc::new(open_strict_test_engine(&source));
         engine
             .execute("CREATE TABLE items(id INT PRIMARY KEY,extra INT,v VECTOR(4) NOT NULL)")
             .unwrap();
-        for id in 1..=32 {
-            engine
-                .execute(&format!(
-                    "INSERT INTO items VALUES({id},{id},'[{id},1,2,3]')"
-                ))
-                .unwrap();
-        }
+        let values = (1..=32)
+            .map(|id| format!("({id},{id},'[{id},1,2,3]')"))
+            .collect::<Vec<_>>()
+            .join(",");
+        engine
+            .execute(&format!("INSERT INTO items VALUES {values}"))
+            .unwrap();
         let options = if algorithm == "HNSW" {
             "m=4,ef_construction=32,ef_search=128"
         } else {
@@ -2160,6 +2163,7 @@ fn copy_checkpoint_between_decision_and_graph_transfer_preserves_index_journal()
             ))
             .unwrap();
         engine.checkpoint().unwrap();
+        preparation.finish().unwrap();
         let catchup = engine.database().install_online_copy_publish_test_hook();
         let committed = engine.database().install_vector_copy_commit_test_hook();
         let worker = engine.clone();
@@ -2243,11 +2247,13 @@ fn failed_vector_rebuild_keeps_old_index_and_resumes_its_durable_job_after_resta
     engine
         .execute("CREATE TABLE items(id INT PRIMARY KEY,v VECTOR(4) NOT NULL)")
         .unwrap();
-    for id in 1..=32 {
-        engine
-            .execute(&format!("INSERT INTO items VALUES({id},'[{id},1,2,3]')"))
-            .unwrap();
-    }
+    let values = (1..=32)
+        .map(|id| format!("({id},'[{id},1,2,3]')"))
+        .collect::<Vec<_>>()
+        .join(",");
+    engine
+        .execute(&format!("INSERT INTO items VALUES {values}"))
+        .unwrap();
     engine.execute("CREATE INDEX vx ON items(v) USING HNSW WITH(m=4,ef_construction=32,ef_search=256,quantization=sq8)").unwrap();
     let table = engine.database().table("items").unwrap();
     let index = table
@@ -2382,17 +2388,20 @@ fn checkpoint_during_committed_vector_batch_never_overstates_snapshot_coverage()
             StorageQueryEngine::open_with_storage_config_without_background_workers(path, config)
                 .unwrap()
         };
+        let preparation = crate::platform::fs::FixtureSyncBatch::new(root.path()).unwrap();
         let engine = std::sync::Arc::new(open(&source));
         engine
             .execute(&format!(
                 "CREATE TABLE items(id INT PRIMARY KEY,v VECTOR(4,{datatype}) NOT NULL)"
             ))
             .unwrap();
-        for id in 1..=20 {
-            engine
-                .execute(&format!("INSERT INTO items VALUES({id},'[{id},1,2,3]')"))
-                .unwrap();
-        }
+        let values = (1..=20)
+            .map(|id| format!("({id},'[{id},1,2,3]')"))
+            .collect::<Vec<_>>()
+            .join(",");
+        engine
+            .execute(&format!("INSERT INTO items VALUES {values}"))
+            .unwrap();
         let options = if algorithm == "HNSW" {
             "m=4,ef_construction=32,ef_search=128"
         } else {
@@ -2409,6 +2418,7 @@ fn checkpoint_during_committed_vector_batch_never_overstates_snapshot_coverage()
             ))
             .unwrap();
         engine.checkpoint().unwrap();
+        preparation.finish().unwrap();
         let hook = engine.database().install_vector_apply_test_hook();
         let worker = engine.clone();
         let writer = std::thread::spawn(move || {
@@ -2530,17 +2540,20 @@ fn storage_single_insert_uses_durable_deferred_vector_maintenance() {
             ]);
             let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
             {
+                let preparation = crate::platform::fs::FixtureSyncBatch::new(dir.path()).unwrap();
                 let engine = open_strict_test_engine(dir.path());
                 engine
                     .execute(&format!(
                         "CREATE TABLE items(id INT PRIMARY KEY,v VECTOR(4,{datatype}) NOT NULL)"
                     ))
                     .unwrap();
-                for id in 1..=20 {
-                    engine
-                        .execute(&format!("INSERT INTO items VALUES({id},'[{id},1,2,3]')"))
-                        .unwrap();
-                }
+                let values = (1..=20)
+                    .map(|id| format!("({id},'[{id},1,2,3]')"))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                engine
+                    .execute(&format!("INSERT INTO items VALUES {values}"))
+                    .unwrap();
                 let options = if algorithm == "HNSW" {
                     "m=4,ef_construction=32,ef_search=128"
                 } else {
@@ -2552,6 +2565,7 @@ fn storage_single_insert_uses_durable_deferred_vector_maintenance() {
                     ))
                     .unwrap();
                 engine.checkpoint().unwrap();
+                preparation.finish().unwrap();
                 let db = engine.database();
                 let table = db.table("items").unwrap();
                 let index = table

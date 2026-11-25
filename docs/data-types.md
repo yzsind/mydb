@@ -156,8 +156,13 @@ binary UUID forms, compressed data, and payloads not guaranteed to be UTF-8 shou
 | `LONGTEXT` | `LONGBLOB` | 4,294,967,295 |
 
 `TEXT` limits are counted in encoded bytes, and truncation is guaranteed to stop at character
-boundaries; `BLOB` is counted purely in bytes. `TEXT(M)`/`BLOB(M)` selects the smallest LOB
-tier that can hold `M` bytes. `LONG` is a legacy alias for `MEDIUMTEXT`, and `LONG BYTE` is a
+boundaries; `BLOB` is counted purely in bytes. `TEXT(M)` selects the smallest LOB
+tier that can hold `M` characters at the effective character set's maximum bytes
+per character, after column/table/database charset inheritance. `BLOB(M)` selects
+the smallest tier for `M` bytes. For example, `TEXT(100)` becomes `TEXT` under
+utf8mb4 (400 bytes), but `TINYTEXT` under latin1 (100 bytes). The resulting tier's
+byte cap applies to writes; `M` is not a separate per-value character limit.
+`LONG` is a legacy alias for `MEDIUMTEXT`, and `LONG BYTE` is a
 legacy alias for `MEDIUMBLOB`.
 
 Large values can be externalized by the storage layer; see
@@ -397,7 +402,7 @@ ALTER COPY share the same core conversion rules. The main behaviors:
 - Strict mode (`STRICT_TRANS_TABLES`/`STRICT_ALL_TABLES`) turns degradable data problems into
   statement errors; an explicitly non-strict mode can clamp or truncate and record warnings.
   The built-in session/global default is
-  `ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,ERROR_FOR_DIVISION_BY_ZERO`.
+  `ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION`.
   `SET SESSION sql_mode=''` enables non-strict empty mode; new connections
   inheriting an explicitly empty GLOBAL mode also run in non-strict mode.
 - Statements such as `INSERT IGNORE` and `UPDATE IGNORE` can downgrade some row-level errors

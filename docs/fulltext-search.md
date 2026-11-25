@@ -26,6 +26,11 @@ Column order does not matter. A missing matching index returns error 1191.
 `CREATE FULLTEXT INDEX` and `ALTER TABLE ... ADD FULLTEXT KEY` can also build
 indexes over existing rows. Prepared statements support `AGAINST(?)`.
 
+A [partial FULLTEXT index](partial-indexes.md) can end with `WHERE <predicate>`.
+It is a query access path only when the query implies that membership condition;
+membership filtering does not redefine the BM25 corpus or authorize incomplete
+results. Index hints do not bypass that proof.
+
 Persistent offline builds use the index-build worker budget for projected
 scanning, tokenization, sorting, spill consolidation, and leaf-page writes.
 Use `CREATE /*+ PARALLEL(8) */ FULLTEXT INDEX ft ON articles(body)` to request
@@ -113,9 +118,12 @@ rechecked. An ordinary full-text index is not a substring index.
 
 BM25 uses posting term frequency and document length, together with document
 count, total token length and term document frequencies from the whole visible
-corpus. These counts share a bounded cache keyed by the table definition,
-column set, tokenizer and read snapshot. A cold cache streams the corpus;
-`ANALYZE TABLE` remains useful for optimizer cost estimates.
+corpus. These counts use persisted transactional counters and a bounded cache
+keyed by the table definition, column set, tokenizer and read snapshot. A cold
+cache reads counter shards rather than scanning the user heap on the normal
+current-view path. Historical and older-than-publication snapshots can require
+the visible-document oracle described below. `ANALYZE TABLE` remains useful for
+optimizer cost estimates; it does not initialize BM25 counters.
 
 Scores do not promise numeric equality with MySQL. Complete and partial
 indexes share the same snapshot baseline; filtering candidates does not
