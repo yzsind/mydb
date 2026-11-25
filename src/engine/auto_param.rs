@@ -413,6 +413,22 @@ pub fn auto_parameterize(mode: AutoParameterizeMode, statement: &mut Statement) 
     }
 }
 
+/// Caller-proven bounded primary ranges may use the prepared execution
+/// vehicle. This does not change the ordinary literal-sensitive planner.
+pub(crate) fn bounded_range_template(statement: &Statement) -> (Statement, Vec<Value>) {
+    let mut statement = statement.clone();
+    let mut params = Vec::new();
+    if let Statement::Select(select) = &mut statement {
+        let mut next = 0;
+        let mut sensitive = false;
+        if let Some(predicate) = &mut select.selection {
+            rewrite_predicate_expr::<false>(&[], predicate, &mut next, &mut params, &mut sensitive);
+        }
+        rewrite_limit_offset(select, &mut next, &mut params);
+    }
+    (statement, params)
+}
+
 /// Canonical compiled-plan key shared by auto-parameterized text SQL and
 /// prepared placeholders. Runtime parameter type classes and LIMIT/OFFSET
 /// magnitude remain part of the key because both can affect physical shape.

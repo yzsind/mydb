@@ -412,3 +412,34 @@ fn predicate_string_truthiness_retains_the_post_evaluation_diagnostic_phase() {
         }
     }
 }
+
+#[test]
+fn adjacent_utf8_transforms_match_scalar_for_unicode_nulls_and_expanding_case() {
+    let schema = schema(ColumnType::VarString);
+    let mut values = Vec::new();
+    for text in ["", "  Hello  ", "界É🙂", "ßİΣ", " a\0b ", "e\u{301}"] {
+        for _ in 0..17 {
+            values.push(Value::String(text.into()));
+        }
+        values.push(Value::Null);
+    }
+    let batch = Batch::new(schema.clone(), vec![ColumnVector::from_values(values)]);
+    for name in ["LOWER", "UPPER", "LTRIM", "RTRIM", "TRIM", "REVERSE"] {
+        let program = compile_for_batch(&expr(&format!("{name}(x)")), &schema)
+            .unwrap()
+            .unwrap();
+        let expected = scalar_values(&program, &batch).unwrap();
+        let actual = eval_to_column(&program, &batch).unwrap();
+        assert_eq!(
+            (0..batch.num_rows())
+                .map(|row| actual.value_at(row))
+                .collect::<Vec<_>>(),
+            expected,
+            "{name}"
+        );
+    }
+    assert!(
+        transform_utf8_column(StringTransformKind::Lower, &[0, 1], "界".as_bytes(), None).is_none()
+    );
+    assert!(transform_utf8_column(StringTransformKind::Lower, &[0, 2, 1], b"ab", None).is_none());
+}

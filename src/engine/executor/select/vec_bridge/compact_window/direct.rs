@@ -11,6 +11,9 @@ pub(super) enum End {
 #[derive(Clone, Copy)]
 pub(super) enum Plan {
     RowNumber,
+    CountStar {
+        end: End,
+    },
     Rank {
         dense: bool,
     },
@@ -37,23 +40,10 @@ impl Plan {
                     dense: name == "DENSE_RANK",
                 })
             }
+            "COUNT" if matches!(window.args.as_slice(), [Expr::Wildcard]) => {}
             "FIRST_VALUE" | "LAST_VALUE" | "NTH_VALUE" => {}
             _ => return None,
         }
-        let column = expr_column_index_in_template(window.args.first()?, template)?;
-        let nth = match name.as_str() {
-            "FIRST_VALUE" => Some(0),
-            "LAST_VALUE" => None,
-            _ => {
-                let Expr::Literal(crate::parser::Literal::Int(n)) = window.args.get(1)? else {
-                    return None;
-                };
-                if *n <= 0 {
-                    return None;
-                }
-                Some(usize::try_from(*n - 1).ok()?)
-            }
-        };
         let end = match &window.frame {
             None if window.order_by.is_empty() => End::Partition,
             None => End::Peers,
@@ -69,6 +59,23 @@ impl Plan {
                 }
             }
             _ => return None,
+        };
+        if name == "COUNT" {
+            return Some(Self::CountStar { end });
+        }
+        let column = expr_column_index_in_template(window.args.first()?, template)?;
+        let nth = match name.as_str() {
+            "FIRST_VALUE" => Some(0),
+            "LAST_VALUE" => None,
+            _ => {
+                let Expr::Literal(crate::parser::Literal::Int(n)) = window.args.get(1)? else {
+                    return None;
+                };
+                if *n <= 0 {
+                    return None;
+                }
+                Some(usize::try_from(*n - 1).ok()?)
+            }
         };
         Some(Self::Value { column, nth, end })
     }
@@ -118,7 +125,7 @@ impl Plan {
                     }
                     Value::Int(rank)
                 }
-                Self::Value { column, nth, end } => {
+                Self::Value { end, .. } | Self::CountStar { end } => {
                     let last = match end {
                         End::Row => position,
                         End::Partition => partition.len() - 1,
@@ -135,11 +142,17 @@ impl Plan {
                             peer_end
                         }
                     };
-                    let source = nth.unwrap_or(last);
-                    if source <= last {
-                        read(source, column)
-                    } else {
-                        Value::Null
+                    match self {
+                        Self::CountStar { .. } => Value::Int((last + 1) as i64),
+                        Self::Value { column, nth, .. } => {
+                            let source = nth.unwrap_or(last);
+                            if source <= last {
+                                read(source, column)
+                            } else {
+                                Value::Null
+                            }
+                        }
+                        _ => unreachable!("value or count frame"),
                     }
                 }
             };
@@ -254,6 +267,7 @@ mod tests {
                         "ROW_NUMBER()",
                         "RANK()",
                         "DENSE_RANK()",
+                        "COUNT(*)",
                         "FIRST_VALUE(v)",
                         "LAST_VALUE(v)",
                         "NTH_VALUE(v,2)",

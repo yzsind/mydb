@@ -585,11 +585,9 @@ pub(super) fn prepare_with_limit<'a>(
         trace_layout("binding_or_output_type", 0, 0, 0);
         return Ok(Preparation::Streaming(input));
     };
-    if positions.is_empty()
-        || windows.iter().any(|window| {
-            !supported_spec(window, template) || !fixed_window_references(window, template)
-        })
-    {
+    if windows.iter().any(|window| {
+        !supported_spec(window, template) || !fixed_window_references(window, template)
+    }) {
         trace_layout("input_type_or_expression", 0, 0, 0);
         return Ok(Preparation::Streaming(input));
     }
@@ -713,16 +711,20 @@ pub(super) fn prepare_with_limit<'a>(
             } else {
                 None
             };
-            let key = native_key.is_none().then(|| {
+            let key = (!positions.is_empty() && native_key.is_none()).then(|| {
                 keys.iter()
                     .map(|column| ValueKey::from(&column.value_at(row)))
                     .collect::<smallvec::SmallVec<[_; 2]>>()
             });
-            let existing = match (native_lookup.as_ref(), native_key) {
-                (Some(lookup), Some(key)) => lookup.get(key),
-                _ => lookup
-                    .get(key.as_ref().expect("general partition key"))
-                    .copied(),
+            let existing = if positions.is_empty() {
+                (!partitions.is_empty()).then_some(0)
+            } else {
+                match (native_lookup.as_ref(), native_key) {
+                    (Some(lookup), Some(key)) => lookup.get(key),
+                    _ => lookup
+                        .get(key.as_ref().expect("general partition key"))
+                        .copied(),
+                }
             };
             let group = if let Some(group) = existing {
                 group
@@ -754,7 +756,7 @@ pub(super) fn prepare_with_limit<'a>(
                         input_bytes.saturating_add(scratch_bytes),
                         limit,
                     );
-                } else {
+                } else if !positions.is_empty() {
                     lookup.insert(key.expect("general partition key"), group);
                 }
                 group
@@ -817,9 +819,18 @@ pub(super) fn prepare_with_limit<'a>(
     };
     let sort_workers =
         crate::engine::executor::dispatch::window_parallel_degree(slots, partitions.len()).max(1);
-    let evaluation_scratch = peak_partition.saturating_mul(
-        (template.len() + max_order + 2).saturating_mul(std::mem::size_of::<Value>()) + 128,
-    );
+    // Direct rank/value evaluation owns only its result vector. Reserving a
+    // scalar copy of every input column would reject a large single partition
+    // even though those values are read from the retained typed batches.
+    let evaluation_row_bytes = if windows
+        .iter()
+        .all(|window| direct::Plan::bind(window, template).is_some())
+    {
+        std::mem::size_of::<Value>()
+    } else {
+        (template.len() + max_order + 2).saturating_mul(std::mem::size_of::<Value>()) + 128
+    };
+    let evaluation_scratch = peak_partition.saturating_mul(evaluation_row_bytes);
     // Sorting and evaluation are separate phases. Parallel sorting needs
     // only row references, not a full scalar partition per worker.
     let sorting_scratch = peak_partition

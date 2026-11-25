@@ -4384,6 +4384,11 @@ impl HeapFile {
         for page_id in HeapPageScan::from_range(page_count, page_lo, page_hi) {
             let mut scan_page = |page: HeapPageRead<'_>| {
                 for slot_id in 0..page.slot_count() {
+                    // Slot directories are contiguous, but variable-width row
+                    // bodies need not be. Overlap the next bodies' first cache
+                    // line with MVCC/decode of the current row. This is only a
+                    // bounded hint: visitation and error order stay unchanged.
+                    page.prefetch_payload(slot_id + 4);
                     let Some(payload) = page.payload(slot_id)? else {
                         continue;
                     };
@@ -4430,10 +4435,10 @@ impl HeapFile {
                     AccessIntent::Scan,
                     &mut loaded,
                 )?;
-                pinned.with_heap_raw_bytes_cached(
-                    self.verified_direct_checksums.as_ref(),
-                    |page| scan_page(HeapPageRead::Raw(page)),
-                )?
+                pinned
+                    .with_heap_raw_bytes_cached(self.verified_direct_checksums.as_ref(), |page| {
+                        scan_page(HeapPageRead::Raw(page))
+                    })?
             } else {
                 self.prefetch_after(page_id, scan_end, &mut prefetch_horizon);
                 self.with_scan_page(page_id, page_count, policy, scan_page)?
@@ -5369,12 +5374,13 @@ impl HeapFile {
         // Stamp FPI coverage before any deferred mutation. Otherwise another
         // mutation in this window would emit an image containing an unlogged
         // row version.
-        self.buffer_pool.with_raw_page_mut(key.clone(), lsn, |bytes| {
-            if reduced {
-                write_u16(bytes, 6, 0);
-            }
-            Ok(())
-        })?;
+        self.buffer_pool
+            .with_raw_page_mut(key.clone(), lsn, |bytes| {
+                if reduced {
+                    write_u16(bytes, 6, 0);
+                }
+                Ok(())
+            })?;
         Ok(lsn)
     }
 
@@ -6711,6 +6717,27 @@ impl HeapPageRead<'_> {
         }
     }
 
+    fn prefetch_payload(&self, slot_id: usize) {
+        let Self::Raw(Some(page)) = self else {
+            return;
+        };
+        if slot_id >= page.slot_count {
+            return;
+        }
+        let base = PAGE_HEADER_SIZE + slot_id * SLOT_SIZE;
+        let offset = read_u16(page.bytes, base) as usize;
+        let len = read_u16(page.bytes, base + 2) as usize;
+        let flags = page.bytes[base + 4];
+        if flags & (ROW_FLAG_DELETED | ROW_FLAG_FREE) == 0
+            && len != 0
+            && offset.saturating_add(len) <= page.bytes.len()
+        {
+            crate::engine::vector::distance::prefetch_read(
+                page.bytes.as_ptr().wrapping_add(offset).cast(),
+            );
+        }
+    }
+
     fn payload(&self, slot_id: usize) -> Result<Option<&[u8]>, QueryError> {
         match self {
             Self::Raw(Some(page)) => page.payload(slot_id),
@@ -6831,7 +6858,6 @@ impl Drop for HeapFile {
         }
     }
 }
-
 
 /// An owed full-page image keeps its page deferred-pinned, hence resident.
 fn owed_page_image_not_resident() -> QueryError {
