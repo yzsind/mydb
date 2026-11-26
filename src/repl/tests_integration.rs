@@ -1124,6 +1124,152 @@ mod online_apply {
     }
 
     #[tokio::test]
+    async fn physical_replica_online_special_alter_preserves_derivatives() {
+        let (source, _source_dir, service) = build_master_engine().await;
+        // Keep authority cleanup pending until the replica has demonstrated
+        // that it cannot retire source-owned counters on its own.
+        source.database_for_replication().set_catalog_retirement_waker(|| {});
+        let (replica, _replica_dir, mut lifecycle, _status) =
+            spawn_replica(service.bind_addr()).await;
+        let writer = source.clone();
+        tokio::task::spawn_blocking(move || {
+            writer.execute("CREATE TABLE transformed(id INT PRIMARY KEY,n INT,body TEXT,g GEOMETRY NOT NULL,FULLTEXT ft(body),SPATIAL sp(g))").unwrap();
+            writer.execute("INSERT INTO transformed VALUES(1,10,'quartz amber',ST_GeomFromText('POINT(1 1)')),(2,20,'silver amber',ST_GeomFromText('POINT(2 2)'))").unwrap();
+        })
+        .await
+        .unwrap();
+        let hook = source
+            .database_for_replication()
+            .install_online_copy_publish_test_hook();
+        let writer = source.clone();
+        let ddl = tokio::task::spawn_blocking(move || {
+            let mut session = crate::engine::SessionContext::default();
+            session.connection_id = 30901;
+            writer
+                .execute_with_session(
+                    &mut session,
+                    "ALTER TABLE transformed MODIFY n BIGINT, LOCK=NONE",
+                )
+                .unwrap();
+        });
+        let wait = hook.clone();
+        assert!(tokio::task::spawn_blocking(
+            move || wait.wait_until_reached(Duration::from_secs(10))
+        )
+        .await
+        .unwrap());
+        let writer = source.clone();
+        tokio::task::spawn_blocking(move || {
+            writer.execute("UPDATE transformed SET n=11,body='cobalt quartz',g=ST_GeomFromText('POINT(3 3)') WHERE id=1").unwrap();
+            writer.execute("INSERT INTO transformed VALUES(3,30,'quartz zircon',ST_GeomFromText('POINT(4 4)'))").unwrap();
+        })
+        .await
+        .unwrap();
+        hook.release();
+        ddl.await.unwrap();
+        let expected = vec![
+            vec![
+                Value::Int(1),
+                Value::Int(11),
+                Value::String("POINT(3 3)".into()),
+            ],
+            vec![
+                Value::Int(3),
+                Value::Int(30),
+                Value::String("POINT(4 4)".into()),
+            ],
+        ];
+        let query = "SELECT id,n,ST_AsText(g) FROM transformed WHERE MATCH(body) AGAINST('quartz' IN BOOLEAN MODE) ORDER BY id";
+        assert_eq!(
+            poll_select_exact(&replica, query, &expected, 5000).await,
+            expected
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while replica
+            .database_for_replication()
+            .table("test.transformed")
+            .unwrap()
+            .active_generation
+            != 2
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "replica did not publish generation"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let query = "SELECT id FROM transformed FORCE INDEX(sp) WHERE MBRContains(ST_GeomFromText('POLYGON((2.5 2.5,5 2.5,5 5,2.5 5,2.5 2.5))'),g) ORDER BY id";
+        let expected = vec![vec![Value::Int(1)], vec![Value::Int(3)]];
+        assert_eq!(
+            poll_select_exact(&replica, query, &expected, 5000).await,
+            expected
+        );
+        let score_sql = "SELECT id,MATCH(body) AGAINST('quartz') FROM transformed ORDER BY id";
+        let writer = source.clone();
+        let score = tokio::task::spawn_blocking(move || {
+            let QueryResponse::ResultSet(result) =
+                writer.execute(score_sql).unwrap().materialize().unwrap()
+            else {
+                panic!("rows")
+            };
+            result.rows
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            poll_select_exact(&replica, score_sql, &score, 5000).await,
+            score
+        );
+        let db = replica.database_for_replication().clone();
+        tokio::task::spawn_blocking(move || {
+            assert_eq!(db.catalog_retirement_count_for_test(), 1);
+            assert_eq!(db.maintain_catalog_retirements_until(|| false).unwrap(), 0);
+            assert_eq!(db.catalog_retirement_count_for_test(), 1);
+        })
+        .await
+        .unwrap();
+        let writer = source.clone();
+        tokio::task::spawn_blocking(move || {
+            assert_eq!(
+                writer
+                    .database_for_replication()
+                    .catalog_retirement_count_for_test(),
+                1
+            );
+            writer
+                .database_for_replication()
+                .maintain_catalog_retirements_until(|| false)
+                .unwrap();
+            assert_eq!(
+                writer
+                    .database_for_replication()
+                    .catalog_retirement_count_for_test(),
+                0
+            );
+        })
+        .await
+        .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while replica
+            .database_for_replication()
+            .catalog_retirement_count_for_test()
+            != 0
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "replica did not apply corpus retirement"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            poll_select_exact(&replica, score_sql, &score, 5000).await,
+            score
+        );
+        lifecycle.stop_and_wait().await;
+        service.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn physical_replica_index_retirement_reuses_names_without_local_wal() {
         let (source, _source_dir, service) = build_master_engine().await;
         let (replica, _replica_dir, mut lifecycle, _status) =

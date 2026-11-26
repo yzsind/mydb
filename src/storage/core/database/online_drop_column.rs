@@ -67,6 +67,7 @@ impl Database {
             vector_files: Vec::new(),
             vector_directories: Vec::new(),
             retired_table_cache: None,
+            retired_fulltext: None,
         };
         for id in table.storage_ids() {
             let path = self.index_path_for_table_schema(table, id, &index.name);

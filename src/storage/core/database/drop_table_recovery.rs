@@ -57,6 +57,12 @@ impl RetiredTableCache {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct RetiredFulltextGeneration {
+    generation: u64,
+    resume: Option<(IndexKey, RowId)>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct DropTableIntent {
     table_id: u64,
     /// An index retirement shares the table-drop file protocol, but its
@@ -82,6 +88,8 @@ pub(crate) struct DropTableIntent {
     /// keep cleanup independent of a replacement table's SQL name.
     #[serde(default)]
     retired_table_cache: Option<RetiredTableCache>,
+    #[serde(default)]
+    retired_fulltext: Option<RetiredFulltextGeneration>,
 }
 
 impl Database {
@@ -138,6 +146,9 @@ impl Database {
 
     fn retirement_is_live(&self, intent: &DropTableIntent) -> bool {
         self.table_by_id(intent.table_id).is_some_and(|table| {
+            if let Some(retired) = &intent.retired_fulltext {
+                return table.active_generation == retired.generation;
+            }
             intent.retired_index.is_none_or(|(id, generation)| {
                 table.active_generation.max(1) == generation
                     && table.indexes.iter().any(|index| index.index_id == id)
@@ -161,6 +172,13 @@ impl Database {
                 format!("invalid catalog retirement: {err}"),
             )
         })?;
+        if intent.retired_fulltext.as_ref().is_some_and(|retired| {
+            retired.generation == 0 || intent.retired_index != Some((0, retired.generation))
+        }) {
+            return Err(fulltext_statistics_error(
+                "invalid retired corpus generation",
+            ));
+        }
         let (index_id, generation) = intent.retired_index.unwrap_or((0, 0));
         if values.get(..3)
             != Some(
@@ -221,7 +239,8 @@ impl Database {
                     continue;
                 }
                 let old = Self::decode_retirement(&row.values)?;
-                if !self.retirement_is_live(&old)
+                if old.retired_fulltext.is_none()
+                    && !self.retirement_is_live(&old)
                     && old
                         .files
                         .iter()
@@ -249,6 +268,104 @@ impl Database {
         }
         self.add_index_retirement(&mut txn, intent)?;
         Ok(txn)
+    }
+
+    fn stage_fulltext_generation_retirement(
+        &self,
+        txn: &mut CatalogTxn<'_>,
+        table: &TableSchema,
+        generation: u64,
+    ) -> Result<(), QueryError> {
+        let intent = DropTableIntent {
+            table_id: table.id,
+            retired_index: Some((0, generation)),
+            had_auto_increment: false,
+            database: table.database.clone(),
+            table_name: table.name.clone(),
+            files: Vec::new(),
+            vector_files: Vec::new(),
+            vector_directories: Vec::new(),
+            retired_table_cache: None,
+            retired_fulltext: Some(RetiredFulltextGeneration {
+                generation,
+                resume: None,
+            }),
+        };
+        self.add_index_retirement(txn, &intent)
+    }
+
+    fn retire_fulltext_counter_batch(
+        &self,
+        intent: &mut DropTableIntent,
+        read: TxnView,
+        txn: &mut CatalogTxn<'_>,
+        stop: &dyn Fn() -> bool,
+    ) -> Result<bool, QueryError> {
+        use crate::storage::data_dictionary::DD_FULLTEXT_COUNTERS;
+        #[cfg(test)]
+        {
+            let hook = self.retirement_cleanup_test_hook.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook.pause();
+            }
+        }
+        let retired = intent.retired_fulltext.as_mut().unwrap();
+        if intent.retired_index != Some((0, retired.generation)) || retired.generation == 0 {
+            return Err(fulltext_statistics_error(
+                "invalid retired corpus generation",
+            ));
+        }
+        // Bound both the raw traversal (including MVCC tombstones) and the DD
+        // transaction. Persist the cursor with each batch so restart resumes
+        // without rescanning retained historical keys or skipping live rows.
+        let _scratch = crate::engine::executor::mem_budget::ControlledMemoryCharge::try_new(
+            crate::engine::executor::mem_budget::ControlledMemoryCategory::StorageScratch,
+            8 * 1024 * 1024,
+        )?;
+        let schema =
+            crate::storage::data_dictionary::dd_table_schema(DD_FULLTEXT_COUNTERS).unwrap();
+        let primary = Self::dd_primary_index(&schema)?;
+        let prefix = Self::dd_selector_key(
+            &schema,
+            primary,
+            &[
+                Value::UInt(intent.table_id),
+                Value::UInt(retired.generation),
+            ],
+        )?;
+        let low = IndexBound {
+            key: prefix.clone(),
+            inclusive: true,
+        };
+        let entries = self.with_index_read(DD_FULLTEXT_COUNTERS, &primary.name, |index| {
+            index.range_entries_chunk(Some(&low), None, retired.resume.as_ref(), 257)
+        })?;
+        for (key, row_id) in entries.iter().take(256) {
+            if !key.0.starts_with(&prefix.0) {
+                return Ok(true);
+            }
+            if stop() {
+                return Ok(false);
+            }
+            if let Some(row) = self.read_row_at(&schema, DD_FULLTEXT_COUNTERS, *row_id, read)? {
+                if schema.index_key(primary, &row.values)? == *key {
+                    let values = primary
+                        .columns
+                        .iter()
+                        .map(|name| schema.column_index(name).map(|pos| row.values[pos].clone()))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    txn.replace(
+                        DD_FULLTEXT_COUNTERS,
+                        CatalogRowSelector::PrimaryValues(values),
+                        Vec::new(),
+                    );
+                }
+            }
+            retired.resume = Some((key.clone(), *row_id));
+        }
+        Ok(entries
+            .get(256)
+            .is_none_or(|(key, _)| !key.0.starts_with(&prefix.0)))
     }
 
     fn add_index_retirement(
@@ -314,12 +431,14 @@ impl Database {
             crate::wal::LogManager::sync_durable_to(&self.log, covered)?;
         }
         let mut completed = 0;
+        let mut counters_pending = false;
         let mut txn = CatalogTxn::new(self);
         let mut visited = None;
         for (key, row_id) in &entries {
             if stop() {
                 break;
             }
+            let previous = visited.clone();
             visited = Some((key.clone(), *row_id));
             let Some(row) = self.read_row_at(&table, DD_DDL_RETIREMENTS, *row_id, snapshot.txn)?
             else {
@@ -329,7 +448,7 @@ impl Database {
             if table.index_key(primary, &row.values)? != *key {
                 continue;
             }
-            let intent = Self::decode_retirement(&row.values)?;
+            let mut intent = Self::decode_retirement(&row.values)?;
             if self.retirement_is_live(&intent) {
                 continue;
             }
@@ -338,6 +457,27 @@ impl Database {
                 Err(err) if err.is(crate::error::catalog::ER_DISK_FULL_NOWAIT) => continue,
                 Err(err) => return Err(err),
             };
+            if intent.retired_fulltext.is_some() {
+                // Only the authority removes DD rows. Replicas consume its WAL;
+                // local cleanup must never generate a divergent transaction.
+                if self.physical_replica_mode() {
+                    continue;
+                }
+                let finished = self.retire_fulltext_counter_batch(
+                    &mut intent, snapshot.txn, &mut txn, &stop,
+                )?;
+                if finished {
+                    txn.replace(DD_DDL_RETIREMENTS, Self::retirement_selector(&intent), Vec::new());
+                } else {
+                    self.add_index_retirement(&mut txn, &intent)?;
+                    visited = previous;
+                    counters_pending = true;
+                }
+                completed += 1;
+                // One counter batch per maintenance call keeps memory, WAL,
+                // shared DD latches and the cleanup mutex bounded.
+                break;
+            }
             let cleaned = if self.physical_replica_mode() {
                 intent
                     .retired_table_cache
@@ -382,6 +522,10 @@ impl Database {
         }
         if !txn.replacements.is_empty() {
             txn.commit()?;
+        }
+        drop(cursor);
+        if counters_pending {
+            self.request_catalog_retirement_cleanup();
         }
         Ok(completed)
     }
@@ -432,6 +576,7 @@ impl Database {
             vector_files,
             vector_directories,
             retired_table_cache: Some(RetiredTableCache::for_table(table)),
+            retired_fulltext: None,
         })
     }
 

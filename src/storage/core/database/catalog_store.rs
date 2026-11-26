@@ -1797,9 +1797,16 @@ impl Database {
                                 }
                             }
                         }
-                        for corpus in corpora.difference(&retained) {
-                            txn.replace(crate::storage::data_dictionary::DD_FULLTEXT_COUNTERS,
-                                CatalogRowSelector::PrefixValues(vec![Value::UInt(table_id), Value::UInt(generation), Value::UInt(*corpus)]), Vec::new());
+                        if let Some(table) = table.filter(|table| table.active_generation != generation) {
+                            // Old scoring families are unreachable after a physical
+                            // generation switch. Retire them atomically, then reclaim
+                            // bounded batches without holding the publication lock.
+                            self.stage_fulltext_generation_retirement(&mut txn, table, generation)?;
+                        } else {
+                            for corpus in corpora.difference(&retained) {
+                                txn.replace(crate::storage::data_dictionary::DD_FULLTEXT_COUNTERS,
+                                    CatalogRowSelector::PrefixValues(vec![Value::UInt(table_id), Value::UInt(generation), Value::UInt(*corpus)]), Vec::new());
+                            }
                         }
                     }
                     let rows = table

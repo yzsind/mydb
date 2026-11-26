@@ -3671,6 +3671,7 @@ impl Database {
         if recycled.is_none() { self.stage_table_retirement(&retired)?; }
         let mut private = DropTableIntent {
             retired_table_cache: None,
+            retired_fulltext: None,
             retired_index: None,
             table_id: candidate.id,
             had_auto_increment: candidate.auto_increment_column_index().is_some(),
@@ -5651,6 +5652,7 @@ impl Database {
         };
         let mut retired = DropTableIntent {
             retired_table_cache: None,
+            retired_fulltext: None,
             table_id: table_snapshot.id,
             retired_index: Some((
                 dropped_index.index_id,
@@ -7989,17 +7991,6 @@ impl Database {
                 "online OPTIMIZE TABLE requires a durable storage backend",
             ));
         }
-        if source.indexes.iter().any(|index| {
-            !["BTREE", "FULLTEXT", "SPATIAL"]
-                .iter()
-                .any(|kind| index.index_type.eq_ignore_ascii_case(kind))
-                && !index.is_vector()
-        }) {
-            return Err(error(
-                crate::error::catalog::ER_NOT_SUPPORTED_YET,
-                "online OPTIMIZE TABLE does not support this index type",
-            ));
-        }
         // FULLTEXT candidates currently carry only RowId, which is local to
         // one partition. Compaction can make previously distinct local ids
         // collide in that query path. Reject before changing any files until
@@ -8008,6 +7999,12 @@ impl Database {
             return Err(error(
                 crate::error::catalog::ER_NOT_SUPPORTED_YET,
                 "online OPTIMIZE TABLE does not support partitioned FULLTEXT indexes",
+            ));
+        }
+        if !online_copy_indexes_supported(&source) {
+            return Err(error(
+                crate::error::catalog::ER_NOT_SUPPORTED_YET,
+                "online OPTIMIZE TABLE does not support this index type",
             ));
         }
         let mut target = source.as_ref().clone();
@@ -8049,6 +8046,8 @@ impl Database {
         strict: bool,
     ) -> Result<Vec<crate::engine::api::SqlWarning>, QueryError> {
         #[cfg(test)]
+        let _offline_hold = OnlineCopyHoldTimer(Instant::now());
+        #[cfg(test)]
         if !ddl_copy_streaming_enabled() {
             return self.rewrite_table_for_alter_copy_legacy_oracle(
                 table_name, old_table, candidate, strict,
@@ -8057,7 +8056,7 @@ impl Database {
         candidate.reset_row_layouts_for_rewrite();
         candidate.build_column_index();
         let _binlog = crate::binlog::SessionSqlLogBinGuard::new(false);
-        if old_table.is_partitioned() {
+        let result = if old_table.is_partitioned() {
             let job = self.register_alter_copy_job(&old_table);
             let id = old_table.id;
             let result =
@@ -8068,7 +8067,11 @@ impl Database {
             self.rewrite_table_for_alter_copy_streaming_direct(
                 table_name, old_table, candidate, strict, None, None,
             )
+        };
+        if result.is_ok() {
+            self.request_catalog_retirement_cleanup();
         }
+        result
     }
 
     // Differential oracle only: production never destructively rewrites a live heap.
@@ -8660,6 +8663,13 @@ impl Database {
                     )
                 }));
             DDL_COPY_SHADOW_BYTES.fetch_add(shadow_bytes, Ordering::Relaxed);
+            if online_barrier.is_some() {
+                // Direct bulk output has no row redo. Declare and seed the
+                // private heap before catch-up emits logical row mutations.
+                // Do this outside publication X; the final public baseline is
+                // still logged atomically with the catalog switch below.
+                self.log_copied_page_file(ddl_txn_id, &shadow_heap_path)?;
+            }
             self.backfill_copied_fulltext_statistics(ddl_txn, &candidate, shadow_id, candidate.id)?;
             if let Some((owner, _)) = online_barrier {
                 Self::set_alter_copy_job_state(&job, "CATCH_UP");
@@ -9648,6 +9658,45 @@ impl Database {
         })
     }
 
+    // Private and published page files use the same bounded WAL baseline.
+    // No replica may consume a private heap delta before this declaration.
+    fn log_copied_page_file(&self, txn_id: u64, path: &Path) -> Result<(), QueryError> {
+        if self.config.durability == DurabilityMode::Memory {
+            return Ok(());
+        }
+        let _charge = crate::engine::executor::mem_budget::ControlledMemoryCharge::try_new(
+            crate::engine::executor::mem_budget::ControlledMemoryCategory::DdlCopy,
+            4 * PAGE_SIZE,
+        )?;
+        let relative = self.relative_path(path);
+        let mut file = File::open(path).map_err(io_err)?;
+        let total = file.metadata().map_err(io_err)?.len();
+        if total == 0 || total % PAGE_SIZE as u64 != 0 {
+            return Err(error(
+                crate::error::catalog::ER_GET_ERRNO,
+                "copied generation has invalid page file length",
+            ));
+        }
+        let mut page = vec![0; PAGE_SIZE];
+        file.read_exact(&mut page).map_err(io_err)?;
+        self.append_wal(
+            txn_id,
+            WalPayload::FileCreate {
+                path: relative.clone(),
+                after: page.clone(),
+            },
+        )?;
+        for page_id in 1..total / PAGE_SIZE as u64 {
+            crate::engine::cancel::check_cancelled()?;
+            file.read_exact(&mut page).map_err(io_err)?;
+            self.append_wal(
+                txn_id,
+                WalPayload::full_page_image(relative.clone(), page_id, page.clone()),
+            )?;
+        }
+        Ok(())
+    }
+
     /// Direct COPY output is durable locally but has no row redo. Publish a
     /// bounded physical baseline at its final paths before committing the DD.
     /// Replication and backup replay cannot follow local hard links or intents.
@@ -9659,19 +9708,15 @@ impl Database {
         if self.config.durability == DurabilityMode::Memory {
             return Ok(());
         }
-        let _charge = crate::engine::executor::mem_budget::ControlledMemoryCharge::try_new(
-            crate::engine::executor::mem_budget::ControlledMemoryCategory::DdlCopy,
-            4 * PAGE_SIZE,
-        )?;
         for (_, path) in &swap.shadow_to_live {
             let ext = path.extension().and_then(|ext| ext.to_str()).unwrap_or("");
             if matches!(ext, "idx" | "vmanifest") || !path.try_exists().map_err(io_err)? {
                 continue;
             }
-            let relative = self.relative_path(path);
-            let mut file = File::open(path).map_err(io_err)?;
-            let total = file.metadata().map_err(io_err)?.len();
             if matches!(ext, "hvec" | "hnsw") {
+                let relative = self.relative_path(path);
+                let mut file = File::open(path).map_err(io_err)?;
+                let total = file.metadata().map_err(io_err)?.len();
                 let _vector_charge =
                     crate::engine::executor::mem_budget::ControlledMemoryCharge::try_new(
                         crate::engine::executor::mem_budget::ControlledMemoryCategory::DdlCopy,
@@ -9695,29 +9740,7 @@ impl Database {
                 }
                 continue;
             }
-            if total == 0 || total % PAGE_SIZE as u64 != 0 {
-                return Err(error(
-                    crate::error::catalog::ER_GET_ERRNO,
-                    "copied generation has invalid page file length",
-                ));
-            }
-            let mut page = vec![0; PAGE_SIZE];
-            file.read_exact(&mut page).map_err(io_err)?;
-            self.append_wal(
-                txn_id,
-                WalPayload::FileCreate {
-                    path: relative.clone(),
-                    after: page.clone(),
-                },
-            )?;
-            for page_id in 1..total / PAGE_SIZE as u64 {
-                crate::engine::cancel::check_cancelled()?;
-                file.read_exact(&mut page).map_err(io_err)?;
-                self.append_wal(
-                    txn_id,
-                    WalPayload::full_page_image(relative.clone(), page_id, page.clone()),
-                )?;
-            }
+            self.log_copied_page_file(txn_id, path)?;
         }
         Ok(())
     }

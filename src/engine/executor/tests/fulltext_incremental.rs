@@ -888,16 +888,51 @@ fn fulltext_incremental_ddl_retires_counters_without_breaking_old_snapshots() {
     e.execute("CREATE FULLTEXT INDEX fn ON ft_inc(body) WHERE active=1")
         .unwrap();
     let before_copy = db.table("test.ft_inc").unwrap();
+    let copy_snapshot = db.begin_read_only_txn().unwrap();
+    let copy_statistics = db
+        .fulltext_corpus_statistics(
+            copy_snapshot,
+            &before_copy,
+            &before_copy.indexes[1],
+            &["quartz".into()],
+            None,
+        )
+        .unwrap();
     e.execute("OPTIMIZE TABLE ft_inc").unwrap();
     assert_corpora(&e, "test.ft_inc", current(&e));
     let after_copy = db.table("test.ft_inc").unwrap();
     if before_copy.active_generation != after_copy.active_generation {
+        for _ in 0..16 {
+            if count(vec![before_copy.id, before_copy.active_generation]) == 0 {
+                break;
+            }
+            db.maintain_catalog_retirements_until(|| false).unwrap();
+        }
         assert_eq!(
             count(vec![before_copy.id, before_copy.active_generation]),
             0
         );
     }
+    let frozen = db
+        .fulltext_corpus_statistics(
+            copy_snapshot,
+            &before_copy,
+            &before_copy.indexes[1],
+            &["quartz".into()],
+            None,
+        )
+        .unwrap();
+    assert_eq!(frozen.documents, copy_statistics.documents);
+    assert_eq!(frozen.total_tokens, copy_statistics.total_tokens);
+    assert_eq!(frozen.frequencies, copy_statistics.frequencies);
+    db.rollback_txn(copy_snapshot.txn_id).unwrap();
     e.execute("TRUNCATE TABLE ft_inc").unwrap();
+    for _ in 0..16 {
+        if count(vec![after_copy.id, after_copy.active_generation]) == 0 {
+            break;
+        }
+        db.maintain_catalog_retirements_until(|| false).unwrap();
+    }
     assert_eq!(count(vec![after_copy.id, after_copy.active_generation]), 0);
     e.execute("INSERT INTO ft_inc VALUES(3,'quartz',1)")
         .unwrap();

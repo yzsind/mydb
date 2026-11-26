@@ -160,6 +160,7 @@ impl Database {
                     }
                 }
                 let cleaned = self.purge_dropped_table_files(&DropTableIntent {
+                    retired_fulltext: None,
                     retired_table_cache: Some(RetiredTableCache::for_table(&intent.table)),
                     retired_index: None,
                     table_id: intent.table.id,

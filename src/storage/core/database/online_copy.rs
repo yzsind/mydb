@@ -12,6 +12,18 @@ impl Drop for OnlineCopyHoldTimer {
     }
 }
 
+// All writable COPY entry points share the same derived-index backends.
+// Partitioned FULLTEXT queries still use unqualified RowIds; a new generation
+// can change their meaning, so exclude that shape before allocating shadows.
+fn online_copy_indexes_supported(source: &TableSchema) -> bool {
+    source.indexes.iter().all(|index| {
+        index.index_type.eq_ignore_ascii_case("BTREE")
+            || index.is_vector()
+            || index.is_spatial()
+            || (index.is_fulltext() && !source.is_partitioned())
+    })
+}
+
 // Online physical ALTER uses immutable read views and a private generation.
 // The log records transaction-qualified dirty rows, not speculative row images:
 // once a transaction is visible at a gap-free read watermark we materialize its
@@ -197,12 +209,7 @@ impl Database {
         let Ok(source) = self.table(table_name) else {
             return false;
         };
-        // Shared mode captures no concurrent writes, so derived special indexes
-        // only need the existing bulk builder. Writable replay stays BTREE/vector.
-        (source
-            .indexes
-            .iter()
-            .all(|index| index.index_type.eq_ignore_ascii_case("BTREE") || index.is_vector())
+        (online_copy_indexes_supported(&source)
             || (lock == crate::parser::AlterLock::Shared && !source.is_partitioned()))
             && (copy_requested
                 || actions.iter().any(|action| {
@@ -269,6 +276,9 @@ impl Database {
         };
         drop(barrier);
         self.unregister_alter_copy_job(source.id, result.as_ref().err());
+        if result.is_ok() {
+            self.request_catalog_retirement_cleanup();
+        }
         result
     }
 
