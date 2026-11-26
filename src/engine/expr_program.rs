@@ -1,4 +1,6 @@
+mod borrowed_compare;
 mod column_batch;
+mod native_arithmetic;
 mod unicode_like;
 use crate::engine::expr::expect_arg_count as expect_len;
 use crate::engine::expr::{null_or, ComparisonProvenance};
@@ -2345,6 +2347,9 @@ impl ExprCompiler {
         coerce_conditional_result: bool,
         lower: impl FnOnce(&Expr, &InputSchema) -> Result<ExprNode, CompileError>,
     ) -> Result<ExprProgram, CompileError> {
+        if crate::engine::expr::prepared_string_parameter_requires_scalar(expr) {
+            return Err(CompileError::Unsupported);
+        }
         if expression_depth_exceeds(expr, MAX_COMPILED_EXPRESSION_DEPTH) {
             return Err(CompileError::TooDeep);
         }
@@ -3591,14 +3596,16 @@ impl From<QueryError> for CompileError {
 /// Comparison provenance and arithmetic warning policies are separate: the
 /// former must never double as a flag for integer-division diagnostics.
 #[derive(Debug, Clone, Copy, Default)]
-enum IntegerComparisonConstant {
+enum IntegerKernel {
     #[default]
     None,
     Left,
     Right,
+    CheckedArithmetic,
+    CheckedZeroScaleArithmetic,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 struct BinarySemantics {
     left_boolean: bool,
     right_boolean: bool,
@@ -3609,26 +3616,66 @@ struct BinarySemantics {
     suppress_left_string_truncation: bool,
     suppress_right_string_truncation: bool,
     comparison: ComparisonProvenance,
-    integer_constant: IntegerComparisonConstant,
+    integer_constant: IntegerKernel,
+    native_arithmetic: Option<Arc<native_arithmetic::NativeArithmetic>>,
     suppress_int_div_truncation: bool,
     exact_left_numeric: bool,
     exact_right_numeric: bool,
 }
 
 impl BinarySemantics {
+    #[inline]
+    fn checked_integer_tree(&self) -> bool {
+        matches!(self.integer_constant, IntegerKernel::CheckedArithmetic)
+    }
+
+    #[inline]
+    fn checked_zero_scale_tree(&self) -> bool {
+        matches!(
+            self.integer_constant,
+            IntegerKernel::CheckedZeroScaleArithmetic
+        )
+    }
+
+    /// Homogeneous text has no numeric/temporal provenance conversions. An
+    /// enclosing numeric scope still declines to the full Value comparator.
+    fn compare_text(&self, left: &str, op: BinaryOp, right: &str) -> Option<Value> {
+        if !matches!(self.integer_constant, IntegerKernel::None) {
+            return None;
+        }
+        crate::engine::expr::with_compare_collation(self.collation_id, || {
+            let order = crate::engine::expr::compare_borrowed_strings(left, right)?;
+            Some(Value::Int(match op {
+                BinaryOp::Eq | BinaryOp::NullSafeEq => order.is_eq(),
+                BinaryOp::NotEq => !order.is_eq(),
+                BinaryOp::Lt => order.is_lt(),
+                BinaryOp::LtEq => !order.is_gt(),
+                BinaryOp::Gt => order.is_gt(),
+                BinaryOp::GtEq => !order.is_lt(),
+                _ => return None,
+            } as i64))
+        })
+    }
+
     fn compare(&self, left: &Value, op: BinaryOp, right: &Value) -> Result<Value, QueryError> {
+        if let (Some(left), Some(right)) = (
+            crate::types::value_str(left),
+            crate::types::value_str(right),
+        ) {
+            if let Some(value) = self.compare_text(left, op, right) {
+                return Ok(value);
+            }
+        }
         let integer = match self.integer_constant {
-            IntegerComparisonConstant::None => None,
-            IntegerComparisonConstant::Left => {
-                crate::engine::expr::exact_integer_comparison_constant(left)
-            }
-            IntegerComparisonConstant::Right => {
-                crate::engine::expr::exact_integer_comparison_constant(right)
-            }
+            IntegerKernel::None
+            | IntegerKernel::CheckedArithmetic
+            | IntegerKernel::CheckedZeroScaleArithmetic => None,
+            IntegerKernel::Left => crate::engine::expr::exact_integer_comparison_constant(left),
+            IntegerKernel::Right => crate::engine::expr::exact_integer_comparison_constant(right),
         };
         let (left, right) = match (self.integer_constant, integer.as_ref()) {
-            (IntegerComparisonConstant::Left, Some(value)) => (value, right),
-            (IntegerComparisonConstant::Right, Some(value)) => (left, value),
+            (IntegerKernel::Left, Some(value)) => (value, right),
+            (IntegerKernel::Right, Some(value)) => (left, value),
             _ => (left, right),
         };
         let left_json =
@@ -3945,7 +3992,17 @@ impl ExprNode {
             | ExprNode::IsNull(expr)
             | ExprNode::IsNotNull(expr)
             | ExprNode::SubstringConst { expr, .. } => boxed(expr),
-            ExprNode::Binary { left, right, .. } => boxed(left).saturating_add(boxed(right)),
+            ExprNode::Binary {
+                left,
+                right,
+                semantics,
+                ..
+            } => boxed(left).saturating_add(boxed(right)).saturating_add(
+                semantics
+                    .native_arithmetic
+                    .as_ref()
+                    .map_or(0, |program| program.heap_bytes()),
+            ),
             ExprNode::InList { expr, list, .. } => {
                 boxed(expr).saturating_add(vector(list, list.capacity()))
             }
@@ -6284,16 +6341,18 @@ fn compile_node_inner(expr: &Expr, schema: &InputSchema) -> Result<ExprNode, Com
                     || matches!(operand, Expr::Placeholder(_) | Expr::BoundValue(_))
             };
             let mut integer_constant = if is_cmp && integer_column(left) && constant(right) {
-                IntegerComparisonConstant::Right
+                IntegerKernel::Right
             } else if is_cmp && integer_column(right) && constant(left) {
-                IntegerComparisonConstant::Left
+                IntegerKernel::Left
             } else {
-                IntegerComparisonConstant::None
+                IntegerKernel::None
             };
             let node = match integer_constant {
-                IntegerComparisonConstant::Left => Some(&mut lnode),
-                IntegerComparisonConstant::Right => Some(&mut rnode),
-                IntegerComparisonConstant::None => None,
+                IntegerKernel::Left => Some(&mut lnode),
+                IntegerKernel::Right => Some(&mut rnode),
+                IntegerKernel::None
+                | IntegerKernel::CheckedArithmetic
+                | IntegerKernel::CheckedZeroScaleArithmetic => None,
             };
             if let Some(ExprNode::Const(value)) = node {
                 if let Some(integer) = crate::engine::expr::exact_integer_comparison_constant(value)
@@ -6301,8 +6360,41 @@ fn compile_node_inner(expr: &Expr, schema: &InputSchema) -> Result<ExprNode, Com
                     *value = integer;
                 }
                 // Ordinary literal comparisons retain their allocation-free hot path.
-                integer_constant = IntegerComparisonConstant::None;
+                integer_constant = IntegerKernel::None;
             }
+            let checked_integer_tree = matches!(
+                op,
+                BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::IntDiv | BinaryOp::Mod
+            ) && !operand_unsigned(left, schema)
+                && !operand_unsigned(right, schema)
+                && checked_integer_node(&lnode, schema)
+                && checked_integer_node(&rnode, schema);
+            if checked_integer_tree {
+                integer_constant = IntegerKernel::CheckedArithmetic;
+            }
+            // Exact zero-scale arithmetic retains DECIMAL results. `/` may
+            // use this lane only when the bound session precision is zero.
+            let zero_scale_arithmetic = matches!(
+                op,
+                BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Mod
+            ) && (!checked_integer_node(&lnode, schema)
+                || !checked_integer_node(&rnode, schema));
+            if (zero_scale_arithmetic
+                || (*op == BinaryOp::Div
+                    && crate::engine::expr::session_div_precision_increment() == 0))
+                && !operand_unsigned(left, schema)
+                && !operand_unsigned(right, schema)
+                && checked_zero_scale_node(&lnode, schema)
+                && checked_zero_scale_node(&rnode, schema)
+            {
+                integer_constant = IntegerKernel::CheckedZeroScaleArithmetic;
+            }
+            let native_arithmetic = native_arithmetic::NativeArithmetic::compile(
+                &mut lnode,
+                *op,
+                &mut rnode,
+                integer_constant,
+            );
             Ok(ExprNode::Binary {
                 left: Box::new(lnode),
                 op: *op,
@@ -6326,6 +6418,7 @@ fn compile_node_inner(expr: &Expr, schema: &InputSchema) -> Result<ExprNode, Com
                     ),
                     comparison,
                     integer_constant,
+                    native_arithmetic,
                     suppress_int_div_truncation: *op == BinaryOp::IntDiv
                         && (crate::engine::expr::expr_contains_user_variable_assignment(left)
                             || crate::engine::expr::expr_contains_user_variable_assignment(right)),
@@ -7478,7 +7571,151 @@ impl ValueRef<'_> {
     }
 }
 
+/// Bind only pure signed integer leaves and already-proven arithmetic
+/// children. Parameters retain a runtime type check; no parameter value is
+/// captured in the shared IR. Other domains keep their existing evaluator.
+fn checked_integer_node(node: &ExprNode, schema: &InputSchema) -> bool {
+    match node {
+        ExprNode::Column(index) => schema.columns.get(*index).is_some_and(|column| {
+            !column.unsigned
+                && matches!(
+                    column.column_type,
+                    ColumnType::Tiny
+                        | ColumnType::Short
+                        | ColumnType::MediumInt
+                        | ColumnType::Long
+                        | ColumnType::LongLong
+                )
+        }),
+        ExprNode::Const(Value::Int(_)) => true,
+        ExprNode::Placeholder(index) => {
+            // The program cache already keys on parameter type descriptors.
+            // Avoid a failed speculative tree walk on every row of a bound
+            // string/decimal/NULL execution. Unbound direct programs still
+            // retain the runtime type guard when subsequently rebound.
+            crate::engine::params::with_current_param(*index, |value| {
+                value.is_none() || matches!(value, Some(Value::Int(_)))
+            })
+        }
+        ExprNode::Binary { semantics, .. } => semantics.checked_integer_tree(),
+        _ => false,
+    }
+}
+
+/// Admit only pure exact operands with no fractional scale. Overflow, mixed
+/// runtime lanes and zero divisors are declined without diagnostic effects.
+fn checked_zero_scale_node(node: &ExprNode, schema: &InputSchema) -> bool {
+    if checked_integer_node(node, schema) {
+        return true;
+    }
+    match node {
+        ExprNode::Column(index) => schema.columns.get(*index).is_some_and(|column| {
+            !column.unsigned
+                && matches!(
+                    column.column_type,
+                    ColumnType::Decimal {
+                        precision: 1..=18,
+                        scale: 0
+                    }
+                )
+        }),
+        ExprNode::Const(Value::DecimalCompact(_, 0) | Value::Decimal128(_, 0)) => true,
+        ExprNode::Placeholder(index) => {
+            crate::engine::params::with_current_param(*index, |value| {
+                matches!(
+                    value,
+                    Some(Value::DecimalCompact(_, 0) | Value::Decimal128(_, 0))
+                )
+            })
+        }
+        ExprNode::Binary { semantics, .. } => semantics.checked_zero_scale_tree(),
+        _ => false,
+    }
+}
+
+#[inline]
+fn checked_integer_binary(left: i64, op: BinaryOp, right: i64) -> Option<i64> {
+    match op {
+        BinaryOp::Add => left.checked_add(right),
+        BinaryOp::Sub => left.checked_sub(right),
+        BinaryOp::Mul => left.checked_mul(right),
+        BinaryOp::IntDiv => left.checked_div(right),
+        BinaryOp::Mod => left.checked_rem(right),
+        _ => None,
+    }
+}
+
 impl ExprNode {
+    /// A successful result needs neither Value temporaries nor coercion or
+    /// diagnostic scopes. A refusal has no observable effects: the ordinary
+    /// evaluator still owns NULL propagation, overflow, zero divisors and
+    /// mixed runtime types, in their original left-to-right order.
+    fn checked_integer(&self, row: &dyn RowSource) -> Option<i64> {
+        match self {
+            ExprNode::Column(index) => match row.value_ref(*index)? {
+                Value::Int(value) => Some(*value),
+                _ => None,
+            },
+            ExprNode::Const(Value::Int(value)) => Some(*value),
+            ExprNode::Placeholder(index) => {
+                crate::engine::params::with_current_param(*index, |value| match value? {
+                    Value::Int(value) => Some(*value),
+                    _ => None,
+                })
+            }
+            ExprNode::Binary {
+                left,
+                op,
+                right,
+                semantics,
+            } if semantics.checked_integer_tree() => {
+                let left = left.checked_integer(row)?;
+                let right = right.checked_integer(row)?;
+                checked_integer_binary(left, *op, right)
+            }
+            _ => None,
+        }
+    }
+
+    fn checked_zero_scale(&self, row: &dyn RowSource) -> Option<(i64, bool)> {
+        let read = |value: &Value| match value {
+            Value::Int(value) => Some((*value, false)),
+            Value::DecimalCompact(value, 0) => Some((*value, true)),
+            Value::Decimal128(value, 0) => i64::try_from(*value).ok().map(|value| (value, true)),
+            _ => None,
+        };
+        match self {
+            ExprNode::Column(index) => read(row.value_ref(*index)?),
+            ExprNode::Const(value) => read(value),
+            ExprNode::Placeholder(index) => {
+                crate::engine::params::with_current_param(*index, |value| value.and_then(read))
+            }
+            ExprNode::Binary {
+                left,
+                op,
+                right,
+                semantics,
+            } if semantics.checked_zero_scale_tree() => {
+                let left = left.checked_zero_scale(row)?;
+                let right = right.checked_zero_scale(row)?;
+                let value = checked_integer_binary(
+                    left.0,
+                    if *op == BinaryOp::Div {
+                        BinaryOp::IntDiv
+                    } else {
+                        *op
+                    },
+                    right.0,
+                )?;
+                Some((value, *op == BinaryOp::Div || left.1 || right.1))
+            }
+            ExprNode::Binary { semantics, .. } if semantics.checked_integer_tree() => {
+                self.checked_integer(row).map(|value| (value, false))
+            }
+            _ => None,
+        }
+    }
+
     fn try_eval_simple_predicate(
         &self,
         row: &dyn RowSource,
@@ -7604,7 +7841,22 @@ impl ExprNode {
                 op,
                 right,
                 semantics,
-            } => eval_binary_node(left, *op, right, semantics, row, scratch),
+            } => {
+                if matches!(
+                    op,
+                    BinaryOp::Eq
+                        | BinaryOp::NullSafeEq
+                        | BinaryOp::NotEq
+                        | BinaryOp::Lt
+                        | BinaryOp::LtEq
+                        | BinaryOp::Gt
+                        | BinaryOp::GtEq
+                ) {
+                    borrowed_compare::evaluate(left, *op, right, semantics, row, scratch)
+                } else {
+                    eval_binary_node(left, *op, right, semantics, row, scratch)
+                }
+            }
             ExprNode::IsNull(expr) => Ok(Value::Int(expr.eval_ref(row, scratch)?.is_null() as i64)),
             ExprNode::IsNotNull(expr) => {
                 Ok(Value::Int((!expr.eval_ref(row, scratch)?.is_null()) as i64))
@@ -7818,6 +8070,51 @@ fn eval_binary_node(
     row: &dyn RowSource,
     scratch: &mut EvalScratch,
 ) -> Result<Value, QueryError> {
+    // Probe compact arithmetic only in an already-proven numeric lane.
+    // Comparisons, fractional DECIMAL and mixed coercions keep one dispatch.
+    match semantics.integer_constant {
+        IntegerKernel::CheckedArithmetic | IntegerKernel::CheckedZeroScaleArithmetic => {
+            if let Some(value) = semantics
+                .native_arithmetic
+                .as_ref()
+                .and_then(|program| program.eval(row))
+            {
+                return Ok(value);
+            }
+            if semantics.checked_zero_scale_tree() {
+                if let Some(value) = left.checked_zero_scale(row).and_then(|left| {
+                    right.checked_zero_scale(row).and_then(|right| {
+                        let value = checked_integer_binary(
+                            left.0,
+                            if op == BinaryOp::Div {
+                                BinaryOp::IntDiv
+                            } else {
+                                op
+                            },
+                            right.0,
+                        )?;
+                        Some((value, op == BinaryOp::Div || left.1 || right.1))
+                    })
+                }) {
+                    return Ok(if value.1 {
+                        Value::DecimalCompact(value.0, 0)
+                    } else {
+                        Value::Int(value.0)
+                    });
+                }
+            }
+            if semantics.checked_integer_tree() {
+                if let Some(value) = left.checked_integer(row).and_then(|left| {
+                    right
+                        .checked_integer(row)
+                        .and_then(|right| checked_integer_binary(left, op, right))
+                }) {
+                    return Ok(Value::Int(value));
+                }
+            }
+        }
+        _ => {}
+    }
     if matches!(op, BinaryOp::And | BinaryOp::Or) {
         let l = crate::engine::expr::logical_value(left.eval_ref(row, scratch)?.as_value());
         if op == BinaryOp::And && l == Some(false) {

@@ -4923,3 +4923,364 @@ fn arithmetic_narrow_decimal_lanes_match_scalar_at_domain_boundaries() {
         });
     }
 }
+
+fn clear_checked_integer_tree(node: &mut ExprNode) {
+    match node {
+        ExprNode::Binary {
+            left,
+            right,
+            semantics,
+            ..
+        } => {
+            semantics.native_arithmetic = None;
+            if semantics.checked_integer_tree() || semantics.checked_zero_scale_tree() {
+                semantics.integer_constant = IntegerKernel::None;
+            }
+            clear_checked_integer_tree(left);
+            clear_checked_integer_tree(right);
+        }
+        ExprNode::Unary { expr, .. }
+        | ExprNode::IsNull(expr)
+        | ExprNode::IsNotNull(expr)
+        | ExprNode::SubstringConst { expr, .. } => clear_checked_integer_tree(expr),
+        ExprNode::Function { args, .. } => args.iter_mut().for_each(clear_checked_integer_tree),
+        _ => {}
+    }
+}
+
+#[test]
+fn checked_integer_trees_preserve_values_errors_and_warning_order() {
+    let schema = InputSchema::new(vec![
+        InputColumn {
+            table: "t".into(),
+            alias: None,
+            name: "x".into(),
+            column_type: ColumnType::LongLong,
+            unsigned: false,
+            collation_id: None,
+        },
+        InputColumn {
+            table: "t".into(),
+            alias: None,
+            name: "y".into(),
+            column_type: ColumnType::LongLong,
+            unsigned: false,
+            collation_id: None,
+        },
+        InputColumn {
+            table: "t".into(),
+            alias: None,
+            name: "s".into(),
+            column_type: ColumnType::VarString,
+            unsigned: false,
+            collation_id: None,
+        },
+    ]);
+    let values = [
+        Value::Int(i64::MIN),
+        Value::Int(i64::MIN + 1),
+        Value::Int(i64::MAX),
+        Value::Int(-17),
+        Value::Int(-1),
+        Value::Int(0),
+        Value::Int(1),
+        Value::Int(2),
+        Value::Int(19),
+        Value::UInt(u64::MAX),
+        Value::DecimalCompact(15, 1),
+        Value::Double(1.5),
+        Value::String("2".into()),
+        Value::Null,
+    ];
+    for sql in [
+        "((x-1) DIV 9)*9+y",
+        "(x DIV y)*3+x%y",
+        "(x+y)*(x-y)",
+        "x DIV 0 + y DIV 0",
+        "SUBSTRING(s,(x-1) DIV y+1,(y*2)%7)",
+    ] {
+        let ast = crate::parser::parse_expr_fragment(sql).unwrap();
+        let fast = ExprCompiler::compile(&ast, &schema).unwrap();
+        let mut ordinary = ExprCompiler::compile(&ast, &schema).unwrap();
+        clear_checked_integer_tree(&mut ordinary.root);
+        for x in &values {
+            for y in &values {
+                let input = [x.clone(), y.clone(), Value::String("a中🙂bc\0def".into())];
+                let row = RowView::from_values(&input);
+                let run = |program: &ExprProgram| {
+                    let sink = crate::engine::api::StatementWarningSink::default();
+                    let result =
+                        crate::engine::api::with_statement_warning_sink(sink.clone(), || {
+                            with_eval_scratch(|scratch| program.eval_row(&row, scratch))
+                        });
+                    let warnings = sink.lock().clone();
+                    (result, warnings)
+                };
+                assert_eq!(run(&fast), run(&ordinary), "{sql}; {x:?}, {y:?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn checked_integer_tree_parameters_rebind_and_unsafe_domains_decline() {
+    let schema = InputSchema::new(vec![InputColumn {
+        table: "t".into(),
+        alias: None,
+        name: "x".into(),
+        column_type: ColumnType::LongLong,
+        unsigned: false,
+        collation_id: None,
+    }]);
+    let ast = crate::parser::parse_expr_fragment("(x-?) DIV ? + ?").unwrap();
+    let program = ExprCompiler::compile(&ast, &schema).unwrap();
+    assert!(
+        matches!(&program.root,ExprNode::Binary {semantics,..} if semantics.checked_integer_tree())
+    );
+    let mut ordinary = ExprCompiler::compile(&ast, &schema).unwrap();
+    clear_checked_integer_tree(&mut ordinary.root);
+    let input = [Value::Int(42)];
+    let row = RowView::from_values(&input);
+    for first in [
+        Value::Int(1),
+        Value::UInt(2),
+        Value::DecimalCompact(15, 1),
+        Value::String("1.5".into()),
+        Value::Null,
+    ] {
+        for divisor in [Value::Int(3), Value::Int(0), Value::Int(-1)] {
+            crate::engine::params::with_params(vec![first.clone(), divisor, Value::Int(7)], || {
+                let run = |program: &ExprProgram| {
+                    let sink = crate::engine::api::StatementWarningSink::default();
+                    let result =
+                        crate::engine::api::with_statement_warning_sink(sink.clone(), || {
+                            with_eval_scratch(|scratch| program.eval_row(&row, scratch))
+                        });
+                    let warnings = sink.lock().clone();
+                    (result, warnings)
+                };
+                assert_eq!(run(&program), run(&ordinary));
+            });
+        }
+    }
+    crate::engine::params::with_params(vec![Value::Int(1), Value::Int(3), Value::Int(7)], || {
+        assert_eq!(program.root.checked_integer(&row), Some(20))
+    });
+    for (kind, unsigned) in [
+        (ColumnType::LongLong, true),
+        (
+            ColumnType::Decimal {
+                precision: 20,
+                scale: 2,
+            },
+            false,
+        ),
+        (ColumnType::VarString, false),
+    ] {
+        let schema = InputSchema::new(vec![InputColumn {
+            table: "t".into(),
+            alias: None,
+            name: "x".into(),
+            column_type: kind,
+            unsigned,
+            collation_id: None,
+        }]);
+        let ast = crate::parser::parse_expr_fragment("(x-1) DIV 3").unwrap();
+        let program = ExprCompiler::compile(&ast, &schema).unwrap();
+        assert!(
+            matches!(&program.root,ExprNode::Binary{semantics,..} if !semantics.checked_integer_tree())
+        );
+    }
+}
+
+#[test]
+fn checked_integer_tree_cache_uses_parameter_types_without_capturing_values() {
+    let schema = InputSchema::new(vec![InputColumn {
+        table: "t".into(),
+        alias: None,
+        name: "x".into(),
+        column_type: ColumnType::LongLong,
+        unsigned: false,
+        collation_id: None,
+    }]);
+    let ast = crate::parser::parse_expr_fragment("(x-?) DIV 7").unwrap();
+    for value in [
+        Value::Int(1),
+        Value::String("1.0".into()),
+        Value::DecimalCompact(15, 1),
+        Value::Null,
+        Value::Int(9),
+    ] {
+        let native = matches!(value, Value::Int(_));
+        let expected = match &value {
+            Value::Null => Value::Null,
+            Value::Int(9) => Value::Int(4),
+            _ => Value::Int(5),
+        };
+        crate::engine::params::with_params(vec![value], || {
+            let program = ExprCompiler::compile_cached(&ast, &schema).unwrap();
+            assert_eq!(
+                matches!(&program.root,ExprNode::Binary {semantics,..} if semantics.checked_integer_tree()),
+                native
+            );
+            let row = [Value::Int(42)];
+            let result =
+                with_eval_scratch(|scratch| program.eval_row(&RowView::from_values(&row), scratch))
+                    .unwrap();
+            assert_eq!(result, expected);
+        });
+    }
+}
+
+#[test]
+fn zero_scale_exact_trees_preserve_decimal_types_diagnostics_and_session_precision() {
+    let schema = InputSchema::new(vec![
+        InputColumn {
+            table: "t".into(),
+            alias: None,
+            name: "x".into(),
+            column_type: ColumnType::LongLong,
+            unsigned: false,
+            collation_id: None,
+        },
+        InputColumn {
+            table: "t".into(),
+            alias: None,
+            name: "y".into(),
+            column_type: ColumnType::Decimal {
+                precision: 18,
+                scale: 0,
+            },
+            unsigned: false,
+            collation_id: None,
+        },
+    ]);
+    let values = [
+        Value::Int(i64::MIN),
+        Value::Int(i64::MAX),
+        Value::Int(-19),
+        Value::Int(-1),
+        Value::Int(0),
+        Value::Int(1),
+        Value::Int(19),
+        Value::DecimalCompact(7, 0),
+        Value::DecimalCompact(15, 1),
+        Value::Decimal128(i128::MAX, 0),
+        Value::UInt(u64::MAX),
+        Value::String("2x".into()),
+        Value::Double(1.5),
+        Value::Null,
+    ];
+    for increment in [0, 4, 9] {
+        let mut session = SessionContext::default();
+        session.sysvars.div_precision_increment = increment;
+        crate::engine::expr::with_session_expr_info(&session, || {
+            for sql in [
+                "((x-1)/9)*9+y",
+                "x/y",
+                "x+y",
+                "x*y",
+                "x%y",
+                "x/0+y/0",
+                "(x/y)%3+(y/3)*6",
+                "(x+x)/y",
+            ] {
+                let ast = crate::parser::parse_expr_fragment(sql).unwrap();
+                let program = ExprCompiler::compile(&ast, &schema).unwrap();
+                let mut oracle = ExprCompiler::compile(&ast, &schema).unwrap();
+                clear_checked_integer_tree(&mut oracle.root);
+                for x in &values {
+                    for y in &values {
+                        let input = [x.clone(), y.clone()];
+                        let row = RowView::from_values(&input);
+                        let run = |p: &ExprProgram| {
+                            let sink = crate::engine::api::StatementWarningSink::default();
+                            let result = crate::engine::api::with_statement_warning_sink(
+                                sink.clone(),
+                                || with_eval_scratch(|scratch| p.eval_row(&row, scratch)),
+                            );
+                            let warnings = sink.lock().clone();
+                            (result, warnings)
+                        };
+                        assert_eq!(
+                            run(&program),
+                            run(&oracle),
+                            "{sql}, increment={increment}, {input:?}"
+                        );
+                    }
+                }
+            }
+            let ast = crate::parser::parse_expr_fragment("x/3").unwrap();
+            let p = ExprCompiler::compile_cached(&ast, &schema).unwrap();
+            assert_eq!(
+                matches!(&p.root,ExprNode::Binary{semantics,..} if semantics.checked_zero_scale_tree()),
+                increment == 0
+            );
+        });
+    }
+}
+
+#[test]
+fn compact_arithmetic_tapes_keep_bounded_trees_and_decline_to_the_oracle() {
+    let schema = InputSchema::new(vec![InputColumn {
+        table: "t".into(),
+        alias: None,
+        name: "x".into(),
+        column_type: ColumnType::LongLong,
+        unsigned: false,
+        collation_id: None,
+    }]);
+    let mut expressions = vec!["(x+2)*(x-3)+x%7".to_string()];
+    // Deep and wide trees exercise the stack and tape caps.
+    let mut right = "x".to_string();
+    for _ in 0..20 {
+        right = format!("x+({right})");
+    }
+    expressions.push(right);
+    fn balanced_sum(count: usize) -> String {
+        if count == 1 {
+            "x".into()
+        } else {
+            format!(
+                "({}+{})",
+                balanced_sum(count / 2),
+                balanced_sum(count - count / 2)
+            )
+        }
+    }
+    expressions.push(balanced_sum(90));
+    for (index, sql) in expressions.iter().enumerate() {
+        let ast = crate::parser::parse_expr_fragment(sql).unwrap();
+        let program = ExprCompiler::compile(&ast, &schema).unwrap();
+        assert_eq!(
+            matches!(&program.root, ExprNode::Binary { semantics, .. } if semantics.native_arithmetic.is_some()),
+            index == 0
+        );
+        let mut oracle = ExprCompiler::compile(&ast, &schema).unwrap();
+        let charged = program.root.heap_capacity_bytes();
+        clear_checked_integer_tree(&mut oracle.root);
+        assert!(charged >= oracle.root.heap_capacity_bytes());
+        for value in [
+            Value::Int(-17),
+            Value::Int(3),
+            Value::Int(i64::MAX),
+            Value::Int(i64::MIN),
+            Value::DecimalCompact(3, 0),
+            Value::String("2x".into()),
+            Value::Double(1.5),
+            Value::Null,
+        ] {
+            let input = [value];
+            let row = RowView::from_values(&input);
+            let run = |p: &ExprProgram| {
+                let sink = crate::engine::api::StatementWarningSink::default();
+                let result = crate::engine::api::with_statement_warning_sink(sink.clone(), || {
+                    with_eval_scratch(|scratch| p.eval_row(&row, scratch))
+                });
+                let warnings = sink.lock().clone();
+                (result, warnings)
+            };
+            assert_eq!(run(&program), run(&oracle), "{sql}; {input:?}");
+        }
+    }
+}

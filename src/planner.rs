@@ -2751,7 +2751,15 @@ pub(crate) fn resolve_group_by_refs(db: &Database, select: &mut Select) {
                 }
                 if matches > 0 {
                     // A visible FROM column wins over a same-named alias.
-                    if aliases.contains_key(&name.to_ascii_lowercase()) {
+                    if aliases
+                        .get(&name.to_ascii_lowercase())
+                        .is_some_and(|alias| {
+                            !expr_semantically_eq(
+                                &canonical_scope_expr(alias, scope),
+                                &canonical_scope_expr(&Expr::Identifier(name.clone()), scope),
+                            )
+                        })
+                    {
                         // Resolution is intentionally invoked on the
                         // executable SELECT and on planner-owned clones.
                         // Keep the diagnostic statement-scoped and
@@ -3013,6 +3021,23 @@ pub(crate) fn resolve_order_by_output_refs(
         None
     };
     let mut output: HashMap<String, Option<std::borrow::Cow<'_, Expr>>> = HashMap::new();
+    let grouped = !select.group_by.is_empty() || select_has_aggregate(db, select);
+    let mut aggregate_outputs = HashMap::new();
+    if grouped {
+        for item in &select.projection {
+            if let SelectItem::Expr {
+                expr,
+                alias: Some(alias),
+            } = item
+            {
+                if expr_has_aggregate(expr) {
+                    aggregate_outputs
+                        .entry(alias.to_ascii_lowercase())
+                        .or_insert(expr);
+                }
+            }
+        }
+    }
     fn add<'a>(
         output: &mut HashMap<String, Option<std::borrow::Cow<'a, Expr>>>,
         name: String,
@@ -3059,6 +3084,9 @@ pub(crate) fn resolve_order_by_output_refs(
                 }
             }
         }
+    }
+    for (name, expr) in aggregate_outputs {
+        output.insert(name, Some(std::borrow::Cow::Borrowed(expr)));
     }
     let needs = select.order_by.iter().filter(|order| !order.names_bound).any(|order| {
         crate::parser::visit::any_expr_matching(
@@ -4000,6 +4028,7 @@ fn bind_rollup_expr(
                 order_by,
                 frame,
                 inherits,
+                direct_reference,
             } = *spec;
             Expr::WindowFunction {
                 name,
@@ -4041,6 +4070,7 @@ fn bind_rollup_expr(
                         })
                         .transpose()?,
                     inherits,
+                    direct_reference,
                 }),
             }
         }
@@ -5185,9 +5215,36 @@ fn validate_select_in_column_scope(
     if let Some(selection) = &select.selection {
         validate_expr_columns(db, selection, &scope, None, false)?;
     }
+    let source_width =
+        |reference: &TableRef, derived: Option<&SubQuery>| -> Result<usize, QueryError> {
+            if reference.name == "$nested_join_preserve" {
+                if let Some(inner) = derived.and_then(SubQuery::leftmost_select) {
+                    return Ok(build_column_scope(db, inner, scope.outer)?.tables.len());
+                }
+            }
+            Ok(1)
+        };
+    let mut visible = select
+        .from
+        .first()
+        .map(|reference| source_width(reference, select.derived.as_ref()))
+        .transpose()?
+        .unwrap_or(0);
+    let mut on_scope = ColumnScope {
+        tables: Vec::new(),
+        outer: scope.outer,
+    };
+    on_scope.tables.extend_from_slice(&scope.tables[..visible]);
     for join in &select.joins {
+        let end = visible + source_width(&join.table, join.derived.as_ref())?;
+        on_scope
+            .tables
+            .extend_from_slice(&scope.tables[visible..end]);
+        visible = end;
         if let Some(condition) = &join.condition {
-            validate_expr_columns(db, condition, &scope, None, false)?;
+            validate_expr_columns(db, condition, &on_scope, None, false).map_err(|err| {
+                err.map_message(|message| message.replace("field list", "on clause"))
+            })?;
         }
     }
     for expr in &select.group_by {
@@ -5781,7 +5838,10 @@ impl ColumnScope<'_> {
         if let Some(outer) = self.outer {
             return outer.resolve_column(qualifier, column, output_only);
         }
-        Err(crate::error::messages::bad_field(column, "field list"))
+        Err(crate::error::messages::bad_field(
+            &qualifier.map_or_else(|| column.to_string(), |q| format!("{q}.{column}")),
+            "field list",
+        ))
     }
 
     fn column_matches(&self, qualifier: Option<&str>, column: &str, output_only: bool) -> usize {
@@ -24050,12 +24110,13 @@ fn subquery_correlation_only_uses_table(
     }
     if let Some(plan_tables) = subquery_plan_tables(db, subquery) {
         for sub_table in plan_tables {
-            sub_tables.insert(sub_table.schema.name.to_ascii_lowercase());
             if let Some(alias) = &sub_table.alias {
                 sub_tables.insert(alias.to_ascii_lowercase());
-            }
-            if let Some(bare) = sub_table.schema.name.rsplit('.').next() {
-                sub_tables.insert(bare.to_ascii_lowercase());
+            } else {
+                sub_tables.insert(sub_table.schema.name.to_ascii_lowercase());
+                if let Some(bare) = sub_table.schema.name.rsplit('.').next() {
+                    sub_tables.insert(bare.to_ascii_lowercase());
+                }
             }
             for column in &sub_table.schema.columns {
                 sub_columns.insert(normalize_expr_column(&column.name));

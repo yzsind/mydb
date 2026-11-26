@@ -600,7 +600,19 @@ async fn read_backup_manifest<R: tokio::io::AsyncReadExt + Unpin>(
             Message::BaseBackupStart(chunk) => (chunk, true),
             Message::BaseBackupManifest(chunk) => (chunk, false),
             Message::Close(close) => {
-                return Err(crate::error::catalog::MYDB_ER_BASE_BACKUP_FAILED.error(close.reason))
+                if close.reason.starts_with("replica UUID ")
+                    && close.reason.ends_with(" is already connected")
+                {
+                    return Err(QueryError::internal_control(
+                        crate::error::InternalErrorKind::ReplicaHandshakeRejected,
+                        crate::error::catalog::MYDB_ER_BASE_BACKUP_FAILED,
+                        format!(
+                            "{}; use a unique node UUID for each data directory",
+                            close.reason
+                        ),
+                    ));
+                }
+                return Err(crate::error::catalog::MYDB_ER_BASE_BACKUP_FAILED.error(close.reason));
             }
             other => {
                 return Err(
@@ -963,6 +975,13 @@ pub(crate) async fn perform_base_backup_into_with_config(
 
     let ack: HandshakeAck = match read_backup_frame(&mut reader).await {
         Ok(Message::HandshakeAck(a)) => a,
+        Ok(Message::Close(close)) => {
+            return Err(QueryError::internal_control(
+                crate::error::InternalErrorKind::ReplicaHandshakeRejected,
+                crate::error::catalog::MYDB_ER_REPLICATION_SECURITY,
+                format!("base backup handshake rejected: {}", close.reason),
+            ));
+        }
         Ok(other) => {
             return Err(error(
                 crate::error::catalog::ER_NOT_SUPPORTED_YET,
@@ -975,14 +994,16 @@ pub(crate) async fn perform_base_backup_into_with_config(
         Err(err) => return Err(io_err(err)),
     };
     if !ack.accepted {
-        return Err(error(
+        return Err(QueryError::internal_control(
+            crate::error::InternalErrorKind::ReplicaHandshakeRejected,
             crate::error::catalog::ER_NOT_SUPPORTED_YET,
             format!("base backup handshake rejected: {}", ack.reason),
         ));
     }
     let local_format = crate::storage::format_versions::native_replication_compatibility();
     if ack.format_compatibility != local_format {
-        return Err(error(
+        return Err(QueryError::internal_control(
+            crate::error::InternalErrorKind::ReplicaHandshakeRejected,
             crate::error::catalog::ER_SOURCE_FATAL_ERROR_READING_BINLOG,
             format!(
                 "base backup format mismatch: master='{}', replica='{}'",
@@ -1927,4 +1948,63 @@ async fn release1106_failed_backup_cleans_stage_before_connecting() {
     .await
     .is_err());
     assert!(!stage.exists());
+}
+
+#[tokio::test]
+async fn audit1125_duplicate_uuid_seed_rejection_is_permanent() {
+    for (reason, permanent) in [
+        ("replica UUID duplicate is already connected", true),
+        ("master service stopping", false),
+    ] {
+        let (mut writer, mut reader) = tokio::io::duplex(8192);
+        protocol::write_frame_async(
+            &mut writer,
+            &Message::Close(protocol::Close {
+                reason: reason.into(),
+            }),
+        )
+        .await
+        .unwrap();
+        let error = read_backup_manifest(&mut reader).await.err().unwrap();
+        assert_eq!(
+            error.is_internal(crate::error::InternalErrorKind::ReplicaHandshakeRejected),
+            permanent
+        );
+        assert!(error.message().contains(reason));
+    }
+}
+
+#[tokio::test]
+async fn audit1125_authentication_close_is_not_a_retryable_io_error() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        assert!(matches!(
+            protocol::read_frame_async(&mut socket).await.unwrap(),
+            Message::Handshake(_)
+        ));
+        protocol::write_frame_async(
+            &mut socket,
+            &Message::Close(protocol::Close {
+                reason: "native replication authentication failed".into(),
+            }),
+        )
+        .await
+        .unwrap();
+    });
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let error = perform_base_backup_into_with_config(
+        "127.0.0.1",
+        address.port(),
+        &crate::repl::role::generate_uuid_string(),
+        dir.path(),
+        crate::repl::config::ReplConfig::test_defaults(),
+    )
+    .await
+    .err()
+    .unwrap();
+    server.await.unwrap();
+    assert!(error.is_internal(crate::error::InternalErrorKind::ReplicaHandshakeRejected));
+    assert!(error.message().contains("authentication failed"));
 }

@@ -73,7 +73,7 @@ pub async fn start(init: MasterServiceInit) -> Result<MasterService, QueryError>
     let listener = TcpListener::bind(&bind).await.map_err(|err| {
         error(
             crate::error::catalog::ER_NOT_SUPPORTED_YET,
-            format!("repl bind {bind}: {err}"),
+            crate::repl::master_bind_error(&bind, &err),
         )
     })?;
     start_bound(init, listener)

@@ -643,7 +643,7 @@ impl<'a> Iterator for Matches<'_, 'a> {
 
 mod fold;
 mod translate;
-pub(crate) use translate::translate;
+pub(crate) use translate::{has_legacy_word_boundary, has_unsupported_vertical_range, translate};
 
 #[cfg(test)]
 mod tests {

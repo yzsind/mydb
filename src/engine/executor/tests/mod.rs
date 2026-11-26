@@ -10,6 +10,7 @@ mod dml_metadata_audit_1109;
 mod engine_status;
 mod final_release_audit_1107;
 mod five_audit_1123;
+mod four_audit_1125;
 mod fresh_release_audit;
 mod function_runtime_fixes;
 mod github_release_audit;
@@ -615,3 +616,5 @@ mod fulltext_incremental;
 mod github_issues_1123;
 mod issues_101_105;
 mod issues_87_99;
+
+mod prepared_numeric;

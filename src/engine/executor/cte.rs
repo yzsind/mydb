@@ -1301,6 +1301,8 @@ fn fork_cte_worker_session(parent: &SessionContext) -> SessionContext {
         x509_subject: parent.x509_subject.clone(),
         x509_issuer: parent.x509_issuer.clone(),
         user_variables: parent.user_variables.clone(),
+        prepared_div_precision_increment: parent.prepared_div_precision_increment,
+        prepared_numeric_parameter_types: parent.prepared_numeric_parameter_types.clone(),
         cte_max_recursion_depth: parent.cte_max_recursion_depth,
         foreign_key_checks: parent.foreign_key_checks,
         sql_log_off: parent.sql_log_off,
@@ -2964,9 +2966,8 @@ pub(super) fn flatten_union_all_branches<'q>(
 /// registry for downstream CTEs / the body to read. Non-recursive plain
 /// SELECT CTEs and non-recursive `UNION ALL` CTEs with display plans run
 /// *those exact plans* (giving per-operator stats inside the CTE body —
-/// for every UNION ALL branch); recursive or other set-operation bodies
-/// fall back to the re-planning path (`materialize_single_cte`) — correct
-/// results, but their internal nodes show `(never executed)`.
+/// for every UNION ALL branch). Self-referencing recursive CTEs use their
+/// recursive display plan. Other bodies fall back to `materialize_single_cte`.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn analyze_materialize_cte(
     db: &Arc<Database>,
@@ -2998,13 +2999,10 @@ pub(super) fn analyze_materialize_cte(
         }
         _ => false,
     };
+    // WITH RECURSIVE permits recursion; only a self-reference requires it.
+    let references_self = statement_references_cte(&cte.query, &cte.name);
     let extras_len = cte_extras.map(|e| e.len()).unwrap_or(0);
-    if !body_has_window
-        && extras_len > 0
-        && !cte.is_recursive
-        && !statement_references_cte(&cte.query, &cte.name)
-        && cte_plans.contains_key(key)
-    {
+    if !body_has_window && extras_len > 0 && !references_self && cte_plans.contains_key(key) {
         if let Some(branches) = flatten_union_all_branches(&cte.query) {
             if branches.len() == extras_len + 1 {
                 let head_plan = cte_plans.get(key).expect("checked above");
@@ -3015,7 +3013,7 @@ pub(super) fn analyze_materialize_cte(
             }
         }
     }
-    if cte.is_recursive {
+    if cte.is_recursive && references_self {
         if let Some(plan) = cte_plans.get(key) {
             let started = std::time::Instant::now();
             let io_start = db.buffer_stats_counts();
@@ -3033,9 +3031,8 @@ pub(super) fn analyze_materialize_cte(
             return Ok(result);
         }
     }
-    let eligible = !cte.is_recursive
-        && !body_has_window
-        && !statement_references_cte(&cte.query, &cte.name)
+    let eligible = !body_has_window
+        && !references_self
         && matches!(&cte.query, crate::parser::QueryExpr::Select(_))
         && cte_plans.contains_key(key);
     if eligible {
@@ -3944,10 +3941,19 @@ fn materialize_recursive(
                         | ColumnType::Decimal { .. }
                 )
             });
+            let cancel_mask = if !variable_payload && step.can_batch_cancel_checks() {
+                crate::engine::cancel::SCALAR_ROW_CANCEL_MASK
+            } else {
+                0
+            };
             return with_cte_materialization(|| {
                 let mut depth = 0;
                 loop {
-                    crate::engine::cancel::check_cancelled()?;
+                    // Use the same bounded polling interval as scalar batch
+                    // kernels. Recheck before depth errors and result return.
+                    if depth as usize & cancel_mask == 0 || depth >= depth_limit {
+                        crate::engine::cancel::check_cancelled()?;
+                    }
                     if depth >= depth_limit {
                         return Err(error(
                             crate::error::catalog::ER_CTE_MAX_RECURSION_DEPTH,
@@ -3993,11 +3999,13 @@ fn materialize_recursive(
                     }
                     emitted_rows += 1;
                     if emitted_rows >= row_cap {
+                        crate::engine::cancel::check_cancelled()?;
                         return total_builder.finish();
                     }
                     std::mem::swap(&mut row, &mut next);
                     depth += 1;
                 }
+                crate::engine::cancel::check_cancelled()?;
                 total_builder.finish()
             });
         }

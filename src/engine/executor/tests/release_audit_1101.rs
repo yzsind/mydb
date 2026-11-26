@@ -455,7 +455,7 @@ fn regex_preserves_binary_and_matches_sql_search_regions() {
     }
     assert_eq!(
         rows(&engine, "SELECT REGEXP_SUBSTR('abc','^b',2)")[0][0],
-        Value::Null
+        Value::String("b".into())
     );
     assert_eq!(
         rows(&engine, "SELECT REGEXP_SUBSTR('abc','$',4)")[0][0],

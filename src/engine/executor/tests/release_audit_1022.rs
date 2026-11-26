@@ -385,6 +385,6 @@ fn audit1022_routine_set_and_select_into_finish_their_own_row_counts() {
         .unwrap();
     assert_eq!(
         rows(&engine, &mut session, "SELECT @a,@b,@c"),
-        vec![vec![Value::Int(2), Value::Int(0), Value::Int(1)]]
+        vec![vec![Value::Int(2), Value::Int(2), Value::Int(1)]]
     );
 }

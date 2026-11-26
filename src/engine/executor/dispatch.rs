@@ -7727,37 +7727,44 @@ pub(super) fn execute_sql_prepare(
     if let Statement::Select(select) = &validation_statement {
         crate::engine::executor::select::warn_prepared_select_temporal_constants(db, select);
     }
-    let result_columns: Arc<[crate::types::Column]> =
-        crate::engine::executor::select::aggregate::with_group_concat_max_len(
-            session.group_concat_max_len,
-            || {
-                crate::engine::expr::with_session_expr_info(session, || {
-                    // The new statement's placeholders must not see parameters
-                    // belonging to the surrounding PREPARE command.
-                    crate::engine::params::with_params(Vec::new(), || {
-                        let mut columns = super::select::describe_statement_columns(
-                            db,
-                            session,
-                            &validation_statement,
-                        )?;
-                        if let Statement::Select(select) = &validation_statement {
-                            if select.projection.len() == columns.len() {
-                                for (item, column) in select.projection.iter().zip(&mut columns) {
-                                    if let crate::parser::SelectItem::Expr { expr, .. } = item {
-                                        column.source.dynamic_parameter |=
-                                            crate::engine::expr::xml::parameter_dependent_result(
-                                                expr,
-                                            );
-                                    }
+    let numeric_context = super::prepared_numeric::bind(db, session, &statement)?;
+    let saved_precision = session.prepared_div_precision_increment;
+    let saved_types = session.prepared_numeric_parameter_types.take();
+    session.prepared_div_precision_increment =
+        numeric_context.as_ref().map(|context| context.precision);
+    session.prepared_numeric_parameter_types = numeric_context
+        .as_ref()
+        .and_then(|context| context.parameters.clone());
+    let result_columns = crate::engine::executor::select::aggregate::with_group_concat_max_len(
+        session.group_concat_max_len,
+        || {
+            crate::engine::expr::with_session_expr_info(session, || {
+                // The new statement's placeholders must not see parameters
+                // belonging to the surrounding PREPARE command.
+                crate::engine::params::with_params(Vec::new(), || {
+                    let mut columns = super::select::describe_statement_columns(
+                        db,
+                        session,
+                        &validation_statement,
+                    )?;
+                    if let Statement::Select(select) = &validation_statement {
+                        if select.projection.len() == columns.len() {
+                            for (item, column) in select.projection.iter().zip(&mut columns) {
+                                if let crate::parser::SelectItem::Expr { expr, .. } = item {
+                                    column.source.dynamic_parameter |=
+                                        crate::engine::expr::xml::parameter_dependent_result(expr);
                                 }
                             }
                         }
-                        Ok(columns)
-                    })
+                    }
+                    Ok(columns)
                 })
-            },
-        )?
-        .into();
+            })
+        },
+    );
+    session.prepared_div_precision_increment = saved_precision;
+    session.prepared_numeric_parameter_types = saved_types;
+    let result_columns: Arc<[crate::types::Column]> = result_columns?.into();
     let result_column_bytes = result_columns.iter().fold(0usize, |total, column| {
         total
             .saturating_add(std::mem::size_of::<crate::types::Column>())
@@ -7789,6 +7796,7 @@ pub(super) fn execute_sql_prepare(
     session.insert_sql_prepared_statement(
         key,
         crate::engine::api::SessionSqlPreparedStatement {
+            numeric_context,
             xml_parameter_types: crate::engine::expr::xml::parameter_history(
                 &sql,
                 parameter_count,
@@ -7817,7 +7825,7 @@ fn execute_sql_prepared(
     name: &str,
     using: &[String],
 ) -> Result<QueryResponse, QueryError> {
-    let prepared = session
+    let mut prepared = session
         .sql_prepared_statements
         .get(&name.to_ascii_lowercase())
         .cloned()
@@ -7839,7 +7847,7 @@ fn execute_sql_prepared(
             "Incorrect arguments to EXECUTE",
         ));
     }
-    let params = using
+    let mut params = using
         .iter()
         .map(|name| session.user_variable(name).cloned().unwrap_or(Value::Null))
         .collect::<Vec<_>>();
@@ -7867,18 +7875,42 @@ fn execute_sql_prepared(
             }
         }
     }
-    let mut response = crate::engine::params::with_params(params, || {
-        let execute = || execute_statement(db, session, statement, registry);
-        match int_div_context {
-            Some(context) => crate::engine::expr::with_integer_overflow_context(context, execute),
-            None => execute(),
+    let saved_precision = session.prepared_div_precision_increment;
+    let saved_parameter_types = session.prepared_numeric_parameter_types.take();
+    let mut response = (|| {
+        session.prepared_div_precision_increment = super::prepared_numeric::refresh(
+            db,
+            session,
+            &prepared.statement,
+            &mut prepared.numeric_context,
+        )?;
+        if let Some(context) = prepared.numeric_context.as_mut() {
+            context.bind_parameters(session, &mut params)?;
+            session.prepared_div_precision_increment = Some(context.precision);
+            session.prepared_numeric_parameter_types = context.parameters.clone();
         }
-    });
+        crate::engine::params::with_params(params, || {
+            let execute = || execute_statement(db, session, statement, registry);
+            match int_div_context {
+                Some(context) => {
+                    crate::engine::expr::with_integer_overflow_context(context, execute)
+                }
+                None => execute(),
+            }
+        })
+    })();
+    session.prepared_div_precision_increment = saved_precision;
+    session.prepared_numeric_parameter_types = saved_parameter_types;
+    session.update_sql_prepared_numeric_context(name, prepared.numeric_context.clone());
     session.current_database = saved_database;
     session.xml_parameter_types = saved_xml_types;
     session.xml_parameter_binding = saved_xml_binding;
     if let Ok(result) = &mut response {
         if !prepared.routine_result_metadata
+            && !prepared
+                .numeric_context
+                .as_ref()
+                .is_some_and(|context| context.parameter_reprepared)
             && prepared.result_catalog_epoch == db.catalog_publication_epoch()
         {
             apply_sql_prepared_result_columns(result, &prepared.result_columns);
@@ -11393,6 +11425,7 @@ mod window_cancellation_tests {
                 order_by: vec![],
                 frame: None,
                 inherits: None,
+                direct_reference: false,
             }),
         };
         let rows = vec![vec![Value::Int(1)]; 1024];

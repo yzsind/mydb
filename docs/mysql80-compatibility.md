@@ -684,6 +684,26 @@ pages for supported arguments, return types, and limitations.
 
 The LIKE ESCAPE may be a literal, placeholder, or scalar expression; single-character
 validation happens at execution time and charset/collation semantics are preserved.
+Regular expressions use a linear-time engine. Backreferences, lookaround,
+`\Q...\E`, `\Z`, `\h`, `\H`, and `\V` are not
+supported and return explicit errors. Legacy `[[:<:]]` / `[[:>:]]` boundary
+classes are rejected rather than interpreted as ordinary characters. `\v` matches ICU's seven vertical whitespace characters; using that class as a range endpoint
+is rejected explicitly. Patterns
+are limited to 8192 bytes and compilation/search memory is governed.
+
+Stored-routine LIMIT clauses currently accept literals and prepared parameters;
+local variable LIMIT bounds return an explicit unsupported-feature error.
+Stored functions may share a name with a built-in; use a schema-qualified name
+to select the stored function, while an unqualified call selects the built-in.
+`lc_time_names` currently supports en_US, de_DE, fr_FR, es_ES, it_IT, pt_BR,
+zh_CN, ja_JP and ko_KR; other locales return an explicit error.
+ALLOW_INVALID_DATES permits storing invalid date components. Calendar arithmetic
+on a nonexistent date returns NULL with a conversion warning, rather than
+normalizing it into another month or propagating an invalid calendar result.
+
+Typed CTE column declarations are rejected; use CAST in the anchor query to
+control the recursive result type and width.
+
 `REGEXP NULL` returns NULL. `NAME_CONST` accepts only the literal forms MySQL
 allows; complex expressions return 1210.
 

@@ -105,6 +105,35 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
+struct RoutineInvocation {
+    depth: u32,
+    stack_len: usize,
+}
+
+impl RoutineInvocation {
+    fn enter(is_function: bool, database: String, name: String) -> Self {
+        let depth = ROUTINE_DEPTH.with(|depth| {
+            let previous = depth.get();
+            depth.set(previous + 1);
+            previous
+        });
+        let stack_len = ROUTINE_STACK.with(|stack| {
+            let mut stack = stack.borrow_mut();
+            let length = stack.len();
+            stack.push((is_function, database, name));
+            length
+        });
+        Self { depth, stack_len }
+    }
+}
+
+impl Drop for RoutineInvocation {
+    fn drop(&mut self) {
+        ROUTINE_STACK.with(|stack| stack.borrow_mut().truncate(self.stack_len));
+        ROUTINE_DEPTH.with(|depth| depth.set(self.depth));
+    }
+}
+
 struct TriggerAccess {
     auth: Arc<crate::engine::auth::AuthCatalog>,
     context: crate::engine::auth::AuthorizationContext,
@@ -2142,7 +2171,14 @@ fn execute_procedure_call(
         .ok_or_else(|| {
             error(
                 crate::error::catalog::ER_SP_DOES_NOT_EXIST,
-                format!("PROCEDURE {} does not exist", call.name),
+                format!(
+                    "PROCEDURE {} does not exist",
+                    if call.name.contains('.') || session.current_database.is_empty() {
+                        call.name.clone()
+                    } else {
+                        format!("{}.{}", session.current_database, call.name)
+                    }
+                ),
             )
         })?;
     authorize_routine_execute(db, session, &routine)?;
@@ -2270,7 +2306,14 @@ pub(crate) fn missing_function(database: &str, name: &str) -> QueryError {
     }
     error(
         crate::error::catalog::ER_SP_DOES_NOT_EXIST,
-        format!("FUNCTION {name} does not exist"),
+        format!(
+            "FUNCTION {} does not exist",
+            if name.contains('.') || database.is_empty() {
+                name.to_string()
+            } else {
+                format!("{database}.{name}")
+            }
+        ),
     )
 }
 
@@ -2420,13 +2463,9 @@ fn execute_routine_checked(
                 format!("recursive stored routine limit {hard_max} was exceeded"),
             ));
         }
-        depth.set(current + 1);
-        ROUTINE_STACK.with(|stack| {
-            stack
-                .borrow_mut()
-                .push((is_function, routine.database.clone(), name_key.clone()))
-        });
-        let result = execute_routine_inner(
+        let _invocation =
+            RoutineInvocation::enter(is_function, routine.database.clone(), name_key.clone());
+        execute_routine_inner(
             db,
             session,
             routine,
@@ -2435,12 +2474,7 @@ fn execute_routine_checked(
             caller_locals.as_deref_mut(),
             inherited_capabilities,
             program,
-        );
-        ROUTINE_STACK.with(|stack| {
-            stack.borrow_mut().pop();
-        });
-        depth.set(current);
-        result
+        )
     })
 }
 
@@ -2491,7 +2525,7 @@ fn execute_routine_inner(
         lexical_scopes: Vec::new(),
         handler_scope_limit: None,
         handled_warning_ranges: Vec::new(),
-        diag_row_count: 0,
+        diag_row_count: session.last_row_count,
         diag_conditions: Vec::new(),
         allow_result_sets: capabilities.allow_result_sets && !is_function,
         allow_return: is_function,
@@ -2563,9 +2597,6 @@ fn execute_routine_inner(
         return Err(err);
     }
     let invocation_snapshot = RoutineInvocationSnapshot::capture(session);
-    if !is_function {
-        session.last_row_count = 0;
-    }
     // RETURN/IF/SET expressions can evaluate subqueries without dispatching
     // a separate SQL statement. Isolate the entire body from view bindings.
     // SAFETY: db, session and registry remain pinned throughout this call.
@@ -2779,7 +2810,7 @@ fn execute_trigger_body_inner(
         lexical_scopes: Vec::new(),
         handler_scope_limit: None,
         handled_warning_ranges: Vec::new(),
-        diag_row_count: 0,
+        diag_row_count: session.last_row_count,
         diag_conditions: Vec::new(),
         allow_result_sets: false,
         allow_return: false,
@@ -3283,10 +3314,12 @@ fn exec_block_inner(
                 } else if is_root {
                     match &err {
                         RoutineExecError::Warning(_, _) => continue,
-                        RoutineExecError::Condition(
-                            RoutineCondition::NotFound | RoutineCondition::SqlWarning,
-                            warning,
-                        ) => {
+                        RoutineExecError::Condition(condition, warning)
+                            if matches!(
+                                condition,
+                                RoutineCondition::NotFound | RoutineCondition::SqlWarning
+                            ) || warning.sql_state().starts_with("01") =>
+                        {
                             // The frame already records the condition for GET
                             // DIAGNOSTICS; only the published area proves that
                             // the caller can see it through SHOW WARNINGS.
@@ -3622,10 +3655,17 @@ fn exec_stmt(
                     value,
                 )?;
             }
-            session.last_row_count = 0;
+            if assignments.iter().any(|(target, _)| match target {
+                RoutineTarget::UserVariable(_) => true,
+                RoutineTarget::Local(name) => !frame.locals.contains_key(&normalize_local(name)),
+            }) {
+                session.last_row_count = 0;
+                frame.diag_row_count = 0;
+            } else {
+                session.last_row_count = incoming_row_count;
+            }
             crate::engine::api::clear_statement_matched_rows();
             crate::engine::api::clear_statement_info();
-            frame.diag_row_count = 0;
             Ok(RoutineControl::None)
         }
         RoutineStmt::SelectInto {
@@ -3798,6 +3838,7 @@ fn exec_stmt(
                 )
                 .into());
             }
+            let incoming_row_count = session.last_row_count;
             let response = execute_sql_in_routine(
                 db,
                 session,
@@ -3810,6 +3851,7 @@ fn exec_stmt(
                 frame.forbid_transaction_control,
                 frame.trigger_table.as_deref(),
             )?;
+            session.last_row_count = incoming_row_count;
             cursor.column_count = match &response {
                 QueryResponse::ResultSet(result) => result.columns.len(),
                 QueryResponse::StreamingResultSet(result) => result.columns.len(),
@@ -3935,7 +3977,11 @@ fn exec_stmt(
                     ("SUBCLASS_ORIGIN", String::new()),
                 ]),
             )?);
-            Err(RoutineExecError::Condition(resolved_condition, err))
+            if sql_state.starts_with("01") {
+                Err(RoutineExecError::Warning(resolved_condition, err))
+            } else {
+                Err(RoutineExecError::Condition(resolved_condition, err))
+            }
         }
         RoutineStmt::Resignal {
             condition,
@@ -4000,8 +4046,8 @@ fn exec_stmt(
                 frame.diag_conditions = vec![original.clone(), raised];
                 crate::engine::api::push_sql_warning(original);
             }
-            let retain_warning =
-                resolved.is_none() && matches!(active, RoutineExecError::Warning(_, _));
+            let retain_warning = state.starts_with("01")
+                || resolved.is_none() && matches!(active, RoutineExecError::Warning(_, _));
             let condition = resolved
                 .map(|(condition, _)| condition)
                 .unwrap_or_else(|| active.condition());
@@ -4161,6 +4207,7 @@ fn exec_stmt(
                     // result-set header before the handler's response.
                     if let Some(columns) = routine_failed_select_columns(
                         db,
+                        &session.current_database,
                         sql,
                         &frame.locals,
                         &frame.static_statements,
@@ -4203,7 +4250,7 @@ fn exec_stmt(
                     }
                 }
             }
-            frame.diag_row_count = response_row_count(&response);
+            frame.diag_row_count = session.last_row_count;
             collect_routine_response(session, frame, response)?;
             Ok(RoutineControl::None)
         }
@@ -4246,24 +4293,34 @@ fn resolve_signal_condition(
 
 fn routine_failed_select_columns(
     db: &Database,
+    database: &str,
     sql: &str,
     locals: &HashMap<String, Value>,
     static_statements: &HashMap<String, CompiledStaticStatement>,
 ) -> Option<Vec<crate::types::Column>> {
     let mut statement = (*static_statements.get(sql)?.statement).clone();
     bind_statement_locals(&mut statement, locals).ok()?;
+    if crate::parser::collect_statement_function_names(&statement)
+        .iter()
+        .any(|name| {
+            if crate::parser::IntrinsicFunction::from_name(name).is_some()
+                || !name.contains('.')
+                    && (crate::engine::cbo::function_cost::is_known_builtin_function(name)
+                        || crate::planner::is_aggregate_function(name))
+            {
+                return false;
+            }
+            db.routine_definition(database, RoutineKindSchema::Function, name)
+                .is_none()
+        })
+    {
+        return None;
+    }
     let crate::parser::Statement::Select(select) = statement else {
         return None;
     };
+    crate::planner::validate_select_column_references(db, &select).ok()?;
     super::select::describe_select_columns(db, &select).ok()
-}
-
-fn response_row_count(response: &QueryResponse) -> i64 {
-    match response {
-        QueryResponse::OkAffected { affected_rows } => *affected_rows as i64,
-        QueryResponse::ResultSet(rs) => rs.rows.len() as i64,
-        _ => 0,
-    }
 }
 
 fn select_into_single_row(
@@ -6350,4 +6407,24 @@ fn collect_static_calls_from_statements(
 pub(in crate::engine::executor) fn external_calls_forbidden() -> bool {
     ROUTINE_DEPTH.with(|depth| depth.get() != 0)
         || TRIGGER_STACK.with(|stack| !stack.borrow().is_empty())
+}
+
+#[cfg(test)]
+mod audit1125_unwind_tests {
+    use super::*;
+
+    #[test]
+    fn audit1125_routine_invocation_restores_tls_on_unwind() {
+        let depth = ROUTINE_DEPTH.with(|depth| depth.get());
+        let stack = ROUTINE_STACK.with(|stack| stack.borrow().clone());
+        let result = std::panic::catch_unwind(|| {
+            let _outer = RoutineInvocation::enter(false, "test".into(), "outer".into());
+            let _inner = RoutineInvocation::enter(true, "test".into(), "inner".into());
+            assert_eq!(ROUTINE_DEPTH.with(|depth| depth.get()), depth + 2);
+            panic!("injected routine unwind");
+        });
+        assert!(result.is_err());
+        assert_eq!(ROUTINE_DEPTH.with(|depth| depth.get()), depth);
+        assert_eq!(ROUTINE_STACK.with(|stack| stack.borrow().clone()), stack);
+    }
 }

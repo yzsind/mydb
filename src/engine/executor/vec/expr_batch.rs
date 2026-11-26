@@ -5,6 +5,8 @@
 //! looping over rows and calling `ExprProgram::eval_row` — the legacy
 //! interpreter remains the ground truth.
 
+mod scalar_pairs;
+
 use crate::engine::expr_program::input_expr_column_index as resolve_batch_column;
 use std::borrow::Cow;
 use std::sync::Arc;

@@ -1005,6 +1005,7 @@ pub(super) fn prepare_with_limit<'a>(
                     order_by: window.order_by.clone(),
                     frame: window.frame.clone(),
                     inherits: None,
+                    direct_reference: false,
                 }),
             };
             let prefix = window.frame.as_ref().is_some_and(|frame| {

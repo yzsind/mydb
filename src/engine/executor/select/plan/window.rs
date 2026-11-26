@@ -499,6 +499,7 @@ pub(in crate::engine::executor::select) fn execute_window_agg(
                         order_by: w.order_by.clone(),
                         frame: w.frame.clone(),
                         inherits: None,
+                        direct_reference: false,
                     }),
                 };
                 let values = evaluate_window_with_partitions(
@@ -780,6 +781,7 @@ pub(super) fn execute_window_agg_limited(
                     order_by: window.order_by.clone(),
                     frame: window.frame.clone(),
                     inherits: None,
+                    direct_reference: false,
                 }),
             };
             let values = evaluate_window_with_partitions(
@@ -1048,6 +1050,7 @@ pub(super) fn window_group_values_spilled(
                     order_by: w.order_by.clone(),
                     frame: w.frame.clone(),
                     inherits: None,
+                    direct_reference: false,
                 }),
             };
             let vals =

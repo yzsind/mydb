@@ -455,3 +455,93 @@ fn recursive_native_delta_falls_back_under_small_query_budget() {
         ["40000", "200020000", "60000"]
     );
 }
+
+#[test]
+fn recursive_cte_sudoku_uses_integer_coordinates_and_returns_valid_solution() {
+    let (_dir, e) = engine();
+    let sql = r#"WITH RECURSIVE
+ input(sud) AS (VALUES('53..7....6..195....98....6.8...6...34..8.3..17...2...6.6....28....419..5....8..79')),
+ digits(z, lp) AS (VALUES('1', 1) UNION ALL SELECT lp+1, lp+1 FROM digits WHERE lp<9),
+ x(s, ind) AS (
+ SELECT sud, instr(sud, '.') FROM input
+ UNION ALL
+ SELECT concat(substr(s, 1, ind-1), z, substr(s, ind+1)),
+ instr(concat(substr(s, 1, ind-1), z, substr(s, ind+1)), '.')
+ FROM x, digits AS z
+ WHERE ind>0 AND NOT EXISTS (
+ SELECT 1 FROM digits AS lp
+ WHERE z.z = substr(s, ((ind-1) DIV 9)*9 + lp, 1)
+ OR z.z = substr(s, ((ind-1)%9) + (lp-1)*9 + 1, 1)
+ OR z.z = substr(s, (((ind-1) DIV 3) % 3)*3 + ((ind-1) DIV 27)*27 + lp + ((lp-1) DIV 3)*6, 1)))
+SELECT s FROM x WHERE ind=0;"#;
+    let analyzed = rows(&e, &format!("EXPLAIN ANALYZE {sql}"));
+    let plan = format!("{analyzed:?}");
+    assert!(plan.contains("rows=4632"), "{plan}");
+    assert!(plan.contains("actual time="), "{plan}");
+    let result = rows(&e, sql);
+    assert_eq!(result.len(), 1);
+    let solved = result[0][0].to_display_string();
+    assert_eq!(
+        solved,
+        "534678912672195348198342567859761423426853791713924856961537284287419635345286179"
+    );
+    let bytes = solved.as_bytes();
+    let valid = |mut digits: Vec<u8>| {
+        digits.sort_unstable();
+        assert_eq!(digits, b"123456789");
+    };
+    for index in 0..9 {
+        valid(bytes[index * 9..index * 9 + 9].to_vec());
+        valid((0..9).map(|row| bytes[row * 9 + index]).collect());
+        let (row, col) = (index / 3 * 3, index % 3 * 3);
+        valid(
+            (0..9)
+                .map(|n| bytes[(row + n / 3) * 9 + col + n % 3])
+                .collect(),
+        );
+    }
+    // Decimal division is intentionally different; do not optimize it into
+    // integer division to recognize a particular recursive workload.
+    let prefix = sql
+        .replace(" DIV ", "/")
+        .replace("WHERE ind>0", "WHERE ind>0 AND ind<=9")
+        .replace(
+            "SELECT s FROM x WHERE ind=0",
+            "SELECT ind,COUNT(*) FROM x GROUP BY ind ORDER BY ind",
+        );
+    let counts = rows(&e, &prefix)
+        .into_iter()
+        .map(|row| row.iter().map(Value::to_display_string).collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        counts,
+        [
+            ("3", "1"),
+            ("4", "5"),
+            ("6", "20"),
+            ("7", "80"),
+            ("8", "160"),
+            ("9", "320"),
+            ("11", "1280")
+        ]
+        .into_iter()
+        .map(|(ind, count)| vec![ind.to_owned(), count.to_owned()])
+        .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn cte_analyze_recursive_keyword_allows_nonrecursive_definitions() {
+    let (_dir, e) = engine();
+    for sql in [
+        "WITH RECURSIVE seed(n) AS (VALUES(2)), t(n) AS (SELECT n FROM seed UNION ALL SELECT n+1 FROM t WHERE n<4) SELECT SUM(n) FROM t",
+        "WITH RECURSIVE seed(n) AS (SELECT 2 UNION ALL SELECT 3), t(n) AS (SELECT n FROM seed UNION ALL SELECT n+2 FROM t WHERE n<4) SELECT SUM(n) FROM t",
+        "WITH RECURSIVE seed(n) AS (SELECT 2), t(n) AS (SELECT n FROM seed UNION ALL SELECT n+1 FROM t WHERE n<4) SELECT SUM(n) FROM t",
+    ] {
+        let expected = rows(&e, sql);
+        let plan = rows(&e, &format!("EXPLAIN ANALYZE {sql}"));
+        let text = format!("{plan:?}");
+        assert!(text.contains("actual"), "{text}");
+        assert_eq!(rows(&e, sql), expected);
+    }
+}

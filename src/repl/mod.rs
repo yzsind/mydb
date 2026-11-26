@@ -354,6 +354,13 @@ pub async fn maybe_bootstrap_replica(data_dir: &std::path::Path) -> Result<(), Q
         match base_backup::perform_base_backup_into(&host, port, &state.node_uuid, data_dir).await {
             Ok(lsn) => break lsn,
             Err(err) => {
+                if err.is_internal(crate::error::InternalErrorKind::ReplicaHandshakeRejected) {
+                    return Err(err.map_message(|message| {
+                        format!(
+                            "{message}; fix node identity/authentication/configuration and restart"
+                        )
+                    }));
+                }
                 if config.bootstrap_max_attempts > 0 && attempts >= config.bootstrap_max_attempts {
                     return Err(err.map_message(|message| format!("base backup failed after {attempts} attempts: {message}; fix source/configuration and restart; MYDB_REPL_BOOTSTRAP_MAX_ATTEMPTS=0 retries indefinitely")));
                 }
@@ -374,6 +381,14 @@ pub async fn maybe_bootstrap_replica(data_dir: &std::path::Path) -> Result<(), Q
         "mydb-repl bootstrap: base backup complete at LSN {backup_lsn}"
     ));
     Ok(())
+}
+
+pub(crate) fn master_bind_error(bind: &str, err: &std::io::Error) -> String {
+    let mut message = format!("mydb-repl bind {bind}: {err}");
+    if err.kind() == std::io::ErrorKind::AddrInUse {
+        message.push_str("; replication listener address is already in use; configure a distinct MYDB_REPL_PORT for each local node. If promotion failed and the old master remains authoritative, run RESUME MASTER WRITES on the old master to restore writes");
+    }
+    message
 }
 
 /// Get the global manager if it has been initialized.
@@ -641,10 +656,17 @@ pub fn after_local_commit_durable(commit_lsn: u64) {
     // during the wait window, collapsing semi-sync throughput to a
     // single in-flight commit (Pf1).
     let waiter = { manager.slots.lock().semi_sync_waiter() };
+    let t0 = std::time::Instant::now();
     let outcome = waiter.wait_for_ack(
         commit_lsn,
         manager.config.semi_sync_wait_count,
         manager.config.semi_sync_timeout,
+    );
+    eprintln!(
+        "[semi-sync-probe] lsn={} outcome={:?} waited_ms={}",
+        commit_lsn,
+        outcome,
+        t0.elapsed().as_millis()
     );
     match outcome {
         master::slot::SemiSyncOutcome::Acknowledged => {
@@ -1291,7 +1313,7 @@ impl MydbReplManager {
         let listener = std::net::TcpListener::bind(&bind).map_err(|err| {
             error(
                 crate::error::catalog::ER_GET_ERRNO,
-                format!("mydb-repl bind {bind}: {err}"),
+                master_bind_error(&bind, &err),
             )
         })?;
         listener
@@ -2540,4 +2562,18 @@ mod tests {
         ));
         assert!(!is_mydb_repl_admin_sql("SELECT 1"));
     }
+}
+
+#[cfg(test)]
+#[test]
+fn audit1125_occupied_listener_explains_promotion_recovery() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let bind = listener.local_addr().unwrap().to_string();
+    let error = std::net::TcpListener::bind(&bind).unwrap_err();
+    let message = master_bind_error(&bind, &error);
+    assert!(message.contains("MYDB_REPL_PORT"));
+    assert!(message.contains("RESUME MASTER WRITES"));
+    assert!(message.contains(&bind));
+    let error = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+    assert!(!master_bind_error(&bind, &error).contains("RESUME MASTER WRITES"));
 }
