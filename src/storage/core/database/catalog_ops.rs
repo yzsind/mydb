@@ -268,14 +268,35 @@ impl Database {
             .iter()
             .map(|name| self.table(name))
             .collect::<Result<Vec<_>, _>>()?;
+        for table in &tables {
+            self.check_ddl_table_lock(table.id)?;
+        }
+        let lock_txn = self.begin_read_only_txn()?;
+        let _storage_guard = OnlineIndexTxnGuard {
+            db: self,
+            txn_id: lock_txn.txn_id,
+        };
+        let recycle = self.recyclebin_enabled();
+        // Recycle uses its own writer transaction below. Permanent retirement
+        // keeps direct storage writers out until the retired floors are set.
+        if !recycle {
+            let mut ids = tables
+                .iter()
+                .flat_map(|table| table.storage_ids().into_iter().chain([table.id]))
+                .collect::<Vec<_>>();
+            ids.sort_unstable();
+            ids.dedup();
+            for id in ids {
+                self.acquire_table_exclusive(lock_txn.txn_id, id)?;
+            }
+        }
         let drop_set = table_names.iter().cloned().collect::<HashSet<_>>();
-        let recycle_txn = if self.recyclebin_enabled() { Some(self.begin_txn()?) } else { None };
+        let recycle_txn = if recycle { Some(self.begin_txn()?) } else { None };
         let _recycle_guard = recycle_txn.map(|txn| RollbackTxnGuard::<true> { db: self, txn_id: txn.txn_id });
         let mut undo = if recycle_txn.is_some() { Some(self.snapshot_recycle_database(&key)?) } else { None };
         let mut recycled = Vec::new();
         let mut dropped = Vec::new();
         for table in &tables {
-            self.check_ddl_table_lock(table.id)?;
             if fk_checks_enabled()
                 && table.fk_referenced_by.iter().any(|fk| {
                     fk.child_table_id != table.id && !drop_set.contains(&fk.child_table_key)
@@ -290,7 +311,7 @@ impl Database {
                 ));
             }
             let intent = self.build_drop_table_intent(table)?;
-            let path = if let Some(txn) = recycle_txn {
+            let path: Option<PathBuf> = if let Some(txn) = recycle_txn {
                 for id in table.storage_ids().into_iter().chain([table.id]) { self.acquire_table_exclusive(txn.txn_id, id)?; }
                 recycled.push(self.prepare_recycle(table, "DROP DATABASE", txn.txn_id)?);
                 None
@@ -446,19 +467,14 @@ impl Database {
                 return Err(err);
             }
         } else { self.commit_ddl_catalog_txn()?; }
-        for (table, intent, path) in dropped {
-            if recycle_txn.is_none() && self.evict_dropped_table_caches(&table).is_ok()
-                && self.purge_dropped_table_files(&intent)
-            {
-                self.remove_drop_table_intent(path.as_ref());
-            }
-            self.catalog
-                .forget_dropped_table(&table.qualified_name(), &table);
+        for (table, _, _) in dropped {
             if recycle_txn.is_none() {
-                self.table_write_epochs.write().remove(&table.id);
-                self.drop_table_modification_delta_without_epoch(table.id);
+                self.finish_retired_table_publication(&table);
+            } else {
+                self.catalog.forget_dropped_table(&table.qualified_name(), &table);
             }
         }
+        if recycle_txn.is_none() { self.request_catalog_retirement_cleanup(); }
         for sequence in sequences {
             self.sequences.remove(sequence.id);
         }

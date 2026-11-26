@@ -5510,6 +5510,8 @@ fn drop_table_file_delete_wal_does_not_copy_table_bytes() {
 
     db.drop_table("test.t").unwrap();
 
+    assert!(db.table("test.t").is_err());
+    db.maintain_catalog_retirements_until(|| false).unwrap();
     let scan = LogManager::scan(dir.path()).unwrap();
     let file_deletes = scan
         .records

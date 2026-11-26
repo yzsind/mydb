@@ -3242,6 +3242,12 @@ impl Database {
         key: (u64, u64, u64, String),
         build: bool,
     ) -> Result<Arc<VectorGraph>, QueryError> {
+        if self.table_locks_sharded.is_retired(table.id) {
+            return Err(error(
+                crate::error::catalog::ER_TABLE_DEF_CHANGED,
+                "vector index owner was retired; rebind the table before building",
+            ));
+        }
         let build_lock = {
             let mut locks = self.vector_build_locks.lock();
             locks.retain(|_, owner| owner.strong_count() > 0);
@@ -3340,6 +3346,7 @@ impl Database {
             .vector_build_epoch
             .load(std::sync::atomic::Ordering::Acquire)
             != build_epoch
+            || self.table_locks_sharded.is_retired(table.id)
         {
             return Err(error(
                 crate::error::catalog::ER_GET_ERRNO,

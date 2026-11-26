@@ -5,6 +5,7 @@ mod bug_report_1107;
 mod collated_constant_in;
 mod critical_audit;
 mod ddl_lock_contract;
+mod ddl_publish_lock;
 mod distinct_order_by;
 mod dml_metadata_audit_1109;
 mod engine_status;

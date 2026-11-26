@@ -3435,76 +3435,7 @@ impl Database {
     }
 
     pub fn drop_table(&self, name: &str) -> Result<(), QueryError> {
-        if self.disk_space_limited() {
-            return self.drop_tables(&[name.to_owned()], false);
-        }
-        if self.recyclebin_enabled() { return self.recycle_drop_tables(&[name.to_string()], false); }
-        let (database, table_name) = split_table_name(DEFAULT_DATABASE, name);
-        check_table_ddl_writable(&database)?;
-        let key = table_key(&database, &table_name);
-        // Resolve a complete descriptor before entering any catalog critical
-        // section. After restart `catalog.tables` may contain only a compact
-        // header; path/FK/index cleanup needs the lazily decoded descriptor,
-        // and the intent path helpers need the catalog row to remain live.
-        let Some(table) = self.table_by_key(&key) else {
-            return Err(error(
-                crate::error::catalog::ER_BAD_TABLE_ERROR,
-                format!("unknown table '{name}'"),
-            ));
-        };
-        // M2.2 - DDL X lock semantics: ensure no active DML holds IX/S/SIX.
-        self.check_ddl_table_lock(table.id)?;
-        // Refuse to drop a table another table references via FK — unless the
-        // session set `foreign_key_checks=0`, which MySQL 8.0 honours for DROP
-        // (the child's constraint is left dangling). This is the standard
-        // mysqldump / ordered-rebuild idiom.
-        if fk_checks_enabled() {
-            self.fk_reject_table_referenced(&table, false)?;
-        }
-        // Crash-safe DROP (commit-first, see drop_table_recovery.rs): record a
-        // durable intent listing every physical file, commit the catalog change
-        // (the atomic point), then unlink the files. A crash before the commit
-        // leaves table + files + intent intact (recovery drops the stale
-        // intent); a crash after it is finished by `recover_drop_tables`.
-        let intent = self.build_drop_table_intent(&table)?;
-        self.stage_table_retirement(&intent)?;
-        let intent_path = None;
-        // Catalog commit point.
-        {
-            let mut catalog = self.catalog_write()?;
-            if catalog.tables.remove(&key).is_none() {
-                // A concurrent drop won the race and already purged the files.
-                self.remove_drop_table_intent(intent_path.as_ref());
-                return Ok(());
-            }
-            catalog.triggers.retain(|_, trigger| {
-                let keep = normalize_name(&trigger.table_database) != database
-                    || normalize_name(&trigger.table_name) != table_name;
-                if !keep {
-                    self.note_catalog_trigger(&trigger.database, &trigger.name);
-                }
-                keep
-            });
-            // Rebuild reverse FK caches only when the dropped table referenced
-            // other tables (child side): that is the sole case that leaves a
-            // stale `fk_referenced_by` entry on a surviving parent. Dropping a
-            // table with no outbound FK cannot invalidate any other table's
-            // caches, so we skip the O(catalog) rebuild entirely (PF1).
-            if !table.foreign_keys.is_empty() {
-                build_fk_runtime(&mut catalog);
-            }
-        }
-        self.note_catalog_table(table.id);
-        self.commit_ddl_catalog_txn()?;
-        // Post-commit physical purge (idempotent; recovery redoes it on crash).
-        let caches_evicted = self.evict_dropped_table_caches(&table).is_ok();
-        self.catalog.forget_dropped_table(&key, &table);
-        self.table_write_epochs.write().remove(&table.id);
-        self.drop_table_modification_delta_without_epoch(table.id);
-        if caches_evicted && self.purge_dropped_table_files(&intent) {
-            self.remove_drop_table_intent(intent_path.as_ref());
-        }
-        Ok(())
+        self.drop_tables(&[name.to_owned()], false)
     }
 
     pub fn drop_tables(&self, names: &[String], if_exists: bool) -> Result<(), QueryError> {
@@ -3578,6 +3509,22 @@ impl Database {
                 }
             }
         }
+        // SQL MDL drains SQL writers; storage locks also fence direct callers
+        // until every retired identity has a rejecting schema floor.
+        let lock_txn = self.begin_read_only_txn()?;
+        let _storage_guard = OnlineIndexTxnGuard {
+            db: self,
+            txn_id: lock_txn.txn_id,
+        };
+        let mut lock_ids = resolved
+            .iter()
+            .flat_map(|(_, table)| table.storage_ids().into_iter().chain([table.id]))
+            .collect::<Vec<_>>();
+        lock_ids.sort_unstable();
+        lock_ids.dedup();
+        for id in lock_ids {
+            self.acquire_table_exclusive(lock_txn.txn_id, id)?;
+        }
         // Snapshot the tables to drop and their intent file lists while the
         // catalog still points at them (the intent builder resolves paths via
         // `table_loc_fs`, which needs the live catalog row). Crash-safe DROP is
@@ -3635,17 +3582,15 @@ impl Database {
             self.note_catalog_table(table.id);
         }
         self.commit_ddl_catalog_txn()?;
-        // Post-commit physical purge (idempotent; recovery redoes it on crash).
-        for (table, intent, intent_path) in &dropped {
-            let caches_evicted = self.evict_dropped_table_caches(table).is_ok();
-            let key = table_key(&table.database, &table.name);
-            self.catalog.forget_dropped_table(&key, table);
-            self.table_write_epochs.write().remove(&table.id);
-            self.drop_table_modification_delta_without_epoch(table.id);
-            if caches_evicted && self.purge_dropped_table_files(intent) {
-                self.remove_drop_table_intent(intent_path.as_ref());
+        for (table, intent, _) in &dropped {
+            self.finish_retired_table_publication(table);
+            // Emergency DROP must still release disk headroom before returning.
+            // Ordinary cleanup runs from the committed retirement manifest.
+            if disk_limited {
+                self.purge_dropped_table_files(intent);
             }
         }
+        self.request_catalog_retirement_cleanup();
         Ok(())
     }
 
@@ -3725,6 +3670,7 @@ impl Database {
         let retired_path: Option<PathBuf> = None;
         if recycled.is_none() { self.stage_table_retirement(&retired)?; }
         let mut private = DropTableIntent {
+            retired_table_cache: None,
             retired_index: None,
             table_id: candidate.id,
             had_auto_increment: candidate.auto_increment_column_index().is_some(),
@@ -3817,15 +3763,11 @@ impl Database {
             return Err(err);
         }
         self.remove_drop_table_intent(private_path.as_ref());
-        if recycled.is_none() && self.evict_dropped_table_caches(&table).is_ok()
-            && self.purge_dropped_table_files(&retired)
-        {
-            self.remove_drop_table_intent(retired_path.as_ref());
-        }
-        self.catalog.forget_dropped_table(&key, &table);
         if recycled.is_none() {
-            self.table_write_epochs.write().remove(&table.id);
-            self.drop_table_modification_delta_without_epoch(table.id);
+            self.finish_retired_table_publication(&table);
+            self.request_catalog_retirement_cleanup();
+        } else {
+            self.catalog.forget_dropped_table(&key, &table);
         }
         Ok(())
     }
@@ -5697,6 +5639,7 @@ impl Database {
             (table_snapshot, dropped_index)
         };
         let mut retired = DropTableIntent {
+            retired_table_cache: None,
             table_id: table_snapshot.id,
             retired_index: Some((
                 dropped_index.index_id,
@@ -5773,9 +5716,7 @@ impl Database {
             self.table_locks_sharded
                 .set_schema_floor(id, table_snapshot.schema_version.saturating_add(1));
         }
-        if self.config.durability != DurabilityMode::Relaxed {
-            self.purge_dropped_table_files(&retired);
-        }
+        self.request_catalog_retirement_cleanup();
         Ok(())
     }
 
@@ -8708,10 +8649,16 @@ impl Database {
                     )
                 }));
             DDL_COPY_SHADOW_BYTES.fetch_add(shadow_bytes, Ordering::Relaxed);
+            self.backfill_copied_fulltext_statistics(ddl_txn, &candidate, shadow_id, candidate.id)?;
             if let Some((owner, _)) = online_barrier {
                 Self::set_alter_copy_job_state(&job, "CATCH_UP");
                 let _replay_timer = OnlineIndexTimer(&DDL_COPY_REPLAY_US, Instant::now());
                 let mut mapping = online_rows.lock();
+                let statistics = candidate
+                    .indexes
+                    .iter()
+                    .any(IndexSchema::is_fulltext)
+                    .then_some(&candidate);
                 let mut attempts = 0;
                 loop {
                     Self::check_alter_copy_cancelled(&job)?;
@@ -8720,6 +8667,7 @@ impl Database {
                     self.replay_online_copy_rows(
                         &old_table,
                         &shadow_table,
+                        statistics,
                         ddl_txn,
                         &job,
                         &mut mapping,
@@ -8757,6 +8705,7 @@ impl Database {
                         self.replay_online_copy_rows(
                             &old_table,
                             &shadow_table,
+                            statistics,
                             ddl_txn,
                             &job,
                             &mut mapping,
@@ -8781,7 +8730,6 @@ impl Database {
                     }
                 }
             }
-            self.backfill_copied_fulltext_statistics(ddl_txn, &candidate, shadow_id, candidate.id)?;
             Self::enter_alter_copy_finalizing(&job)?;
             let swap_started = Instant::now();
             let memory_graphs =

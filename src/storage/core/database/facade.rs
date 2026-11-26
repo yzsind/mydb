@@ -960,6 +960,7 @@ impl Database {
             #[cfg(test)]
             recyclebin_test_free_pct: AtomicU64::new(u64::MAX),
             ddl_retirement_cleanup: parking_lot::Mutex::new(None),
+            ddl_retirement_waker: parking_lot::Mutex::new(None),
             partition_cleanup_background: AtomicBool::new(false),
             xa_reservations: parking_lot::Mutex::new(HashMap::new()),
             prepared_xa: parking_lot::RwLock::new(HashMap::new()),
@@ -996,6 +997,10 @@ impl Database {
             online_index_replay_test_hook: Mutex::new(None),
             #[cfg(test)]
             online_copy_publish_test_hook: Mutex::new(None),
+            #[cfg(test)]
+            fulltext_copy_statistics_test_hook: Mutex::new(None),
+            #[cfg(test)]
+            retirement_cleanup_test_hook: Mutex::new(None),
             #[cfg(test)]
             online_index_long_lived_wait_test_hook: Mutex::new(None),
             #[cfg(test)]

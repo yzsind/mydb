@@ -29,8 +29,31 @@
 
 const DROP_TABLE_INTENT_DIR: &str = "ddl/drop_table";
 
+struct CatalogRetirementWaker(Box<dyn Fn() + Send + Sync>);
+
+impl std::fmt::Debug for CatalogRetirementWaker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CatalogRetirementWaker(..)")
+    }
+}
+
 fn drop_table_intent_dir(data_dir: &Path) -> PathBuf {
     data_dir.join(DROP_TABLE_INTENT_DIR)
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct RetiredTableCache {
+    storage_ids: Vec<u64>,
+    index_names: Vec<String>,
+}
+
+impl RetiredTableCache {
+    fn for_table(table: &TableSchema) -> Self {
+        Self {
+            storage_ids: table.storage_ids(),
+            index_names: table.indexes.iter().map(|index| index.name.clone()).collect(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -55,9 +78,30 @@ pub(crate) struct DropTableIntent {
     /// the object was recycled. Their ownership never depends on SQL names.
     #[serde(default)]
     vector_directories: Vec<String>,
+    /// Cache eviction may follow namespace publication. Stable retired ids
+    /// keep cleanup independent of a replacement table's SQL name.
+    #[serde(default)]
+    retired_table_cache: Option<RetiredTableCache>,
 }
 
 impl Database {
+    pub(crate) fn set_catalog_retirement_waker(&self, wake: impl Fn() + Send + Sync + 'static) {
+        *self.ddl_retirement_waker.lock() = Some(CatalogRetirementWaker(Box::new(wake)));
+    }
+
+    fn request_catalog_retirement_cleanup(&self) {
+        if let Some(wake) = self.ddl_retirement_waker.lock().as_ref() {
+            (wake.0)();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_retirement_cleanup_test_hook(&self) -> Arc<DdlBackfillTestHook> {
+        let hook = Arc::new(DdlBackfillTestHook::new());
+        *self.retirement_cleanup_test_hook.lock().unwrap() = Some(hook.clone());
+        hook
+    }
+
     // Never recurse: a sibling generation/index may still belong to a live table.
     fn remove_empty_object_directories(&self, paths: impl IntoIterator<Item = PathBuf>) -> Result<(), QueryError> {
         let roots = [self.data_dir.join("objects/tables"), self.data_dir.join("objects/indexes")];
@@ -261,10 +305,12 @@ impl Database {
         }
         let mut completed = 0;
         let mut txn = CatalogTxn::new(self);
+        let mut visited = None;
         for (key, row_id) in &entries {
             if stop() {
                 break;
             }
+            visited = Some((key.clone(), *row_id));
             let Some(row) = self.read_row_at(&table, DD_DDL_RETIREMENTS, *row_id, snapshot.txn)?
             else {
                 continue;
@@ -284,17 +330,27 @@ impl Database {
             };
             let cleaned = if self.physical_replica_mode() {
                 intent
-                    .files
-                    .iter()
-                    .chain(&intent.vector_files)
-                    .try_for_each(|path| {
-                        self.buffer_pool
-                            .discard_pages_for_path(&self.data_dir.join(path))?;
-                        match fs::remove_file(self.data_dir.join(path)) {
-                            Ok(()) => Ok(()),
-                            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                            Err(err) => Err(io_err(err)),
-                        }
+                    .retired_table_cache
+                    .as_ref()
+                    .map_or(Ok(()), |cache| {
+                        self.evict_retired_table_caches(intent.table_id, cache)
+                    })
+                    .and_then(|()| {
+                        intent
+                            .files
+                            .iter()
+                            .chain(&intent.vector_files)
+                            .try_for_each(|path| {
+                                self.buffer_pool
+                                    .discard_pages_for_path(&self.data_dir.join(path))?;
+                                match fs::remove_file(self.data_dir.join(path)) {
+                                    Ok(()) => Ok(()),
+                                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                                        Ok(())
+                                    }
+                                    Err(err) => Err(io_err(err)),
+                                }
+                            })
                     })
                     .is_ok()
             } else {
@@ -311,7 +367,9 @@ impl Database {
                 }
             }
         }
-        *cursor = entries.last().cloned();
+        if let Some(visited) = visited {
+            *cursor = Some(visited);
+        }
         if !txn.replacements.is_empty() {
             txn.commit()?;
         }
@@ -363,6 +421,7 @@ impl Database {
             files,
             vector_files,
             vector_directories,
+            retired_table_cache: Some(RetiredTableCache::for_table(table)),
         })
     }
 
@@ -408,19 +467,48 @@ impl Database {
     /// deleting any file. Run after the catalog commit and before the physical
     /// purge so a stray writeback cannot recreate a file we are about to unlink.
     fn evict_dropped_table_caches(&self, table: &TableSchema) -> Result<(), QueryError> {
+        self.evict_retired_table_caches(table.id, &RetiredTableCache::for_table(table))
+    }
+
+    fn evict_retired_table_caches(
+        &self,
+        table_id: u64,
+        cache: &RetiredTableCache,
+    ) -> Result<(), QueryError> {
         // Retired readers must be invalid before their files are unlinked.
-        self.evict_table_vector_graphs(table.id);
-        self.vector_table_snapshot_floors.write().remove(&table.id);
-        for sid in table.storage_ids() {
+        self.evict_table_vector_graphs(table_id);
+        self.vector_table_snapshot_floors.write().remove(&table_id);
+        for &sid in &cache.storage_ids {
             self.remove_heap_cache_entry(sid)?;
             self.remove_overflow_cache_entry(sid)?;
             self.forget_zone_map(sid)?;
-            for index in &table.indexes {
-                self.remove_index_cache_entry(sid, &index.name)?;
+            for name in &cache.index_names {
+                self.remove_index_cache_entry(sid, name)?;
             }
         }
-        self.auto_increment.forget_table(table.id);
+        self.auto_increment.forget_table(table_id);
         Ok(())
+    }
+
+    /// Close stale writer bindings before releasing the publication barrier.
+    /// Physical handles/files remain owned by the committed retirement row.
+    fn finish_retired_table_publication(&self, table: &TableSchema) {
+        for id in table.storage_ids().into_iter().chain([table.id]) {
+            self.table_locks_sharded.set_schema_floor(id, u64::MAX);
+        }
+        if table.indexes.iter().any(IndexSchema::is_vector) {
+            // Retired schema floors fence cold builders. Revoke warm handles
+            // but keep their allocations/mappings in the registry until cleanup.
+            for ((owner, _, _, _), graph) in self.vector_indexes.read().iter() {
+                if *owner == table.id {
+                    graph.revoke();
+                }
+            }
+        }
+        self.catalog
+            .forget_dropped_table(&table.qualified_name(), table);
+        self.table_write_epochs.write().remove(&table.id);
+        self.drop_table_modification_delta_without_epoch(table.id);
     }
 
     /// Unlink every physical file named by the intent. Idempotent: tolerates
@@ -439,6 +527,10 @@ impl Database {
 
     fn purge_dropped_table_files_until(&self, intent: &DropTableIntent, should_stop: &dyn Fn() -> bool) -> bool {
         if should_stop() { return false; }
+        #[cfg(test)]
+        if let Some(hook) = self.retirement_cleanup_test_hook.lock().unwrap().take() {
+            hook.pause();
+        }
         if let Some(table) = self.table_by_id(intent.table_id) {
             match self.build_drop_table_intent(&table) {
                 Ok(current) if intent.files.iter().chain(&intent.vector_files).any(|path|
@@ -455,6 +547,9 @@ impl Database {
             match self.vector_purge_snapshot_gate.try_write() { Some(guard) => Some(guard), None => return false }
         };
         let result = (|| -> Result<(), QueryError> {
+            if let Some(cache) = &intent.retired_table_cache {
+                self.evict_retired_table_caches(intent.table_id, cache)?;
+            }
             let mut intent = intent.clone();
             let mut vector_files = intent.vector_files.iter().cloned().collect::<BTreeSet<_>>();
             for relative in &intent.vector_directories {

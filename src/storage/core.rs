@@ -1479,6 +1479,7 @@ pub struct Database {
     #[cfg(test)]
     recyclebin_test_free_pct: AtomicU64,
     ddl_retirement_cleanup: parking_lot::Mutex<Option<(IndexKey, RowId)>>,
+    ddl_retirement_waker: parking_lot::Mutex<Option<CatalogRetirementWaker>>,
     partition_cleanup_background: AtomicBool,
     /// XID ownership spans ACTIVE, IDLE, PREPARED and completion I/O.
     xa_reservations: parking_lot::Mutex<HashMap<crate::xa::Xid, u64>>,
@@ -1593,6 +1594,10 @@ pub struct Database {
     online_index_replay_test_hook: Mutex<Option<Arc<DdlBackfillTestHook>>>,
     #[cfg(test)]
     online_copy_publish_test_hook: Mutex<Option<Arc<DdlBackfillTestHook>>>,
+    #[cfg(test)]
+    fulltext_copy_statistics_test_hook: Mutex<Option<Arc<DdlBackfillTestHook>>>,
+    #[cfg(test)]
+    retirement_cleanup_test_hook: Mutex<Option<Arc<DdlBackfillTestHook>>>,
     #[cfg(test)]
     online_index_long_lived_wait_test_hook: Mutex<Option<Arc<DdlBackfillTestHook>>>,
     #[cfg(test)]
@@ -2648,6 +2653,13 @@ impl ShardedTableLocks {
         let mut tables = self.table_shard(table_id).lock();
         let state = tables.entry(table_id).or_default();
         state.minimum_schema_version = state.minimum_schema_version.max(version);
+    }
+
+    fn is_retired(&self, table_id: u64) -> bool {
+        self.table_shard(table_id)
+            .lock()
+            .get(&table_id)
+            .is_some_and(|state| state.minimum_schema_version == u64::MAX)
     }
 
     /// DDL guard: is any txn (other than `exclude`) holding a lock on `table_id`?

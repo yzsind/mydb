@@ -23,7 +23,7 @@ fn current(e: &StorageQueryEngine) -> TxnView {
 
 // The heap is an independent oracle used only by tests. Every tokenizer and
 // corpus is checked, including rows excluded from all partial postings.
-fn assert_corpora(e: &StorageQueryEngine, name: &str, txn: TxnView) {
+pub(super) fn assert_corpora(e: &StorageQueryEngine, name: &str, txn: TxnView) {
     let db = e.db_for_tests();
     let table = db.table(name).unwrap();
     let heap = db.scan_rows(name, txn).unwrap();

@@ -2199,9 +2199,15 @@ impl PagedHnsw {
     }
 
     pub(crate) fn invalidate(&self) {
-        self.valid.store(false, Ordering::Release);
+        self.revoke();
         self.file.disable_navigation_mapping();
         self.invalidate_query_navigation();
+    }
+
+    /// Revoke outstanding handles without freeing mappings/navigation arenas
+    /// inside a DDL publication barrier. Retirement performs that cleanup.
+    pub(crate) fn revoke(&self) {
+        self.valid.store(false, Ordering::Release);
     }
 
     pub(crate) fn is_valid(&self) -> bool {

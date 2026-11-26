@@ -86,6 +86,13 @@ fn fulltext_temp_counter_key(owner: u64) -> String {
 }
 
 impl Database {
+    #[cfg(test)]
+    pub(crate) fn install_fulltext_copy_statistics_test_hook(&self) -> Arc<DdlBackfillTestHook> {
+        let hook = Arc::new(DdlBackfillTestHook::new());
+        *self.fulltext_copy_statistics_test_hook.lock().unwrap() = Some(hook.clone());
+        hook
+    }
+
     fn fulltext_counter_table(&self, owner: u64) -> Result<Arc<TableSchema>, QueryError> {
         let schema = crate::storage::data_dictionary::dd_table_schema(
             crate::storage::data_dictionary::DD_FULLTEXT_COUNTERS,
@@ -637,8 +644,8 @@ impl Database {
         Ok(())
     }
 
-    // Private COPY generations do not pass through ordinary DML. Count their
-    // final, caught-up contents in the publication transaction, using the
+    // Establish a private COPY corpus before replay and publication barriers.
+    // Replay debits/credits this baseline in the same transaction, using the
     // future public identity rather than the private heap's physical id.
     fn backfill_copied_fulltext_statistics(
         &self,
@@ -650,8 +657,18 @@ impl Database {
         if !table.indexes.iter().any(|index| index.is_fulltext()) {
             return Ok(());
         }
+        #[cfg(test)]
+        if let Some(hook) = self
+            .fulltext_copy_statistics_test_hook
+            .lock()
+            .unwrap()
+            .take()
+        {
+            hook.pause();
+        }
         let pages = self.with_heap_read(physical_id, |heap| heap.page_count())?;
         for lo in (0..pages).step_by(16) {
+            crate::engine::cancel::check_cancelled()?;
             let rows =
                 self.scan_rows_storage_range(table, physical_id, txn, lo, (lo + 16).min(pages))?;
             self.maintain_fulltext_statistics(
