@@ -4687,6 +4687,7 @@ include!("core/database/rls.rs");
 include!("core/database/txn_ops.rs");
 include!("core/database/vector_index_paths.rs");
 include!("core/database/ddl.rs");
+include!("core/database/online_drop_column.rs");
 include!("core/database/online_index.rs");
 include!("core/database/online_constraints.rs");
 include!("core/database/constraint_index_merge.rs");

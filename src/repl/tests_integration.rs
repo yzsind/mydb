@@ -1034,6 +1034,96 @@ mod online_apply {
     }
 
     #[tokio::test]
+    async fn physical_replica_online_drop_column_replays_and_retires_indexes() {
+        let (source, _source_dir, service) = build_master_engine().await;
+        let (replica, _replica_dir, mut lifecycle, _status) =
+            spawn_replica(service.bind_addr()).await;
+        let writer = source.clone();
+        tokio::task::spawn_blocking(move || {
+            writer.execute("CREATE TABLE removed(id INT PRIMARY KEY,a INT,b INT,UNIQUE ab(a,b),INDEX ba(b,a))").unwrap();
+            writer.execute("INSERT INTO removed VALUES(1,10,100),(2,20,200)").unwrap();
+        }).await.unwrap();
+        let hook = source
+            .database_for_replication()
+            .install_ddl_backfill_test_hook();
+        let writer = source.clone();
+        let ddl = tokio::task::spawn_blocking(move || {
+            let mut session = crate::engine::SessionContext::default();
+            session.connection_id = 29901;
+            writer
+                .execute_with_session(&mut session, "ALTER TABLE removed DROP COLUMN a, LOCK=NONE")
+                .unwrap();
+        });
+        let wait = hook.clone();
+        assert!(tokio::task::spawn_blocking(
+            move || wait.wait_until_reached(Duration::from_secs(10))
+        )
+        .await
+        .unwrap());
+        let writer = source.clone();
+        tokio::task::spawn_blocking(move || {
+            writer
+                .execute("UPDATE removed SET b=101 WHERE id=1")
+                .unwrap();
+            writer
+                .execute("INSERT INTO removed VALUES(3,30,300)")
+                .unwrap();
+        })
+        .await
+        .unwrap();
+        hook.release();
+        ddl.await.unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if replica
+                .database_for_replication()
+                .table("test.removed")
+                .is_ok_and(|table| table.column_index("a").is_err())
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "replica did not publish column removal"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let writer = source.clone();
+        tokio::task::spawn_blocking(move || {
+            writer
+                .database_for_replication()
+                .maintain_catalog_retirements_until(|| false)
+                .unwrap();
+            writer
+                .execute("UPDATE removed SET b=201 WHERE id=2")
+                .unwrap();
+        })
+        .await
+        .unwrap();
+        let expected = vec![
+            vec![Value::Int(1), Value::Int(101)],
+            vec![Value::Int(2), Value::Int(201)],
+            vec![Value::Int(3), Value::Int(300)],
+        ];
+        for index in ["ab", "ba"] {
+            assert_eq!(
+                poll_select_exact(
+                    &replica,
+                    &format!(
+                        "SELECT id,b FROM removed FORCE INDEX({index}) WHERE b>=0 ORDER BY id"
+                    ),
+                    &expected,
+                    5000
+                )
+                .await,
+                expected
+            );
+        }
+        lifecycle.stop_and_wait().await;
+        service.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn physical_replica_index_retirement_reuses_names_without_local_wal() {
         let (source, _source_dir, service) = build_master_engine().await;
         let (replica, _replica_dir, mut lifecycle, _status) =

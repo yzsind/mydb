@@ -247,6 +247,16 @@ impl Database {
                 }
             }
         }
+        self.add_index_retirement(&mut txn, intent)?;
+        Ok(txn)
+    }
+
+    fn add_index_retirement(
+        &self,
+        txn: &mut CatalogTxn<'_>,
+        intent: &DropTableIntent,
+    ) -> Result<(), QueryError> {
+        use crate::storage::data_dictionary::DD_DDL_RETIREMENTS;
         let (index_id, generation) = intent.retired_index.unwrap();
         let manifest = serde_json::to_string(intent).map_err(|err| {
             error(
@@ -264,7 +274,7 @@ impl Database {
                 Value::String(manifest),
             ]],
         );
-        Ok(txn)
+        Ok(())
     }
 
     pub(crate) fn maintain_catalog_retirements_until(
@@ -623,7 +633,9 @@ impl Database {
                 }
             }
             // Includes version tombstones left after removing AUTO_INCREMENT.
-            self.delete_auto_increment_metadata(intent.table_id)?;
+            if intent.retired_index.is_none() {
+                self.delete_auto_increment_metadata(intent.table_id)?;
+            }
             self.remove_empty_object_directories(intent.files.iter().chain(&intent.vector_files)
                 .map(|rel| self.data_dir.join(rel)).chain(intent.vector_directories.iter().map(|rel| self.data_dir.join(rel).join("__empty_owner__"))))?;
             Ok(())

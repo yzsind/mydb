@@ -8886,6 +8886,16 @@ pub(super) fn execute_qualified_statement(
             } else if fused_physical_copy {
                 // One candidate schema, one source scan, one index fan-out and
                 // one generation publish already completed above.
+            } else if alter_plan.online_drop_column {
+                let [AlterAction::DropColumn(column)] = stmt.actions.as_slice() else {
+                    unreachable!("online DROP COLUMN has one action")
+                };
+                db.drop_column_online(
+                    &table_name,
+                    column,
+                    session.connection_id as u64,
+                    stmt.lock,
+                )?;
             } else if all_add_index {
                 let mut indexes = Vec::with_capacity(stmt.actions.len());
                 for action in stmt.actions {

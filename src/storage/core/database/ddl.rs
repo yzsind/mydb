@@ -5342,7 +5342,7 @@ impl Database {
         Ok(())
     }
 
-    /// INSTANT DROP COLUMN — flips the target column's lifecycle state
+    /// Prepare the DROP COLUMN candidate by changing its lifecycle state
     /// to [`ColumnState::Dropped`] (tombstone) without rewriting any
     /// heap data. Existing row layouts remain readable by `layout_id`,
     /// while the newly-published active layout omits the dropped column
@@ -5354,16 +5354,11 @@ impl Database {
     /// PRIMARY/foreign-key and expression dependencies are validated before
     /// mutation. Secondary-index cascades build private replacement trees and
     /// publish them with the tombstone; the heap is never copied.
-    pub fn drop_column(&self, table_name: &str, column_name: &str) -> Result<(), QueryError> {
-        let (database, table_only) = split_table_name(DEFAULT_DATABASE, table_name);
-        check_table_ddl_writable(&database)?;
-        let key = table_key(&database, &table_only);
-        // Pre-checks + index cascade planning on a read snapshot, so the
-        // cascade (drop_index / add_index) can take their own catalog locks
-        // before we grab the write lock for the column tombstone.
-        let snapshot = self
-            .table_by_key(&key)
-            .ok_or_else(|| ddl_table_not_found(&table_name))?;
+    fn drop_column_candidate(
+        &self,
+        snapshot: &TableSchema,
+        column_name: &str,
+    ) -> Result<TableSchema, QueryError> {
         if snapshot.visible_column_count() <= 1 {
             return Err(error(
                 crate::error::catalog::ER_CANT_REMOVE_ALL_FIELDS,
@@ -5402,12 +5397,11 @@ impl Database {
         // MySQL: dropping a column referenced by an index cascades to the
         // index — a single-column / functional / special index is dropped,
         // and a plain composite index drops just that column (issue #83).
-        // Only foreign-key backing indexes still block the drop (handled by
-        // fk_reject_column_referenced above). Execute the cascade via the
-        // self-locking helpers before the tombstone.
+        // Foreign-key backing indexes still block the drop (validated above).
+        // Build and validate every replacement before publishing this candidate.
         let (indexes_to_drop, indexes_to_rebuild) =
             plan_index_cascade_for_drop_column(&snapshot, column_name)?;
-        let mut candidate = snapshot.as_ref().clone();
+        let mut candidate = snapshot.clone();
         candidate
             .indexes
             .retain(|index| !indexes_to_drop.contains(&index.name));
@@ -5434,6 +5428,21 @@ impl Database {
         candidate.build_column_index();
         validate_auto_increment_schema(&candidate)?;
         candidate.bump_schema_version();
+        Ok(candidate)
+    }
+
+    pub fn drop_column(&self, table_name: &str, column_name: &str) -> Result<(), QueryError> {
+        let _hold = DropColumnHoldTimer::start();
+        let (database, table_only) = split_table_name(DEFAULT_DATABASE, table_name);
+        check_table_ddl_writable(&database)?;
+        let key = table_key(&database, &table_only);
+        // Pre-checks + index cascade planning on a read snapshot, so the
+        // cascade (drop_index / add_index) can take their own catalog locks
+        // before we grab the write lock for the column tombstone.
+        let snapshot = self
+            .table_by_key(&key)
+            .ok_or_else(|| ddl_table_not_found(&table_name))?;
+        let candidate = self.drop_column_candidate(&snapshot, column_name)?;
         let replacements = candidate
             .indexes
             .iter()
@@ -5459,6 +5468,8 @@ impl Database {
             lock_ids.sort_unstable();
             lock_ids.dedup();
             self.try_online_index_data_barrier(txn.txn_id, &lock_ids)?;
+            #[cfg(test)]
+            self.pause_ddl_backfill_for_test();
             let mut paths = Vec::new();
             let result = (|| {
                 let _lsn = btree_logical_wal::LsnScope::new(Some(self.log.lock().last_lsn()));

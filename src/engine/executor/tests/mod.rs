@@ -457,6 +457,7 @@ mod nlj_n6_left_fused_agg;
 mod nlj_n7_grouped_direct_agg;
 mod not_in_anti;
 mod online_ddl;
+mod online_drop_column;
 mod operators;
 mod order_by_nulls;
 mod order_by_ordinal;
