@@ -2,7 +2,7 @@
 
 ## Description
 
-Calls a configured model with one nonempty text string. Returns a native FLOAT32 VECTOR of the model-configured dimension.
+Calls a configured model with one nonempty text string, or an image URL/binary input with `type=image`. Returns a native FLOAT32 VECTOR of the model-configured dimension.
 
 The `mysql` command-line client displays native VECTOR payloads as hex. Run
 `SET SESSION vector_result_format = 'TEXT'` once per connection to display
@@ -46,7 +46,7 @@ Requires AI_USE on the selected model as well as any table/column SELECT
 permissions used to obtain input. Model names are literals, bound parameters or
 user variables, fixed per call position rather than selected from a data row.
 
-AI_EMBED accepts one nonempty SQL text. AI_EMBED_DETAIL also accepts a nonempty native JSON array of text strings for an explicit batch. Numeric/binary/vector inputs require explicit text conversion.
+AI_EMBED accepts one nonempty SQL text by default. With `options.type=image`, an image-capable model accepts an HTTP/HTTPS image URL or binary image data (BLOB, binary binding, or FROM_BASE64). AI_EMBED_DETAIL also accepts a nonempty native JSON array of texts, or image URLs with `type=image`. Binary image batches use table rows. Other numeric/binary/vector text inputs require explicit conversion. See [image embeddings](../../ai.md#image-embeddings) for configuration, limits, and backend behavior.
 
 Omitted or SQL NULL options means defaults; a native JSON null option is invalid. See [call options](../../ai.md#calling-functions) for temperature, token limits, timeout, retry and structured-output capability checks. Unknown/conflicting options are errors.
 
