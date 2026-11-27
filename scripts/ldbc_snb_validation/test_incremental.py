@@ -4,11 +4,13 @@ from collections import Counter, defaultdict, deque
 from pathlib import Path
 import json
 import random
+import resource
 from tempfile import TemporaryDirectory
 from threading import Thread
 import time
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 from forum import ForumActivity
 from graph_io import (
@@ -20,6 +22,7 @@ from graph_io import (
 )
 from paths import shortest
 from prepared import Query, Read, partitions, relevant_deltas
+from run import VERIFIER_FILE_LIMIT, configure_file_limit
 
 
 def reference_paths(adjacency, source, target):
@@ -39,6 +42,27 @@ def reference_paths(adjacency, source, target):
 
 
 class IncrementalTests(unittest.TestCase):
+    def test_verifier_raises_only_the_soft_file_limit(self):
+        for soft, hard, expected in (
+            (256, resource.RLIM_INFINITY, VERIFIER_FILE_LIMIT),
+            (256, 1024, 1024),
+            (256, 256, None),
+            (VERIFIER_FILE_LIMIT + 1, resource.RLIM_INFINITY, None),
+        ):
+            with (
+                self.subTest(soft=soft, hard=hard),
+                patch("run.resource.getrlimit", return_value=(soft, hard)),
+                patch("run.resource.setrlimit") as change,
+                patch("run.sys.stderr"),
+            ):
+                configure_file_limit()
+                if expected is None:
+                    change.assert_not_called()
+                else:
+                    change.assert_called_once_with(
+                        resource.RLIMIT_NOFILE, (expected, hard)
+                    )
+
     def test_prepared_shards_preserve_queries_without_consulting_oracles(self):
         class UnreadableOracle:
             def __len__(self):

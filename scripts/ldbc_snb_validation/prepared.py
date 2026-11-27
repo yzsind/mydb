@@ -12,6 +12,7 @@ import hashlib
 import json
 import mmap
 from multiprocessing import get_context
+import sys
 from time import monotonic
 
 from evaluate_all import expected_rows, normalize, operation
@@ -340,6 +341,11 @@ def verify_complete(
         # Preserve shared graph pages when the children start collecting.
         gc.freeze()
         setup_seconds = monotonic() - start
+        print(
+            f"Comparing {OPERATION_COUNT:,} operations across {len(groups)} workers",
+            file=sys.stderr,
+            flush=True,
+        )
         try:
             result = run(prepared, groups, receipts.parent / "workers", receipts)
         finally:
@@ -370,7 +376,13 @@ def sha256(path):
 
 
 def queries_only(
-    work, finished_run, validation, workers, repeats, snapshot_loader=None
+    work,
+    finished_run,
+    validation,
+    workers,
+    repeats,
+    snapshot_loader=None,
+    warmup_passes=0,
 ):
     if workers < 1 or repeats < 1:
         raise ValueError("Worker and repeat counts must be positive")
@@ -404,8 +416,16 @@ def queries_only(
     print(
         f"Prepared verified snapshot and requests in {setup_seconds:.2f}s", flush=True
     )
+    warmups = []
     runs = []
     try:
+        for i in range(warmup_passes):
+            result = run(prepared, groups, work / f"warmup-{i + 1}")
+            print(
+                f"Warmup {i + 1}: {result['operations']:,} PASS (unmeasured)",
+                flush=True,
+            )
+            warmups.append(result)
         for i in range(repeats):
             result = run(prepared, groups, work / f"run-{i + 1}")
             print(
@@ -423,6 +443,8 @@ def queries_only(
         identity=identity,
         runs=runs,
     )
+    if warmups:
+        report["warmups"] = warmups
     (work / "summary.json").write_text(
         json.dumps(report, indent=2) + "\n", encoding="utf-8"
     )

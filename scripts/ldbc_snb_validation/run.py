@@ -5,6 +5,7 @@ from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
+import resource
 import shutil
 import subprocess
 import sys
@@ -15,6 +16,41 @@ from prepare import prepare
 
 TOOLS = Path(__file__).resolve().parent
 REPO = TOOLS.parents[1]
+
+# The database sizes its file-handle caches from the process's soft limit.
+# Some interactive shells inherit 256 on macOS, reducing the index cache to
+# 16 handles and making graph updates repeatedly evict and flush indexes.
+VERIFIER_FILE_LIMIT = 8192
+
+
+def configure_file_limit():
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if soft == resource.RLIM_INFINITY or soft >= VERIFIER_FILE_LIMIT:
+        return
+    target = (
+        VERIFIER_FILE_LIMIT
+        if hard == resource.RLIM_INFINITY
+        else min(hard, VERIFIER_FILE_LIMIT)
+    )
+    if target > soft:
+        try:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+        except (OSError, ValueError) as error:
+            print(
+                f"Could not raise the verifier open-file limit: {error}",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"Verifier open-file limit raised from {soft} to {target}",
+                file=sys.stderr,
+            )
+            soft = target
+    if soft < VERIFIER_FILE_LIMIT:
+        print(
+            f"Verifier open-file limit is {soft}; index eviction may slow updates",
+            file=sys.stderr,
+        )
 
 
 def build_capture(output, native=False):
@@ -105,6 +141,19 @@ def check_exit(code, name, work):
         )
 
 
+def wait_with_progress(process, log):
+    with log.open(encoding="utf-8", errors="replace") as stream:
+        while True:
+            try:
+                status = process.wait(timeout=0.25)
+            except subprocess.TimeoutExpired:
+                status = None
+            for line in stream:
+                print(line, end="", file=sys.stderr, flush=True)
+            if status is not None:
+                return status
+
+
 def reuse_loader(finished, work):
     snapshot = json.loads((finished / "actual" / "snapshot.json").read_text())
     if snapshot.get("format") != "native-v1":
@@ -166,6 +215,7 @@ def run(args):
     if work.parent != scratch and scratch not in work.parents:
         raise ValueError("Use a fresh work directory under /tmp/mydb")
     work.mkdir(parents=True)
+    configure_file_limit()
     if args.queries_only:
         from prepared import queries_only
 
@@ -177,6 +227,7 @@ def run(args):
             args.workers,
             args.repeat,
             reuse_loader(finished, work),
+            args.warmup_passes,
         )
     native = args.mode == "all" and not args.capture_binary
     if args.native_library:
@@ -186,11 +237,15 @@ def run(args):
     else:
         suffix = ".dylib" if sys.platform == "darwin" else ".so"
         binary = work / (f"native-snapshot{suffix}" if native else "capture")
+        if args.compact:
+            print("Building the Rust verifier (Cargo release profile)", flush=True)
         build_capture(binary, native=native)
     source = args.snapshot.resolve(strict=True)
     validation = args.validation.resolve(strict=True)
     start = time.monotonic()
     graph = work / "graph-data"
+    if args.compact:
+        print("Cloning the stopped snapshot and preparing updates", flush=True)
     clone(source, graph)
     copied = time.monotonic()
     plan = work / "writes.jsonl"
@@ -218,9 +273,16 @@ def run(args):
             str(args.workers),
         ]
     if native:
+        if args.compact:
+            print("Scanning the snapshot and replaying durable updates", flush=True)
         command += ["--native-library", str(binary), "--native-data", str(graph)]
         with launch(command, "verification", work, env) as (process, started):
-            check_exit(process.wait(), "verification", work)
+            status = (
+                wait_with_progress(process, work / "verification.log")
+                if args.compact
+                else process.wait()
+            )
+            check_exit(status, "verification", work)
             evaluation_seconds = time.monotonic() - started
     else:
         capture_seconds, evaluation_seconds, overlap_seconds = capture_and_verify(
@@ -271,7 +333,16 @@ def run(args):
     (work / "summary.json").write_text(
         json.dumps(summary, indent=2) + "\n", encoding="utf-8"
     )
-    print(json.dumps(summary, indent=2))
+    if args.compact:
+        target = "met" if summary["within_comparison_target"] else "missed"
+        print(
+            f"Cold validation {sum(verification['counts'].values()):,} PASS in {elapsed:.3f}s"
+        )
+        print(f"5.34s target {target}. Summary {work / 'summary.json'}")
+        if args.mode == "all":
+            print(f"Receipts {work / 'receipts.tsv'}")
+    else:
+        print(json.dumps(summary, indent=2))
     return 0 if elapsed <= 900 else 3
 
 
@@ -299,6 +370,15 @@ def main():
         help="Replays sharing the same prepared indexes",
     )
     cli.add_argument(
+        "--warmup-passes",
+        type=int,
+        default=0,
+        help="Unmeasured replay passes before --queries-only timing",
+    )
+    cli.add_argument(
+        "--compact", action="store_true", help="Print compact cold results"
+    )
+    cli.add_argument(
         "--validation", type=Path, required=True, help="Official SF=1 validation file"
     )
     cli.add_argument("--work-dir", type=Path, required=True)
@@ -315,6 +395,8 @@ def main():
     args = cli.parse_args()
     if args.workers < 1:
         cli.error("--workers must be positive")
+    if args.warmup_passes < 0 or (args.warmup_passes and not args.queries_only):
+        cli.error("--warmup-passes requires --queries-only and a nonnegative count")
     if args.native_library and (args.mode != "all" or args.queries_only):
         cli.error("--native-library requires a full run from a stopped snapshot")
     if args.queries_only and (args.mode != "all" or args.capture_binary):
