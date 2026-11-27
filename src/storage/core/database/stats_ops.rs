@@ -1430,8 +1430,8 @@ impl Database {
 
     /// Refresh persistent statistics for a selected set of physical leaves
     /// without opening any other partition heap. This is the implementation
-    /// behind `ANALYZE PARTITION`; table-level row/page totals are rebuilt
-    /// once the catalog has a statistic for every current leaf.
+    /// behind `ANALYZE PARTITION`. A full aligned scan refreshes population;
+    /// partial scans fold aligned global deltas without mixing leaf horizons.
     fn analyze_partition_storage_ids(
         &self,
         table: &TableSchema,
@@ -1449,12 +1449,8 @@ impl Database {
         } else {
             0
         };
-        let txn = self.begin_read_only_txn()?;
+        let snapshot = StorageReadSnapshot::new(self);
         drop(population_barrier);
-        let _read_guard = PartitionReadTxnGuard {
-            db: self,
-            txn_id: txn.txn_id,
-        };
         let analyzed_at = Some(current_unix_ms());
         let mut refreshed = BTreeMap::new();
         for &storage_id in storage_ids {
@@ -1465,8 +1461,12 @@ impl Database {
             let mut leaf_schema = table.clone();
             leaf_schema.id = storage_id;
             leaf_schema.partitioning = None;
-            let (leaf, _) =
-                self.collect_table_stats_with_sample_pages_and_zone(&leaf_schema, None, None, txn)?;
+            let (leaf, _) = self.collect_table_stats_with_sample_pages_and_zone(
+                &leaf_schema,
+                None,
+                None,
+                snapshot.txn,
+            )?;
             refreshed.insert(
                 storage_id,
                 PartitionStats {
@@ -1502,27 +1502,27 @@ impl Database {
             .iter()
             .all(|storage_id| stored.stats.partition_stats.contains_key(storage_id))
         {
-            let previous_row_count = stored.stats.row_count;
             let new_row_count: u64 = current_ids
                 .iter()
                 .filter_map(|storage_id| stored.stats.partition_stats.get(storage_id))
                 .map(|stats| stats.row_count)
                 .sum();
+            let all_refreshed = current_ids.iter().all(|id| storage_ids.contains(id));
             if baseline_aligned {
-                // Only the part of the live delta now represented by the
-                // refreshed leaf counts can be removed. Other leaves may
-                // still have unapplied DML in the table-wide sidecar.
-                let represented = (new_row_count as i128 - previous_row_count as i128)
-                    .clamp(i64::MIN as i128, i64::MAX as i128)
-                    as i64;
-                let aligned = if represented >= 0 {
-                    represented.min(live_baseline.max(0))
+                stored.stats.row_count = if all_refreshed {
+                    new_row_count
                 } else {
-                    represented.max(live_baseline.min(0))
+                    stored.stats.row_count.saturating_add_signed(live_baseline)
                 };
-                stored.stats.last_analyze_live_baseline = aligned;
+                stored.stats.last_analyze_live_baseline = live_baseline;
             }
-            stored.stats.row_count = new_row_count;
+            // A partial scan mixes leaf counts from different watermarks.
+            // Opposing inserts/deletes in unscanned leaves can cancel the
+            // table-wide delta, so its sign cannot identify the represented
+            // subset. Busy snapshots can also precede counter completion.
+            // Fold an aligned global delta into the existing total instead
+            // of combining leaf counts. Busy snapshots keep their baseline;
+            // fresh distributions remain useful without double-counting DML.
             stored.stats.heap_page_count = current_ids
                 .iter()
                 .filter_map(|storage_id| stored.stats.partition_stats.get(storage_id))
@@ -1537,7 +1537,7 @@ impl Database {
                         .saturating_add(1),
                 ),
             );
-            if baseline_aligned && current_ids.iter().all(|id| storage_ids.contains(id)) {
+            if baseline_aligned && all_refreshed {
                 stored.stats.last_analyze_modification_baseline = modification_baseline;
                 stored.stats.modified_rows_since_analyze = 0;
             }

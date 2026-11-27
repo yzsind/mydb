@@ -13,14 +13,14 @@ impl Drop for OnlineCopyHoldTimer {
 }
 
 // All writable COPY entry points share the same derived-index backends.
-// Partitioned FULLTEXT queries still use unqualified RowIds; a new generation
-// can change their meaning, so exclude that shape before allocating shadows.
+// Partitioned FULLTEXT readers use storage-qualified heap identities; private
+// COPY leaves build and replay their postings and corpus counters separately.
 fn online_copy_indexes_supported(source: &TableSchema) -> bool {
     source.indexes.iter().all(|index| {
         index.index_type.eq_ignore_ascii_case("BTREE")
             || index.is_vector()
             || index.is_spatial()
-            || (index.is_fulltext() && !source.is_partitioned())
+            || index.is_fulltext()
     })
 }
 
@@ -203,7 +203,11 @@ impl Database {
             || !actions.iter().all(|a| match a {
                 A::AddColumn(_) => true,
                 A::ModifyColumn(_) | A::ChangeColumn { .. } => true,
-                A::AddIndex(i) => i.index_type.eq_ignore_ascii_case("BTREE"),
+                A::AddIndex(i) => i.index_type.eq_ignore_ascii_case("BTREE")
+                    || i.index_type.eq_ignore_ascii_case("FULLTEXT")
+                    || i.index_type.eq_ignore_ascii_case("SPATIAL")
+                    || i.index_type.eq_ignore_ascii_case("HNSW")
+                    || i.index_type.eq_ignore_ascii_case("IVF"),
                 A::Rebuild
                 | A::DropColumn(_)
                 | A::DropIndex(_)
@@ -936,6 +940,9 @@ impl Database {
         // A private writer transaction alone does not pin RC undo. Register
         // the read horizon atomically with purge before choosing its snapshot.
         let is_reorg = rewrite.is_some();
+        let truncate = rewrite
+            .as_ref()
+            .is_some_and(|layout| layout.operation == "truncate_partition");
         let mut _source_snapshot = if is_reorg {
             None
         } else {
@@ -1086,7 +1093,13 @@ impl Database {
                 &job,
             )?;
             let mut maps = BTreeMap::new();
-            for id in &source_ids {
+            // TRUNCATE publishes empty replacement leaves at the final
+            // barrier. Source writes in those leaves are intentionally
+            // discarded, including writes committed during preparation.
+            // Only retained-leaf population changes need replay; an absent
+            // mapping already selects that path in the shared replay code.
+            let copy_sources = if truncate { &[][..] } else { &source_ids[..] };
+            for id in copy_sources {
                 let mut map = OnlineCopyRows::new(self.data_dir(), job.job_id)?;
                 map.spill_path = self
                     .data_dir
@@ -1102,7 +1115,7 @@ impl Database {
             self.pause_ddl_backfill_for_test();
             let defaults = AlterCopyDefaults::new(&source, &target, &job)?;
             let scan_timer = OnlineIndexTimer(&DDL_COPY_SCAN_US, Instant::now());
-            for source_id in &source_ids {
+            for source_id in copy_sources {
                 let pages = self.with_heap_read(*source_id, |heap| heap.page_count())?;
                 DDL_COPY_SOURCE_BYTES
                     .fetch_add(pages.saturating_mul(PAGE_SIZE as u64), Ordering::Relaxed);

@@ -372,6 +372,8 @@ fn validate_add_index_definition(
     Ok(())
 }
 
+static DDL_CHECK_PARTITION_HOLD_US: AtomicU64 = AtomicU64::new(0);
+
 static DDL_COPY_TOTAL: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]
 thread_local! {
@@ -7998,16 +8000,6 @@ impl Database {
                 "online OPTIMIZE TABLE requires a durable storage backend",
             ));
         }
-        // FULLTEXT candidates currently carry only RowId, which is local to
-        // one partition. Compaction can make previously distinct local ids
-        // collide in that query path. Reject before changing any files until
-        // the fulltext executor carries partition-qualified document ids.
-        if source.is_partitioned() && source.indexes.iter().any(IndexSchema::is_fulltext) {
-            return Err(error(
-                crate::error::catalog::ER_NOT_SUPPORTED_YET,
-                "online OPTIMIZE TABLE does not support partitioned FULLTEXT indexes",
-            ));
-        }
         if !online_copy_indexes_supported(&source) {
             return Err(error(
                 crate::error::catalog::ER_NOT_SUPPORTED_YET,
@@ -12190,7 +12182,7 @@ impl Database {
         // total strength ordering in the MDL manager.
         let _build_mdl = if self.partition_action_shared_build_supported(&action) {
             if let Some((owner, timeout, allow_dml)) = cutover {
-                if !allow_dml {
+                if !allow_dml && !matches!(&action, A::ExchangePartition { .. }) {
                     self.acquire_alter_execution_mdl_duration(
                         owner,
                         table_name,
@@ -12238,7 +12230,8 @@ impl Database {
                 // as errors; clean scan = OK.
                 let (table, storage_ids) =
                     self.partition_maintenance_storage_ids(table_name, &targets)?;
-                self.check_partition_storage_ids(&table, &storage_ids)
+                self.check_partition_storage_ids(&table, &storage_ids,
+                    cutover.is_some_and(|(_, _, online)| online))
             }
             A::CoalescePartitions(n) => self.coalesce_partitions(table_name, n, cutover),
             A::RemovePartitioning => self.remove_partitioning(table_name, cutover),
@@ -12250,7 +12243,7 @@ impl Database {
                 partition,
                 table,
                 with_validation,
-            } => self.exchange_partition(table_name, &partition, &table, with_validation),
+            } => self.exchange_partition(table_name, &partition, &table, with_validation, cutover),
             A::PartitionBy(def) => self.repartition_table(table_name, def, cutover),
         };
         if result.is_ok() {
@@ -12375,16 +12368,80 @@ impl Database {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(crate) fn check_partition_hold_us_for_test(&self) -> u64 {
+        DDL_CHECK_PARTITION_HOLD_US.load(Ordering::Relaxed)
+    }
+
     fn check_partition_storage_ids(
         &self,
         table: &TableSchema,
         storage_ids: &[u64],
+        online: bool,
     ) -> Result<(), QueryError> {
-        let txn = self.begin_read_only_txn()?;
-        let _read_guard = PartitionReadTxnGuard {
-            db: self,
-            txn_id: txn.txn_id,
+        let _descriptor = {
+            let _catalog = self.catalog_write()?;
+            self.catalog.online_pinned_ids.write().insert(table.id);
+            OnlineIndexDescriptorGuard { db: self, table_id: table.id }
         };
+        let table = self.table(&table.qualified_name())?;
+        for _ in 0..8 {
+            crate::engine::cancel::check_cancelled()?;
+            let alignment = if online {
+                let Some(barrier) = AnalyzePopulationBarrier::try_new(self, &table) else {
+                    std::thread::yield_now();
+                    continue;
+                };
+                Some(barrier)
+            } else { None };
+            let alignment_timer = alignment.as_ref().map(|_| OnlineIndexTimer(
+                &DDL_CHECK_PARTITION_HOLD_US, Instant::now()));
+            let snapshot = StorageReadSnapshot::new(self);
+            let stamp = self.table_write_epoch(table.id);
+            let mut indexes = Vec::new();
+            let mut stable = true;
+            if online {
+                for sid in storage_ids {
+                    for index in table.iter_public_indexes() {
+                        let handle = self.index_handle(*sid, &index.name)?;
+                        let generation = handle.read().stable_generation();
+                        if let Some(generation) = generation {
+                            indexes.push((handle, generation));
+                        } else { stable = false; }
+                    }
+                }
+            }
+            drop(alignment);
+            drop(alignment_timer);
+            if !stable { continue; }
+            #[cfg(test)]
+            self.pause_ddl_backfill_for_test();
+            let checked = self.validate_partition_storage_ids(&table, storage_ids, snapshot.txn, online);
+            crate::engine::cancel::check_cancelled()?;
+            let _publication = if online {
+                let Some(barrier) = AnalyzePopulationBarrier::try_new(self, &table) else { continue; };
+                if self.table_write_epoch(table.id) != stamp || indexes.iter().any(|(handle, generation)|
+                    handle.read().stable_generation() != Some(*generation)) {
+                    continue;
+                }
+                Some(barrier)
+            } else { None };
+            let _publication_timer = _publication.as_ref().map(|_| OnlineIndexTimer(
+                &DDL_CHECK_PARTITION_HOLD_US, Instant::now()));
+            self.publish_partition_check(&table, checked?)?;
+            return Ok(());
+        }
+        Err(error(crate::error::catalog::ER_LOCK_WAIT_TIMEOUT,
+            "CHECK PARTITION could not obtain a stable heap/index view; retry when writes subside"))
+    }
+
+    fn validate_partition_storage_ids(
+        &self,
+        table: &TableSchema,
+        storage_ids: &[u64],
+        txn: TxnView,
+        online: bool,
+    ) -> Result<Vec<(u64, u64, u64)>, QueryError> {
         let mut checked = Vec::with_capacity(storage_ids.len());
         for storage_id in storage_ids {
             let page_count = self.with_heap_read(*storage_id, |heap| heap.page_count())?;
@@ -12404,7 +12461,7 @@ impl Database {
                 .indexes
                 .iter()
                 .map(|_| {
-                    IndexEntryExternalSorter::with_exact_run_bytes(scratch / table.indexes.len())
+                    IndexEntryExternalSorter::with_exact_run_bytes(scratch / (table.indexes.len() + 1))
                 })
                 .collect::<Vec<_>>();
             let mut visible_row_count = 0u64;
@@ -12450,31 +12507,51 @@ impl Database {
                     )
                 };
                 if index.is_spatial() {
-                    let mut actual = self.with_index_read(*storage_id, &index.name, |file| {
-                        file.validate_structure()?;
-                        file.entries()
+                    // Spatial order differs from key order. Spill actual
+                    // entries too, within the same reserved scratch budget.
+                    let mut actual = IndexEntryExternalSorter::with_exact_run_bytes(
+                        scratch / (table.indexes.len() + 1));
+                    self.with_index_read(*storage_id, &index.name, |file| {
+                        let spatial = file.spatial.as_ref().expect("SPATIAL backend");
+                        let visit = |key, row_id| actual.push(self.data_dir(), IndexEntry { key, row_id });
+                        if online {
+                            spatial.validate_optimistic()?;
+                            spatial.visit_entries_optimistic(visit)
+                        } else {
+                            spatial.validate()?;
+                            spatial.visit_entries(visit)
+                        }
                     })?;
-                    actual.sort_unstable();
-                    for (key, row_id) in actual {
-                        let entry = expected.next().transpose()?.ok_or_else(&mismatch)?;
-                        if entry.key != key || entry.row_id != row_id {
+                    let actual: Box<dyn Iterator<Item = Result<IndexEntry, QueryError>>> =
+                        match actual.finish(self.data_dir())? {
+                            SortedIndexEntries::Memory(rows) => Box::new(rows.into_iter().map(Ok)),
+                            SortedIndexEntries::Spilled(runs) => Box::new(runs.into_merger()?),
+                        };
+                    for entry in actual {
+                        if entry? != expected.next().transpose()?.ok_or_else(&mismatch)? {
                             return Err(mismatch());
                         }
                     }
-                    if expected.next().transpose()?.is_some() {
-                        return Err(mismatch());
-                    }
+                    if expected.next().transpose()?.is_some() { return Err(mismatch()); }
                     continue;
                 }
                 let mut actual = IndexRangeCursor::new(
                     self.index_handle(*storage_id, &index.name)?,
-                    false,
+                    // Integrity checks compare entries, including multiple
+                    // postings/array keys owned by the same physical row.
+                    true,
                     None,
                     None,
                 )?;
+                let mut physical = table.clone();
+                physical.id = *storage_id;
                 actual.visit_entries(|entries| {
                     crate::engine::cancel::check_cancelled()?;
                     for (key, row_id) in entries {
+                        if index_supports_delete_mark(index)
+                            && self.is_retained_index_entry(&physical, index, key, *row_id)? {
+                            continue;
+                        }
                         let entry = expected.next().transpose()?.ok_or_else(&mismatch)?;
                         if &entry.key != *key || entry.row_id != *row_id {
                             return Err(mismatch());
@@ -12488,15 +12565,16 @@ impl Database {
             }
             checked.push((*storage_id, visible_row_count, page_count));
         }
-        let key = table_key(&table.database, &table.name);
-        let mut catalog = self.catalog_write()?;
-        let stored = catalog.tables.get_mut(&key).ok_or_else(|| {
-            error(
-                crate::error::catalog::ER_NO_SUCH_TABLE,
-                format!("Table '{}' doesn't exist", table.qualified_name()),
-            )
-        })?;
-        let stored = Arc::make_mut(stored);
+        Ok(checked)
+    }
+
+    fn publish_partition_check(
+        &self,
+        table: &TableSchema,
+        checked: Vec<(u64, u64, u64)>,
+    ) -> Result<(), QueryError> {
+        let mut candidate = table.clone();
+        let stored = &mut candidate;
         for (storage_id, row_count, page_count) in checked {
             let stats = stored
                 .stats
@@ -12515,11 +12593,7 @@ impl Database {
             stats.heap_page_count = page_count;
             stats.check_ok = Some(true);
         }
-        stored.bump_schema_version();
-        drop(catalog);
-        self.note_catalog_table(table.id);
-        self.commit_catalog_txn()?;
-        Ok(())
+        self.publish_stats_candidate(table, candidate)
     }
 
     // Startup repair uses the same bounded bulk builders, without publishing
@@ -13570,6 +13644,36 @@ impl Database {
         partition_name: &str,
         other_table_name: &str,
         with_validation: bool,
+        cutover: Option<(u64, Duration, bool)>,
+    ) -> Result<(), QueryError> {
+        let source = self.table(table_name)?;
+        let (database, name) = split_table_name(&source.database, other_table_name);
+        let other_key = table_key(&database, &name);
+        let other = self.table(&other_key)?;
+        let _descriptors = {
+            let _catalog = self.catalog_write()?;
+            self.catalog.online_pinned_ids.write().extend([source.id, other.id]);
+            [source.id, other.id].map(|table_id|
+                OnlineIndexDescriptorGuard { db: self, table_id })
+        };
+        let job = self.register_ddl_job_with_subject(&source, "EXCHANGE", false,
+            format!("{partition_name} WITH {other_table_name}"));
+        let _cancel = crate::engine::cancel::enter(job.cancel_token.clone());
+        Self::set_alter_copy_job_state(&job, "VALIDATING");
+        let result = self.exchange_partition_worker(table_name, partition_name, other_table_name,
+            with_validation, cutover, &job);
+        self.unregister_alter_copy_job(source.id, result.as_ref().err());
+        result
+    }
+
+    fn exchange_partition_worker(
+        &self,
+        table_name: &str,
+        partition_name: &str,
+        other_table_name: &str,
+        with_validation: bool,
+        cutover: Option<(u64, Duration, bool)>,
+        job: &AlterCopyJob,
     ) -> Result<(), QueryError> {
         let (database, name) = split_table_name(DEFAULT_DATABASE, table_name);
         let key = table_key(&database, &name);
@@ -13600,6 +13704,14 @@ impl Database {
                 crate::error::catalog::ER_PARTITION_EXCHANGE_PART_TABLE,
                 "EXCHANGE PARTITION cannot target a partitioned table",
             ));
+        }
+        if table.indexes.iter().chain(&other_table.indexes).any(IndexSchema::is_vector) {
+            return Err(error(crate::error::catalog::ER_NOT_SUPPORTED_YET,
+                "EXCHANGE PARTITION does not support vector index ownership transfer"));
+        }
+        if table.indexes.iter().chain(&other_table.indexes).any(|i| i.state != IndexState::Public) {
+            return Err(error(crate::error::catalog::ER_NOT_SUPPORTED_YET,
+                "EXCHANGE PARTITION requires Public indexes"));
         }
         // Different generations require physical relocation that the catalog
         // storage-id swap alone cannot replay on a replica. Reject before any
@@ -13763,7 +13875,7 @@ impl Database {
                             .collect::<Vec<_>>(),
                         // Predicates, expressions and FT configuration determine physical membership and encoding.
                         serde_json::to_string(&idx.predicate).expect("serializable index predicate"),
-                        serde_json::to_string(&idx.key_expressions)
+                        serde_json::to_string(&(0..idx.columns.len()).map(|i| idx.key_expressions.get(i).cloned().flatten()).collect::<Vec<_>>())
                             .expect("serializable index expressions"),
                         serde_json::to_string(&idx.fulltext.as_ref().map(|meta| {
                             let mut meta = meta.clone(); meta.corpus_id = 0; meta.snapshot_origin_txn_id = 0; meta
@@ -13779,6 +13891,12 @@ impl Database {
                 crate::error::catalog::ER_TABLES_DIFFERENT_METADATA,
                 "EXCHANGE PARTITION: tables have different secondary index definitions",
             ));
+        }
+        if table.indexes.iter().any(|index|
+            other_table.indexes.iter().any(|other|
+                index.name.eq_ignore_ascii_case(&other.name) && index.index_id != other.index_id)) {
+            return Err(error(crate::error::catalog::ER_NOT_SUPPORTED_YET,
+                "EXCHANGE PARTITION requires matching physical index identities; index relocation is unsupported"));
         }
         // One standalone heap can exchange with exactly one physical leaf.
         // A logical parent of subpartitions is therefore rejected.
@@ -13812,12 +13930,12 @@ impl Database {
                 )
             })?
         };
-        let outgoing_partition_stats = table
+        let mut outgoing_partition_stats = table
             .stats
             .partition_stats
             .get(&partition_storage_id)
             .cloned();
-        let incoming_partition_stats = crate::storage::PartitionStats {
+        let mut incoming_partition_stats = crate::storage::PartitionStats {
             row_count: other_table.stats.row_count,
             heap_page_count: other_table.stats.heap_page_count,
             columns: other_table.stats.columns.clone(),
@@ -13826,115 +13944,32 @@ impl Database {
             analyzed_at_unix_ms: other_table.stats.analyzed_at_unix_ms,
             check_ok: None,
         };
-        let lock_txn = self.begin_read_only_txn()?;
-        let _exchange_locks = OnlineIndexTxnGuard {
-            db: self,
-            txn_id: lock_txn.txn_id,
-        };
-        let mut lock_ids = vec![table.id, partition_storage_id, other_table.id];
-        lock_ids.sort_unstable();
-        lock_ids.dedup();
-        for id in lock_ids {
-            self.acquire_table_exclusive(lock_txn.txn_id, id)?;
-        }
-
-        // WITH VALIDATION: each row currently in the unpartitioned
-        // table must route to this partition under the partitioning
-        // function. Reject otherwise (matches MySQL 1737).
-        if with_validation {
-            let txn = self.begin_read_only_txn()?;
-            let _read_guard = PartitionReadTxnGuard {
-                db: self,
-                txn_id: txn.txn_id,
-            };
-            let columns: Vec<_> = (0..other_table.columns.len()).collect();
-            self.scan_rows_columns_streaming(&other_key, txn, &columns, |row| {
-                let routed = table.route_row_to_partition(row)?;
-                if routed.index != part_idx || routed.storage_id != partition_storage_id {
-                    return Err(error(
-                        crate::error::catalog::ER_ROW_DOES_NOT_MATCH_PARTITION,
-                        "EXCHANGE PARTITION: found row not matching the partition's bounds",
-                    ));
-                }
-                Ok(())
-            })?;
-        }
-
-        // Flush dirty pages for both heaps before the rename, so the
-        // exchanged files contain every committed write. Discarding
-        // a cached heap with dirty pages would lose those writes.
-        let _ = self.with_heap_exclusive(partition_storage_id, |heap| heap.flush_dirty_pages());
-        let _ = self.with_heap_exclusive(other_table.id, |heap| heap.flush_dirty_pages());
-        // The following rename must operate on complete files, not dirty
-        // cache state. Ordinary commits may defer B-tree writeback.
-        for index in &table.indexes {
-            self.with_index_exclusive(partition_storage_id, &index.name, |idx| idx.flush())?;
-            self.with_index_exclusive(other_table.id, &index.name, |idx| idx.flush())?;
-        }
-        // Flush *all* dirty buffer-pool pages (crucially the overflow/LOB
-        // pages the standalone table's INSERTs just wrote) to disk before the
-        // rename. `remove_overflow_cache_entry` discards without flushing, so
-        // without this the un-written LOB pages would be lost and the swapped
-        // `.lob` file would read back a corrupt/incomplete chain.
-        self.flush_dirty_data()?;
-        if self.config.durability == DurabilityMode::Memory {
-            // Memory flush intentionally does nothing. Before retiring its
-            // resident handles, materialize only the exchanged file images.
-            self.materialize_exchange_memory_files(partition_storage_id, &table)?;
-            self.materialize_exchange_memory_files(other_table.id, &other_table)?;
-        }
-        // Heap-cache entries are keyed by storage_id; the next access
-        // must reopen via the new path that the rename installs.
-        self.remove_heap_cache_entry(partition_storage_id)?;
-        self.remove_heap_cache_entry(other_table.id)?;
-        // Overflow handles are keyed by storage_id too; drop them so the next
-        // access reopens via the post-rename `.lob` path.
-        self.remove_overflow_cache_entry(partition_storage_id)?;
-        self.remove_overflow_cache_entry(other_table.id)?;
-        for index in &table.indexes {
-            self.remove_index_cache_entry(partition_storage_id, &index.name)?;
-            self.remove_index_cache_entry(other_table.id, &index.name)?;
-        }
-        // The on-disk file name embeds the *owner* table name, not the
-        // storage id alone — `partition_storage_id` is owned by
-        // `part_tbl`, so its file is `part_tbl__<sid>__data.heap`.
-        // After the swap below, `partition_storage_id` is owned by the
-        // unpartitioned table (`other`), so the on-disk file has to be
-        // renamed to the unpartitioned name. Same for the unpartitioned
-        // table's old id, which now belongs to `part_tbl`'s p0.
-        let part_path_old = self.table_path(partition_storage_id);
-        let other_path_old = self.table_path(other_table.id);
-        // Overflow (LOB) sidecars must swap alongside the heap: a swapped heap
-        // row's externalized columns hold `LobRef`s into `overflow_path(sid)`,
-        // so leaving the `.lob` behind makes those columns unreadable (missing
-        // file / wrong data). Resolved with the same before/after-swap timing
-        // as the heap paths. AUTO_INCREMENT is logical metadata and therefore
-        // does not participate in the physical rename plan.
-        let part_lob_old = self.overflow_path(partition_storage_id);
-        let other_lob_old = self.overflow_path(other_table.id);
-        // Publish all dirty summary pages before the path changes. Evict
-        // their old file handles as well: otherwise a later buffer flush can
-        // reopen the pre-exchange path and recreate a stale sidecar.
-        self.flush_for_rename_zone_map(partition_storage_id)?;
-        self.flush_for_rename_zone_map(other_table.id)?;
-        let part_zm_old = self.zone_map_file_path(partition_storage_id);
-        let other_zm_old = self.zone_map_file_path(other_table.id);
-        // Capture index paths up front too, indexed by name.
-        let part_index_paths: Vec<(String, PathBuf)> = table
-            .indexes
-            .iter()
-            .map(|i| {
-                (
-                    i.name.clone(),
-                    self.index_path(partition_storage_id, &i.name),
+        let prepared = self.prepare_exchange(&table, &other_table, partition_storage_id,
+            part_idx, with_validation, cutover, job)?;
+        let (outgoing, incoming, total) = prepared.counts;
+        incoming_partition_stats.row_count = incoming;
+        outgoing_partition_stats.get_or_insert_with(crate::storage::PartitionStats::empty)
+            .row_count = outgoing;
+        // Heap, LOB and zone-map paths are qualified by immutable physical
+        // storage ID and equal generation. Their bytes/handles stay in place.
+        // No observer may use a partially published ownership swap. Keep the
+        // durable journal/files for recovery on any publication-phase failure.
+        // Both logical tables retain monotone allocation after acquiring
+        // rows (and possibly unused reservations) from the other side.
+        let auto_increment_floor = if other_table.auto_increment_column_index().is_some() {
+            self.auto_increment_state(table.id, 0)?
+                .max_value
+                .load(Ordering::Acquire)
+                .max(
+                    self.auto_increment_state(other_table.id, 0)?
+                        .max_value
+                        .load(Ordering::Acquire),
                 )
-            })
-            .collect();
-        let other_index_paths: Vec<(String, PathBuf)> = other_table
-            .indexes
-            .iter()
-            .map(|i| (i.name.clone(), self.index_path(other_table.id, &i.name)))
-            .collect();
+        } else {
+            0
+        };
+        let publication_txn = prepared.publication_txn;
+        let publication;
         // Swap storage_ids in the catalog. Logical object_id remains stable
         // for sequence ownership and policy dependencies across the exchange.
         {
@@ -13946,6 +13981,7 @@ impl Database {
                         "EXCHANGE PARTITION participant changed; retry"));
                 }
             }
+            publication = ExchangePublicationGuard { db: self, finished: false };
             let table_arc = catalog.tables.get_mut(&key).ok_or_else(|| {
                 error(
                     crate::error::catalog::ER_NO_SUCH_TABLE,
@@ -13988,7 +14024,13 @@ impl Database {
                     .map(|storage_id| table_mut.stats.partition_stats[storage_id].heap_page_count)
                     .sum();
             }
+            table_mut.stats.row_count = total.saturating_sub(outgoing).saturating_add(incoming);
+            table_mut.row_generation_txn_id = publication_txn.txn_id;
+            table_mut.stats.modified_rows_since_analyze = table_mut.stats.modified_rows_since_analyze.max(1);
+            table_mut.stats.analyzed_at_unix_ms = None;
             table_mut.bump_schema_version();
+            table_mut.schema_version = table_mut.schema_version.max(
+                other_table.schema_version.saturating_add(1));
             let other_arc = catalog.tables.get_mut(&other_key).ok_or_else(|| {
                 error(
                     crate::error::catalog::ER_NO_SUCH_TABLE,
@@ -14013,102 +14055,13 @@ impl Database {
                     .modified_rows_since_analyze
                     .saturating_add(1);
             }
+            other_mut.row_generation_txn_id = publication_txn.txn_id;
+            other_mut.stats.modified_rows_since_analyze = other_mut.stats.modified_rows_since_analyze.max(1);
+            other_mut.stats.analyzed_at_unix_ms = None;
             other_mut.bump_schema_version();
+            other_mut.schema_version = other_mut.schema_version.max(
+                table.schema_version.saturating_add(1));
         }
-        // EXCHANGE swaps *content*, not just storage_ids. The bytes
-        // that used to live in `partition_storage_id` (the old p0
-        // heap) now have to be visible as the new staging table, and
-        // vice versa. New paths are resolved *after* the swap so file
-        // ownership reflects the new binding:
-        //
-        //   - the new staging row's storage_id is `partition_storage_id`,
-        //     so its file is `staging__<partition_storage_id>__data.heap`.
-        //   - the new p0 partition's storage_id is `other_table.id`,
-        //     so its file is `part_tbl__<other_table.id>__data.heap`.
-        //
-        // A two-step rename via `.exchange-tmp` names keeps either move
-        // from colliding with a still-occupied destination.
-        let part_path_new = self.table_path(other_table.id);
-        let other_path_new = self.table_path(partition_storage_id);
-        let part_path_tmp = part_path_old.with_extension("heap.exchange-tmp");
-        // Post-swap LOB destinations (owner names now reflect the swap).
-        let part_lob_new = self.overflow_path(other_table.id);
-        let other_lob_new = self.overflow_path(partition_storage_id);
-        let part_lob_tmp = part_lob_old.with_extension("lob.exchange-tmp");
-        let part_zm_new = self.zone_map_file_path(other_table.id);
-        let other_zm_new = self.zone_map_file_path(partition_storage_id);
-        let part_zm_tmp = part_zm_old.with_extension("zm.exchange-tmp");
-        // Build the ordered post-commit rename plan (relative paths) and
-        // journal it so a crash between the durable catalog swap and the
-        // last rename can be completed at startup (§2.1 EXCHANGE
-        // hardening). Replaying with "skip when source is absent" makes
-        // any partial state idempotent.
-        let mut renames: Vec<(String, String)> = vec![
-            (
-                self.relative_path(&part_path_old),
-                self.relative_path(&part_path_tmp),
-            ),
-            (
-                self.relative_path(&other_path_old),
-                self.relative_path(&part_path_new),
-            ),
-            (
-                self.relative_path(&part_path_tmp),
-                self.relative_path(&other_path_new),
-            ),
-            // LOB overflow sidecars — same three-step tmp swap as the heap.
-            (
-                self.relative_path(&part_lob_old),
-                self.relative_path(&part_lob_tmp),
-            ),
-            (
-                self.relative_path(&other_lob_old),
-                self.relative_path(&part_lob_new),
-            ),
-            (
-                self.relative_path(&part_lob_tmp),
-                self.relative_path(&other_lob_new),
-            ),
-            // Zone Map is derived but must move with the exact heap image;
-            // its manifest is keyed by storage id, which remains aligned
-            // after this same three-step content swap.
-            (
-                self.relative_path(&part_zm_old),
-                self.relative_path(&part_zm_tmp),
-            ),
-            (
-                self.relative_path(&other_zm_old),
-                self.relative_path(&part_zm_new),
-            ),
-            (
-                self.relative_path(&part_zm_tmp),
-                self.relative_path(&other_zm_new),
-            ),
-        ];
-        for (name, old) in &part_index_paths {
-            let tmp = old.with_extension("idx.exchange-tmp");
-            let new = self.index_path(partition_storage_id, name);
-            renames.push((self.relative_path(old), self.relative_path(&tmp)));
-            renames.push((self.relative_path(&tmp), self.relative_path(&new)));
-        }
-        for (name, old) in &other_index_paths {
-            let new = self.index_path(other_table.id, name);
-            renames.push((self.relative_path(old), self.relative_path(&new)));
-        }
-        // Both logical tables retain monotone allocation after acquiring
-        // rows (and possibly unused reservations) from the other side.
-        let auto_increment_floor = if other_table.auto_increment_column_index().is_some() {
-            self.auto_increment_state(table.id, 0)?
-                .max_value
-                .load(Ordering::Acquire)
-                .max(
-                    self.auto_increment_state(other_table.id, 0)?
-                        .max_value
-                        .load(Ordering::Acquire),
-                )
-        } else {
-            0
-        };
         let exchange_journal = PartitionExchangeJournal {
             table_id: table.id,
             part_idx,
@@ -14132,9 +14085,11 @@ impl Database {
             } else {
                 None
             },
-            renames,
+            renames: Vec::new(),
         };
         let journal_path = self.write_partition_exchange_journal(&exchange_journal)?;
+        #[cfg(test)]
+        self.exchange_test_point(1)?;
 
         // Durable commit point: persist the storage-id swap. After this
         // returns, recovery treats the swap as committed and will finish
@@ -14143,9 +14098,8 @@ impl Database {
         self.note_catalog_table(other_table.id);
         self.note_catalog_table(partition_storage_id);
         if table.indexes.iter().any(|index| index.is_fulltext()) {
-            let counter_txn = self.begin_txn()?;
-            let _counter_rollback = OnlineIndexTxnGuard { db: self, txn_id: counter_txn.txn_id };
-            let (new_table, new_other) = {
+            let counter_txn = publication_txn;
+            {
                 let mut catalog = self.catalog_write()?;
                 for name in [&key,&other_key] {
                     for index in Arc::make_mut(catalog.tables.get_mut(name).expect("EXCHANGE table"))
@@ -14153,16 +14107,23 @@ impl Database {
                         index.fulltext.as_mut().expect("FULLTEXT metadata").snapshot_origin_txn_id = counter_txn.txn_id;
                     }
                 }
-                (catalog.tables[&key].clone(), catalog.tables[&other_key].clone())
-            };
-            self.transfer_fulltext_statistics(counter_txn, &other_table, other_table.id,
-                &new_table, other_table.id)?;
-            self.transfer_fulltext_statistics(counter_txn, &table, partition_storage_id,
-                &new_other, partition_storage_id)?;
+            }
             self.commit_catalog_txn_existing(counter_txn)?;
         } else {
-            self.commit_ddl_catalog_txn()?;
+            self.commit_catalog_txn_existing(publication_txn)?;
         }
+        for id in [table.id, other_table.id, partition_storage_id] {
+            self.drop_table_modification_delta(id);
+        }
+        self.table_locks_sharded.set_schema_floor(table.id,
+            self.table(&key)?.schema_version);
+        self.primary_definition_highwater.fetch_max(self.visible_scn(), Ordering::Release);
+        self.table_locks_sharded.set_schema_floor(partition_storage_id,
+            self.table(&other_key)?.schema_version);
+        self.table_locks_sharded.set_schema_floor(other_table.id,
+            self.table(&key)?.schema_version);
+        #[cfg(test)]
+        self.exchange_test_point(2)?;
         if partition_reorg_crash_point().as_deref() == Some("exchange_after_catalog") {
             return Ok(());
         }
@@ -14180,13 +14141,6 @@ impl Database {
             return Ok(());
         }
 
-        // Catalog publication can reopen a summary handle. Drain those
-        // publishers once more and hold the exclusive gate through the
-        // renames and final handle retirement; no lookup may reopen an old
-        // owner path in the middle of this physical swap.
-        let _zone_swap = self.zone_map_backup_capture_guard()?;
-        self.flush_for_rename_zone_map(partition_storage_id)?;
-        self.flush_for_rename_zone_map(other_table.id)?;
         for (from, to) in &exchange_journal.renames {
             let from_abs = self.data_dir.join(from);
             let to_abs = self.data_dir.join(to);
@@ -14197,63 +14151,12 @@ impl Database {
                 rename_owned_file(&from_abs, &to_abs).map_err(io_err)?;
             }
         }
-        // Catalog mirroring can reopen handles between the first eviction and
-        // the rename. Drop them again so no reader retains an unlinked inode,
-        // then bind both exchanged heaps to their new owner codecs.
-        self.remove_heap_cache_entry(partition_storage_id)?;
-        self.remove_heap_cache_entry(other_table.id)?;
-        self.remove_overflow_cache_entry(partition_storage_id)?;
-        self.remove_overflow_cache_entry(other_table.id)?;
-        for index in &table.indexes {
-            self.remove_index_cache_entry(partition_storage_id, &index.name)?;
-            self.remove_index_cache_entry(other_table.id, &index.name)?;
-        }
         self.set_cached_heap_codec(other_table.id, table.row_codec.clone())?;
         self.set_cached_heap_codec(partition_storage_id, other_table.row_codec.clone())?;
-        // Cached ZoneMap paths include the pre-swap owner table name. Force
-        // the next lookup to reopen the sidecar at its post-swap path.
-        self.forget_zone_map(partition_storage_id)?;
-        self.forget_zone_map(other_table.id)?;
-        if self.config.durability == DurabilityMode::Memory {
-            // Derived summaries were not flushed in Memory mode. An absent
-            // summary is conservative; an old empty summary could hide rows.
-            for sid in [partition_storage_id, other_table.id] {
-                let path = self.zone_map_file_path(sid);
-                match fs::remove_file(&path) {
-                    Ok(()) => {},
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
-                    Err(error) => return Err(io_err(error)),
-                }
-            }
-        }
+        #[cfg(test)]
+        self.exchange_test_point(3)?;
         self.remove_partition_reorg_journal(&journal_path)?;
-        Ok(())
-    }
-
-    /// Bounded handoff of WAL-free heap, overflow and index pages before a
-    /// physical owner/path change. Ordinary Memory commits remain RAM-only.
-    fn materialize_exchange_memory_files(&self, sid: u64, table: &TableSchema) -> Result<(), QueryError> {
-        self.with_heap_read(sid, |heap| self.flush_temp_snapshot_pages(
-            &heap.path, heap.file_key.clone(), heap.page_count()?, None)).map_err(|error| {
-                let message = format!("EXCHANGE heap handoff {}: {error}", self.table_path(sid).display());
-                error.with_message(message)
-            })?;
-        if self.overflow_path(sid).exists() {
-            self.with_overflow_read(sid, |lob| self.flush_temp_snapshot_pages(
-                &lob.path, lob.file_key.clone(), lob.page_count, None))?;
-        }
-        for index in &table.indexes {
-            self.with_index_read(sid, &index.name, |index| {
-                if let Some(spatial) = &index.spatial {
-                    return self.flush_temp_snapshot_pages(&index.path, index.file_key.clone(), spatial.count_pages(), None);
-                }
-                let meta = index.meta_state.lock().meta.clone();
-                self.flush_temp_snapshot_pages(&index.path, index.file_key.clone(), meta.next_page_id, Some(encode_index_meta(&meta)))
-            }).map_err(|error| {
-                let message = format!("EXCHANGE index handoff {}: {error}", self.index_path(sid, &index.name).display());
-                error.with_message(message)
-            })?;
-        }
+        publication.finish();
         Ok(())
     }
 

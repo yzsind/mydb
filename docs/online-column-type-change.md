@@ -7,13 +7,13 @@ When changing a column type requires rewriting data, mydb by default uses a cons
 - Strict and non-strict SQL modes on Strict, Relaxed and Memory storage. No dependency on `MYDB_DDL_ASYNC`.
 - `MODIFY COLUMN` and `CHANGE COLUMN`, multiple columns changed in one statement, `FIRST` / `AFTER`, and character set conversion.
 - Regular tables, tables without a primary key, partitioned tables, and subpartitioned storage; partitions are re-routed using the converted values.
-- Existing regular/unique BTREE, HNSW and IVF indexes, nonpartitioned FULLTEXT indexes, and ordinary/partitioned SPATIAL indexes. Both in-memory and paged vector backends are supported.
-- Supported compound COPY plans can add columns and BTREE keys, drop columns or primary keys, replace a primary key, and add an AUTO_INCREMENT column with its supporting key. The complete candidate must satisfy key and dependency constraints.
+- Existing regular/unique BTREE, HNSW and IVF indexes, ordinary/partitioned FULLTEXT and SPATIAL indexes. Both in-memory and paged vector backends are supported.
+- Supported compound COPY plans can add columns and BTREE/FULLTEXT/SPATIAL/HNSW/IVF keys, drop columns or primary keys, replace a primary key, and add an AUTO_INCREMENT column with its supporting key. The complete candidate must satisfy key and dependency constraints.
 - Out-of-row data such as TEXT/BLOB is included. Conversion, generated columns, NOT NULL, CHECK, and index key computation reuse the existing general-purpose implementations; conversions or dependencies that were already unsupported still raise errors.
 
 `LOCK=DEFAULT` prefers the online path, and `LOCK=NONE` requires reads and writes to be allowed during the build; the final publication still needs a brief exclusive barrier. `LOCK=SHARED` keeps the semantics of blocking writes during the build, and `LOCK=EXCLUSIVE` uses the offline path. Supported physical column changes allow `ALGORITHM=COPY, LOCK=NONE`, which is a mydb extension.
 
-Writable COPY on partitioned FULLTEXT tables and COPY plans that simultaneously add special indexes remain outside this capability. Unsupported `LOCK=NONE` combinations return 1846. Non-strict conversion uses the same coercions as exclusive COPY and the normal bounded session diagnostics; warning totals can include conversions of multiple committed versions during replay. Newly added AUTO_INCREMENT values survive replay of the same mapped row, honor the session increment/offset, and advance the allocator highwater before publication. `MYDB_DDL_COPY_STREAMING=0` is a differential entry point only in test builds; production builds always use shadow COPY.
+Unsupported `LOCK=NONE` combinations return 1846. Non-strict conversion uses the same coercions as exclusive COPY and the normal bounded session diagnostics; warning totals can include conversions of multiple committed versions during replay. Newly added AUTO_INCREMENT values survive replay of the same mapped row, honor the session increment/offset, and advance the allocator highwater before publication. `MYDB_DDL_COPY_STREAMING=0` is a differential entry point only in test builds; production builds always use shadow COPY.
 
 ## Execution and Consistency
 

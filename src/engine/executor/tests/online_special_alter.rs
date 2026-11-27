@@ -467,7 +467,7 @@ fn special_alter_recovers_before_and_after_publication() {
 }
 
 #[test]
-fn special_alter_partitioned_spatial_replays_moves_and_rejects_partitioned_fulltext() {
+fn special_alter_partitioned_spatial_and_fulltext_replay_moves() {
     let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
     let engine = Arc::new(open_strict_test_engine(dir.path()));
     engine.execute("CREATE TABLE t(id INT PRIMARY KEY,n INT,g GEOMETRY NOT NULL,SPATIAL sp(g)) PARTITION BY HASH(id) PARTITIONS 4").unwrap();
@@ -496,16 +496,19 @@ fn special_alter_partitioned_spatial_replays_moves_and_rejects_partitioned_fullt
     );
     engine.execute("CREATE TABLE p(id INT PRIMARY KEY,n INT,body TEXT,FULLTEXT ft(body)) PARTITION BY HASH(id) PARTITIONS 2").unwrap();
     let old = engine.database().table("test.p").unwrap();
+    engine
+        .execute("INSERT INTO p VALUES(1,10,'quartz')")
+        .unwrap();
+    engine
+        .execute("ALTER TABLE p MODIFY n BIGINT, LOCK=NONE")
+        .unwrap();
+    assert!(engine.database().table("test.p").unwrap().schema_version > old.schema_version);
     assert_eq!(
-        engine
-            .execute("ALTER TABLE p MODIFY n BIGINT, LOCK=NONE")
-            .unwrap_err()
-            .code(),
-        1846
-    );
-    assert_eq!(
-        engine.database().table("test.p").unwrap().schema_version,
-        old.schema_version
+        rows(
+            &engine,
+            "SELECT id FROM p WHERE MATCH(body) AGAINST('quartz' IN BOOLEAN MODE)"
+        ),
+        vec![vec![Value::Int(1)]]
     );
     drop(engine);
     let engine = open_strict_test_engine(dir.path());

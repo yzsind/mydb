@@ -6104,6 +6104,7 @@ fn execute_table_maintenance_status(
                 if op == "check" {
                     let mut problems = db.check_table_lob_integrity(&schema);
                     problems.extend(db.check_table_index_integrity(&schema));
+                    crate::engine::cancel::check_cancelled()?;
                     if problems.is_empty() {
                         rows.push(vec![
                             Value::String(qualified),

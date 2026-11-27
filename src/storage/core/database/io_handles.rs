@@ -1364,6 +1364,7 @@ impl Database {
     /// (`flush_dirty_pages`, `discard_without_flush`). Takes the
     /// file-wide write lock so the DML readers above don't observe
     /// half-discarded state.
+    #[cfg(test)]
     fn with_heap_exclusive<T>(
         &self,
         table_id: u64,

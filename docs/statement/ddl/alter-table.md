@@ -50,6 +50,11 @@ Column add/modify/change accepts FIRST or AFTER column where valid. Index action
 | Supported encoding-compatible column domain checks | Validation without heap rebuild; restrictions in the behavior section apply |
 | Supported AUTO_INCREMENT additions, primary-key replacements and column COPY rewrites | Online COPY accepts LOCK=NONE within its documented scope; unsupported combinations fail explicitly |
 | Index-only FULLTEXT, SPATIAL, HNSW and IVF additions, including supported mixed-index batches | Online INPLACE; LOCK=NONE allows writes during private construction; brief writer barriers at prepare/publication |
+| Supported partition REBUILD, OPTIMIZE, REPAIR, TRUNCATE and row-moving reorganizations with BTREE, FULLTEXT, vector or SPATIAL indexes | DEFAULT / LOCK=NONE admits writes during private preparation; prepare/publication uses exclusive barriers. TRUNCATE removes all rows in the selected leaves at publication, including concurrent commits; writes to retained leaves survive |
+| EXCHANGE with supported BTREE/FULLTEXT/SPATIAL indexes | DEFAULT / LOCK=NONE permits both participants to write during snapshot preparation; changed inputs retry before atomic dual-table publication. Unsupported physical ownership transfers fail explicitly |
+| CHECK PARTITION with supported BTREE/FULLTEXT/SPATIAL indexes | DEFAULT / LOCK=NONE compares snapshot-visible heap rows and physical entries outside writer exclusion, retries changed inputs, and publishes check status behind a short barrier. Sustained changes return a clear retry error |
+| ANALYZE PARTITION | DEFAULT / LOCK=NONE permits concurrent writes under a pinned statistics snapshot; aligned global deltas refresh the population baseline without combining leaf counts from different snapshots; busy scans retain their baseline and live deltas |
+| Column COPY combined with FULLTEXT/SPATIAL/HNSW/IVF additions | Supported private-generation COPY plans accept LOCK=NONE, including partitioned FULLTEXT; the complete action list is validated before mutation |
 | Other mixed physical actions | Capability depends on the complete atomic plan; unsupported combinations return 1846 or an explicit unsupported error |
 | Requested SHARED / EXCLUSIVE | Requests the corresponding blocking behavior, even when an online path exists |
 

@@ -1000,6 +1000,7 @@ impl<'a> CatalogTxn<'a> {
         // Bind a fold/reset to its actual source transaction. Subsequent
         // histogram or DDL rewrites retain the marker and must not replay it.
         let mut generation_changes = HashSet::new();
+        let mut population_resets = HashSet::new();
         for replacement in &self.replacements {
             if replacement.dd_table_id != crate::storage::data_dictionary::DD_TABLES {
                 continue;
@@ -1012,6 +1013,13 @@ impl<'a> CatalogTxn<'a> {
                     replacement.dd_table_id,
                     CatalogRowSelector::PrimaryValues(vec![Value::UInt(*id)]),
                 )?;
+                if let Some(Value::String(json)) = row.get(18) {
+                    let options: crate::storage::schema::TableOptions =
+                        serde_json::from_str(json).map_err(|_| crate::storage::stats_codec::corrupt())?;
+                    if options.row_generation_txn_id == txn.txn_id {
+                        population_resets.insert(*id);
+                    }
+                }
                 if old.first().is_some_and(|old| old.get(19) != row.get(19)) {
                     generation_changes.insert(*id);
                 }
@@ -1043,6 +1051,10 @@ impl<'a> CatalogTxn<'a> {
                     replacement.dd_table_id,
                     CatalogRowSelector::PrimaryValues(vec![Value::UInt(id), Value::UInt(0)]),
                 )?;
+                if population_resets.contains(&id) {
+                    row[14] = Value::UInt(txn.txn_id);
+                    continue;
+                }
                 if let Some(old) = old.first() {
                     row[13] = if row[9] != old[9] && row[9] != Value::UInt(0) {
                         Value::UInt(txn.txn_id)

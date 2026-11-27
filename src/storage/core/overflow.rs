@@ -1188,6 +1188,7 @@ impl OverflowFile {
     /// chain walk the caller does by materializing live rows: this catches
     /// free-list / meta corruption that no live `LobRef` points at.
     /// Returns `Ok(())` for a table with no `.lob` yet.
+    #[cfg(test)]
     fn validate_structure(&self) -> Result<(), QueryError> {
         if self.page_count == 0 {
             return Ok(());
@@ -1203,7 +1204,35 @@ impl OverflowFile {
                 ),
             ));
         }
-        for pid in 0..self.page_count {
+        self.validate_page_range(0, self.page_count)
+    }
+
+    // Allocation advances generation; free-only and shrink operations change
+    // the remaining fields. A complete cycle cannot restore this stamp.
+    fn integrity_stamp(&self) -> (u64, u64, u64, u64) {
+        (self.next_generation, self.page_count, self.free_head, self.free_count)
+    }
+
+    fn validate_free_batch(&self, next: &mut u64, count: &mut u64) -> Result<(), QueryError> {
+        for _ in 0..32 {
+            if *next == 0 { break; }
+            crate::engine::cancel::check_cancelled()?;
+            if *next >= self.page_count || *count >= self.page_count {
+                return Err(error(crate::error::catalog::ER_GET_ERRNO,
+                    "corrupt overflow free list (cycle or out-of-range page)"));
+            }
+            self.validate_page_range(*next, *next + 1)?;
+            *next = self.buffer_pool.with_raw_page(self.page_key(*next), |page| {
+                Ok(read_u64(page, OVFL_OFF_NEXT))
+            })?;
+            *count += 1;
+        }
+        Ok(())
+    }
+
+    fn validate_page_range(&self, lo: u64, hi: u64) -> Result<(), QueryError> {
+        for pid in lo..hi {
+            crate::engine::cancel::check_cancelled()?;
             self.buffer_pool.with_raw_page(self.page_key(pid), |page| {
                 if page.len() != PAGE_SIZE
                     || read_u32(page, OVFL_OFF_MAGIC) != OVFL_MAGIC

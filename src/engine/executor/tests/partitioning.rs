@@ -3222,8 +3222,8 @@ fn partition_analyze_reconciles_live_delta_and_collects_joint_stats() {
         .execute("ANALYZE TABLE ps_fix PARTITION (p0)")
         .unwrap();
     let table = engine.database().table("test.ps_fix").unwrap();
-    assert_eq!(table.stats.row_count, 5);
-    assert_eq!(engine.database().table_live_row_delta(table.id), 1);
+    assert_eq!(table.stats.row_count, 6);
+    assert_eq!(engine.database().table_live_row_delta(table.id), 0);
     assert_eq!(partition_test_rows(&engine,
         "SELECT TABLE_ROWS FROM information_schema.TABLES WHERE TABLE_SCHEMA='test' AND TABLE_NAME='ps_fix'"),
         vec![vec![Value::Int(6)]]);
@@ -5222,9 +5222,10 @@ fn partition_ddl_range_columns_reorg_preserves_upper_bound() {
     engine
         .execute("ALTER TABLE t REBUILD PARTITION ALL, LOCK=NONE")
         .unwrap();
-    assert!(engine
+    engine
         .execute("ALTER TABLE t TRUNCATE PARTITION ALL, LOCK=NONE")
-        .is_err());
+        .unwrap();
+    assert!(partition_test_rows(&engine, "SELECT * FROM t").is_empty());
 }
 
 #[test]

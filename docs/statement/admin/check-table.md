@@ -16,6 +16,7 @@ Checks the implemented LOB and index consistency invariants for the named tables
 ## Behavior, Privileges, and Limitations
 
 - Returns `Table`, `Op`, `Msg_type`, and `Msg_text`. A clean table produces a status/OK row. Each detected problem produces an error row, so one table can produce multiple rows.
+- Index scans allow concurrent writes and retry when their mutation generation changes. After bounded retries, persistent write pressure produces an explicit error row; retry after writes subside. LOB structure uses bounded page-lock batches, and row/chain checks pin an MVCC snapshot.
 - mydb is a transactional MVCC engine; tables do not accumulate MyISAM-style repairable corruption. For severe damage, recover with replica rebuilds or PITR.
 - The listed trailing options are currently accepted without selecting different check algorithms or emitting option-specific warnings. Do not interpret QUICK/EXTENDED as guarantees of different verification depth.
 
