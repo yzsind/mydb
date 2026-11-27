@@ -5437,6 +5437,7 @@ impl Database {
     }
 
     pub fn drop_column(&self, table_name: &str, column_name: &str) -> Result<(), QueryError> {
+        #[cfg(test)]
         let _hold = DropColumnHoldTimer::start();
         let (database, table_only) = split_table_name(DEFAULT_DATABASE, table_name);
         check_table_ddl_writable(&database)?;

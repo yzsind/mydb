@@ -7,15 +7,15 @@
 #[cfg(test)]
 static DROP_COLUMN_LOCK_HOLD_US: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(test)]
 struct DropColumnHoldTimer {
-    #[cfg(test)]
     started: Instant,
 }
 
+#[cfg(test)]
 impl DropColumnHoldTimer {
     fn start() -> Self {
         Self {
-            #[cfg(test)]
             started: Instant::now(),
         }
     }
@@ -208,6 +208,7 @@ impl Database {
                     "ddl/drop-column/shared-build",
                 )?;
             }
+            #[cfg(test)]
             let prepare_hold = DropColumnHoldTimer::start();
             self.try_online_index_data_barrier_mode(txn.txn_id, &ids, true)?;
             job = Some(self.register_ddl_job_with_subject(
@@ -242,6 +243,7 @@ impl Database {
             }
             self.release_mdl_duration(owner, MdlDuration::Transaction);
             self.notify_non_row_lock_waiters();
+            #[cfg(test)]
             drop(prepare_hold);
             #[cfg(test)]
             self.pause_ddl_backfill_for_test();
@@ -283,6 +285,7 @@ impl Database {
                     hook.pause();
                 }
                 self.online_index_barrier(&source, owner, false)?;
+                #[cfg(test)]
                 let hold = DropColumnHoldTimer::start();
                 self.try_online_index_data_barrier(txn.txn_id, &ids)?;
                 // Never wait for an unrelated cleanup I/O while holding table X.
@@ -306,6 +309,7 @@ impl Database {
                     }
                     self.release_mdl_duration(owner, MdlDuration::Transaction);
                     self.notify_non_row_lock_waiters();
+                    #[cfg(test)]
                     drop(hold);
                     if attempt == 63 {
                         return Err(error(
