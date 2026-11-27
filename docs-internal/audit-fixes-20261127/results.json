@@ -1,0 +1,258 @@
+{
+  "baseline": "75fb742",
+  "branch": "codex/bugfix-20261127",
+  "mysql_reference": "8.0.46",
+  "environment": "local macOS ARM64, debug build",
+  "artifacts_root": "/tmp/mydb/audit-fixes",
+  "evidence": [
+    "reference.jsonl",
+    "before.jsonl",
+    "after-verified.jsonl",
+    "prepared-verified.json",
+    "prepared-invalid-qualifiers.jsonl",
+    "native-before2.json",
+    "native-final.json",
+    "perf-final.json",
+    "outbound-final.json",
+    "drift-before-after.jsonl",
+    "ddl-space-before-after.jsonl",
+    "edges-before-after.jsonl",
+    "until-before-after.log",
+    "repl-before.log",
+    "repl-verified.log",
+    "memory-exact-before.log",
+    "memory-probe-after.log",
+    "mixed-drop-before.log",
+    "mixed-drop-after.json",
+    "json-defaults.jsonl",
+    "comparison.json"
+  ],
+  "prepared_comparisons": 50,
+  "memory": {
+    "query_rows": 8000,
+    "result_rows": 32004000,
+    "fixed_seconds": [
+      46.487923375,
+      45.046558083
+    ],
+    "baseline_physical_used_bytes": 16499654136,
+    "fixed_target_mib": 256,
+    "fixed_query_mib": 32
+  },
+  "native_before": {
+    "replicas": [
+      {
+        "replica": 0,
+        "rows": null,
+        "capacity_rejections": 1,
+        "retry": false,
+        "exited": 1
+      },
+      {
+        "replica": 1,
+        "rows": null,
+        "capacity_rejections": 1,
+        "retry": false,
+        "exited": 1
+      },
+      {
+        "replica": 2,
+        "rows": [
+          60000
+        ],
+        "capacity_rejections": 0,
+        "retry": false,
+        "exited": null
+      },
+      {
+        "replica": 3,
+        "rows": null,
+        "capacity_rejections": 1,
+        "retry": false,
+        "exited": 1
+      }
+    ],
+    "max_commit_seconds": 0.5160333330000002,
+    "timeout_commits": 1,
+    "write_errors": []
+  },
+  "native_after": {
+    "replicas": [
+      {
+        "replica": 0,
+        "rows": [
+          60000
+        ],
+        "capacity_rejections": 1,
+        "retry": true,
+        "exited": null
+      },
+      {
+        "replica": 1,
+        "rows": [
+          60000
+        ],
+        "capacity_rejections": 0,
+        "retry": false,
+        "exited": null
+      },
+      {
+        "replica": 2,
+        "rows": [
+          60000
+        ],
+        "capacity_rejections": 2,
+        "retry": true,
+        "exited": null
+      },
+      {
+        "replica": 3,
+        "rows": [
+          60000
+        ],
+        "capacity_rejections": 3,
+        "retry": true,
+        "exited": null
+      }
+    ],
+    "max_commit_seconds": 0.10257145899999998,
+    "timeout_commits": 0,
+    "write_errors": [
+      "(1290, 'master writes are briefly frozen for base backup capture; retry after capture completes')",
+      "(1290, 'master writes are briefly frozen for base backup capture; retry after capture completes')"
+    ]
+  },
+  "outbound": {
+    "rows": [
+      {
+        "id": 1,
+        "e": "b",
+        "s": "y",
+        "b": "41420000"
+      },
+      {
+        "id": 2,
+        "e": "b",
+        "s": "x,y",
+        "b": "00FF0A0D"
+      }
+    ],
+    "status": {
+      "Replica_IO_Running": "Yes",
+      "Replica_SQL_Running": "Yes",
+      "Last_IO_Errno": 0,
+      "Last_SQL_Errno": 0,
+      "Last_SQL_Error": ""
+    }
+  },
+  "performance": {
+    "point": {
+      "samples": {
+        "14980": [
+          8.209341599999998e-05,
+          6.446541700000003e-05,
+          7.100929099999997e-05,
+          6.4553042e-05,
+          6.409675000000003e-05
+        ],
+        "14994": [
+          7.035029199999999e-05,
+          6.351625e-05,
+          6.442112499999997e-05,
+          6.520408300000003e-05,
+          6.451658399999993e-05
+        ]
+      },
+      "ratio": 0.9994352241370738
+    },
+    "update": {
+      "samples": {
+        "14980": [
+          0.00012527650000000002,
+          0.00010254574999999999,
+          0.00011189741600000014,
+          9.859641600000036e-05,
+          9.779491599999979e-05
+        ],
+        "14994": [
+          0.00010193108399999984,
+          0.00010978474999999976,
+          9.669349999999977e-05,
+          9.77928320000001e-05,
+          9.735216599999985e-05
+        ]
+      },
+      "ratio": 0.9536507558821318
+    },
+    "range_join": {
+      "samples": {
+        "14980": [
+          0.2589198749999999,
+          0.23142937500000005,
+          0.23188633299999983,
+          0.22830529199999994,
+          0.22966720799999996
+        ],
+        "14994": [
+          0.246004334,
+          0.23774670900000006,
+          0.2324965830000001,
+          0.232811667,
+          0.23155170800000002
+        ]
+      },
+      "ratio": 1.005972845927618
+    },
+    "duplicate_join": {
+      "samples": {
+        "14980": [
+          0.015348915999999768,
+          0.0025594170000000638,
+          0.002407708999999869,
+          0.002308708000000159,
+          0.0024484170000000915
+        ],
+        "14994": [
+          0.00438566699999976,
+          0.002452041999999821,
+          0.0024185830000003072,
+          0.0023119999999998697,
+          0.0023760839999997785
+        ]
+      },
+      "ratio": 0.9878149841306513
+    }
+  },
+  "verification": {
+    "focused": {
+      "run": 29,
+      "passed": 29,
+      "new": 21,
+      "existing": 8,
+      "log": "/tmp/mydb/audit-fixes/focused-settled.log"
+    },
+    "nextest": {
+      "run": 12843,
+      "passed": 12843,
+      "skipped": 64,
+      "seconds": 228.64,
+      "log": "/tmp/mydb/audit-fixes/full-nextest-settled.log"
+    },
+    "build": "passed",
+    "fmt": "passed",
+    "diff_check": "passed",
+    "cargo_run_help": "passed",
+    "mixed_drop_fault": {
+      "error": [
+        1026,
+        "Error writing file"
+      ],
+      "escaped_name_logged": true
+    }
+  },
+  "cleanup": {
+    "owned_test_processes_stopped": true,
+    "reserve_bytes_released": 8589934592,
+    "data_and_logs_preserved": true
+  }
+}

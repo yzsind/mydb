@@ -5786,16 +5786,45 @@ fn json_table_on_response(
         JsonTableOnResponse::Null => Ok(Value::Null),
         JsonTableOnResponse::Default(expr) => {
             let value = crate::engine::expr::eval_const(expr)?;
-            // DEFAULT is a JSON string literal in MySQL's grammar, not an SQL
-            // scalar to be wrapped. Parse it before applying column coercion.
-            let jsonb = match &value {
-                Value::String(s) | Value::Decimal(s) => {
-                    crate::engine::json::parse_text(s, 1, "json_table").unwrap_or_else(|_| {
-                        crate::engine::expr::value_to_jsonb_typed(&value, false)
-                    })
-                }
+            let mut jsonb = match &value {
+                Value::String(text) => crate::engine::json::parse_text(text, 1, "JSON_TABLE")?,
                 _ => crate::engine::expr::value_to_jsonb_typed(&value, false),
             };
+            let node = crate::engine::json::JsonbRef::new(&jsonb)?;
+            let text_target = matches!(
+                data_type,
+                crate::parser::DataType::Char(_)
+                    | crate::parser::DataType::VarChar(_)
+                    | crate::parser::DataType::Text(_)
+                    | crate::parser::DataType::Binary(_)
+                    | crate::parser::DataType::VarBinary(_)
+                    | crate::parser::DataType::Blob(_)
+                    | crate::parser::DataType::Enum(_)
+                    | crate::parser::DataType::Set(_)
+            );
+            if node.is_null() && !matches!(data_type, crate::parser::DataType::Json) && !text_target
+            {
+                if matches!(
+                    data_type,
+                    crate::parser::DataType::Date
+                        | crate::parser::DataType::Time { .. }
+                        | crate::parser::DataType::DateTime { .. }
+                        | crate::parser::DataType::Timestamp { .. }
+                ) {
+                    return Err(crate::error::catalog::ER_JT_VALUE_OUT_OF_RANGE
+                        .error("Invalid JSON null default for JSON_TABLE temporal column"));
+                }
+                return Err(crate::error::catalog::ER_INVALID_JSON_VALUE_FOR_CAST
+                    .error("Invalid JSON null default for JSON_TABLE numeric column"));
+            }
+            if text_target
+                && (node.is_null()
+                    || matches!(node.json_type(), crate::engine::json::JsonType::Boolean))
+            {
+                let mut text = String::new();
+                node.write_text(&mut text);
+                jsonb = crate::engine::expr::value_to_jsonb_typed(&Value::String(text), false);
+            }
             json_table_jsonb_to_value(&jsonb, data_type, unsigned)
         }
         JsonTableOnResponse::Error => Err(if let Some(err) = conversion_error {

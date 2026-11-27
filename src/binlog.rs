@@ -787,7 +787,7 @@ impl SemiSyncSource {
 /// file names share a base and a zero-padded numeric suffix; compare by that
 /// suffix (robust to a rollover in digit width) then by byte position. An empty
 /// file name (a replica that has never acked) sorts before any real position.
-fn binlog_pos_ge(a: (&str, u64), b: (&str, u64)) -> bool {
+pub(crate) fn binlog_pos_ge(a: (&str, u64), b: (&str, u64)) -> bool {
     binlog_pos_cmp(a, b) != std::cmp::Ordering::Less
 }
 
@@ -6043,7 +6043,14 @@ fn encode_table_map_payload(table: &BinlogTable) -> Vec<u8> {
     payload.push(0);
     write_lenenc_int(&mut payload, table.columns.len() as u64);
     for column in &table.columns {
-        payload.push(column.column_type);
+        // ENUM/SET have a STRING table-map type with the real type in metadata.
+        payload.push(
+            if matches!(column.column_type, MYSQL_TYPE_ENUM | MYSQL_TYPE_SET) {
+                MYSQL_TYPE_STRING
+            } else {
+                column.column_type
+            },
+        );
     }
     let mut metadata = Vec::new();
     for column in &table.columns {
@@ -9138,6 +9145,28 @@ mod tests {
 
         assert_eq!(row_events, 3);
         assert_eq!(decoded_images, 4);
+    }
+
+    #[test]
+    fn audit1127_enum_set_table_map_uses_string_wire_type() {
+        let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let engine = crate::engine::StorageQueryEngine::open(dir.path()).unwrap();
+        engine
+            .execute("CREATE TABLE enum_wire(e ENUM('a','b'),s SET('x','y'))")
+            .unwrap();
+        let table = engine
+            .database_for_replication()
+            .table("test.enum_wire")
+            .unwrap();
+        let wire = binlog_table_from_schema(&table).unwrap();
+        let payload = encode_table_map_payload(&wire);
+        let types_offset = 6 + 2 + 1 + wire.database.len() + 1 + 1 + wire.name.len() + 1 + 1;
+        assert_eq!(
+            &payload[types_offset..types_offset + 2],
+            &[MYSQL_TYPE_STRING, MYSQL_TYPE_STRING]
+        );
+        assert_eq!(wire.columns[0].metadata, vec![MYSQL_TYPE_ENUM, 1]);
+        assert_eq!(wire.columns[1].metadata, vec![MYSQL_TYPE_SET, 1]);
     }
 
     #[test]

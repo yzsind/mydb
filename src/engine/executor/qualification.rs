@@ -32,12 +32,82 @@ fn qualify_dml_source_name(session: &SessionContext, name: &str) -> String {
     }
 }
 
+fn validate_dml_expr_qualifiers(
+    expr: &Expr,
+    table: &str,
+    alias: Option<&str>,
+    proposed_alias: Option<&str>,
+    clause: &str,
+) -> Result<(), QueryError> {
+    struct Check<'a> {
+        table: &'a str,
+        alias: Option<&'a str>,
+        proposed: Option<&'a str>,
+        clause: &'a str,
+        result: Result<(), QueryError>,
+    }
+    impl crate::parser::visit::AstVisitor for Check<'_> {
+        fn walk_query_children(&self, _: &crate::parser::QueryExpr) -> bool {
+            false
+        }
+        fn walk_select_children(&self, _: &Select) -> bool {
+            false
+        }
+        fn continue_expr_walk(&self) -> bool {
+            self.result.is_ok()
+        }
+        fn enter_expr(&mut self, expr: &Expr) {
+            if let Expr::CompoundIdentifier(parts) = expr {
+                if parts.len() < 2 {
+                    return;
+                }
+                let qualifier = &parts[parts.len() - 2];
+                let (_, name) = split_table_name(DEFAULT_DATABASE, self.table);
+                let accepted = self
+                    .proposed
+                    .is_some_and(|a| a.eq_ignore_ascii_case(qualifier))
+                    || self.alias.map_or_else(
+                        || name.eq_ignore_ascii_case(qualifier),
+                        |a| a.eq_ignore_ascii_case(qualifier),
+                    );
+                if !accepted {
+                    self.result = Err(crate::error::catalog::ER_BAD_FIELD_ERROR.error(format!(
+                        "Unknown column '{}' in '{}'",
+                        parts.join("."),
+                        self.clause
+                    )));
+                }
+            }
+        }
+    }
+    let mut check = Check {
+        table,
+        alias,
+        proposed: proposed_alias,
+        clause,
+        result: Ok(()),
+    };
+    crate::parser::visit::visit_expr(&mut check, expr);
+    check.result
+}
+
 pub(super) fn qualify_statement_tables<'q>(
     db: &Database,
     session: &SessionContext,
     statement: impl Into<crate::parser::QueryMut<'q>>,
 ) -> Result<(), QueryError> {
     let statement = statement.into();
+    crate::util::stack::with_stack(
+        crate::engine::executor::mem_budget::ControlledMemoryCategory::ParserTransient,
+        || qualify_statement_tables_inner(db, session, statement),
+    )?
+}
+
+fn qualify_statement_tables_inner(
+    db: &Database,
+    session: &SessionContext,
+    statement: crate::parser::QueryMut<'_>,
+) -> Result<(), QueryError> {
     match statement {
         crate::parser::QueryMut::Other(Statement::RowSecurity(command)) => {
             use crate::parser::rls::RlsStatement;
@@ -66,6 +136,17 @@ pub(super) fn qualify_statement_tables<'q>(
             }
             if let Some(assignments) = &mut stmt.on_duplicate_key_update {
                 for assignment in assignments {
+                    // INSERT SELECT binds source references through its SELECT
+                    // scope before executing ODKU. VALUES has no source scope.
+                    if matches!(stmt.source, InsertSource::Values(_)) {
+                        validate_dml_expr_qualifiers(
+                            &assignment.value,
+                            &stmt.table,
+                            stmt.target_alias.as_deref(),
+                            stmt.insert_alias.as_ref().map(|a| a.row_alias.as_str()),
+                            "field list",
+                        )?;
+                    }
                     qualify_expr_tables(db, session, &mut assignment.value)?;
                 }
             }
@@ -95,6 +176,30 @@ pub(super) fn qualify_statement_tables<'q>(
                     qualify_expr_tables(db, session, condition)?;
                 }
             }
+            if stmt.joins.is_empty() {
+                for assignment in &stmt.assignments {
+                    validate_dml_expr_qualifiers(
+                        &assignment.value,
+                        &stmt.table,
+                        stmt.primary_alias.as_deref(),
+                        None,
+                        "field list",
+                    )?;
+                }
+                for expr in stmt
+                    .selection
+                    .iter()
+                    .chain(stmt.order_by.iter().map(|o| &o.expr))
+                {
+                    validate_dml_expr_qualifiers(
+                        expr,
+                        &stmt.table,
+                        stmt.primary_alias.as_deref(),
+                        None,
+                        "where clause",
+                    )?;
+                }
+            }
             for assignment in &mut stmt.assignments {
                 qualify_expr_tables(db, session, &mut assignment.value)?;
             }
@@ -107,6 +212,21 @@ pub(super) fn qualify_statement_tables<'q>(
         }
         crate::parser::QueryMut::Other(Statement::Delete(stmt)) => {
             stmt.table = qualify_dml_source_name(session, &stmt.table);
+            if stmt.joins.is_empty() {
+                for expr in stmt
+                    .selection
+                    .iter()
+                    .chain(stmt.order_by.iter().map(|o| &o.expr))
+                {
+                    validate_dml_expr_qualifiers(
+                        expr,
+                        &stmt.table,
+                        stmt.primary_alias.as_deref(),
+                        None,
+                        "where clause",
+                    )?;
+                }
+            }
             for join in &mut stmt.joins {
                 if let Some(query) = &mut join.derived {
                     qualify_statement_tables(db, session, query)?;

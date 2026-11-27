@@ -1,0 +1,60 @@
+{"id": "setup", "sql": "DROP DATABASE IF EXISTS `auditfix1127:a`", "rows": [], "affected": 1}
+{"id": "setup", "sql": "DROP DATABASE IF EXISTS auditfix1127", "rows": [], "affected": 9}
+{"id": "setup", "sql": "CREATE DATABASE auditfix1127", "rows": [], "affected": 1}
+{"id": "setup", "sql": "USE auditfix1127", "rows": [], "affected": 0}
+{"id": "version", "sql": "SELECT VERSION()", "rows": [["8.0.46-mydb-1.0.3-20261127"]], "affected": 1}
+{"id": "J1", "sql": "SELECT JSON_SET('{\"a\":1}', '$.a[0]', 9),JSON_REPLACE('{\"a\":1}', '$.a[last-1]', 9),JSON_INSERT('{\"a\":1}', '$.a[last-1]', 9)", "rows": [["{\"a\": 9}", "{\"a\": 1}", "{\"a\": [9, 1]}"]], "affected": 1}
+{"id": "J2", "sql": "SELECT JSON_REMOVE('{\"a\":1}', '$.a[0]'),JSON_REMOVE('1', '$[0]')", "rows": [["{}", "1"]], "affected": 1}
+{"id": "J3", "sql": "SELECT JSON_ARRAY_INSERT('{\"a\":1}', '$.a[0]', 0)", "rows": [["{\"a\": 1}"]], "affected": 1}
+{"id": "J4", "sql": "SELECT JSON_EXTRACT('null','$') IS NULL,IFNULL(JSON_EXTRACT('null','$'),'d'),COALESCE(JSON_EXTRACT('null','$'),'d')", "rows": [[0, "null", "null"]], "affected": 1}
+{"id": "J8", "sql": "SELECT JSON_VALUE('{\"a\":[1,2]}', '$.a[*]')", "rows": [[null]], "affected": 1}
+{"id": "J8", "sql": "SELECT JSON_SEARCH('{\"a\":{\"b\":\"xx\"}}', 'one', 'xx', NULL, '$**.b')", "rows": [["\"$.a.b\""]], "affected": 1}
+{"id": "J9", "sql": "SELECT JSON_QUOTE(123)", "error": [3064, "Incorrect type for argument 1 in function JSON_QUOTE"]}
+{"id": "J10", "sql": "SELECT JSON_UNQUOTE('\"a\"b\"')", "error": [3141, "Invalid JSON text in argument 1 to function json_unquote: trailing characters at line 1 column 4"]}
+{"id": "J11", "sql": "SELECT JSON_VALUE('abc', '$')", "rows": [[null]], "affected": 1}
+{"id": "J12", "sql": "SELECT JSON_VALUE('2.5', '$' RETURNING SIGNED),CAST(JSON_EXTRACT('[2.5]', '$[0]') AS SIGNED)", "rows": [[2, 2]], "affected": 1}
+{"id": "J13", "sql": "SELECT JSON_VALID(123),JSON_VALID(1.5),JSON_VALID(TRUE)", "rows": [[0, 0, 0]], "affected": 1}
+{"id": "J5", "sql": "CREATE TABLE mvo(id INT PRIMARY KEY,j JSON,KEY mv((CAST(j->'$.x' AS UNSIGNED ARRAY))))", "rows": [], "affected": 0}
+{"id": "J5", "sql": "INSERT INTO mvo VALUES(1,'{\"x\":{\"a\":1}}')", "error": [1235, "CAST-ing JSON OBJECT type to array is not supported"]}
+{"id": "J6", "sql": "CREATE TABLE mvc(id INT PRIMARY KEY,j JSON,KEY mv((CAST(j AS CHAR(64) ARRAY))))", "rows": [], "affected": 0}
+{"id": "J6", "sql": "INSERT INTO mvc VALUES(1,'[\"a\"]'),(2,'[\"b\"]')", "rows": [], "affected": 2}
+{"id": "J6", "sql": "PREPARE p FROM 'SELECT id FROM mvc WHERE ? MEMBER OF(j)'", "rows": [], "affected": 0}
+{"id": "J6", "sql": "SET @p='a'", "rows": [], "affected": 0}
+{"id": "J6", "sql": "EXECUTE p USING @p", "rows": [[1]], "affected": 1}
+{"id": "J6", "sql": "SELECT id FROM mvc WHERE 'a' MEMBER OF(j)", "rows": [[1]], "affected": 1}
+{"id": "J7", "sql": "CREATE TABLE mvp(id INT PRIMARY KEY,vc VARCHAR(10),j JSON,KEY mv(vc,(CAST(j AS UNSIGNED ARRAY))))", "rows": [], "affected": 0}
+{"id": "J7", "sql": "INSERT INTO mvp VALUES(1,'01','[7]'),(2,'1','[7]')", "rows": [], "affected": 2}
+{"id": "J7", "sql": "SELECT id FROM mvp WHERE vc=1 AND 7 MEMBER OF(j) ORDER BY id", "rows": [[1], [2]], "affected": 2}
+{"id": "T1", "sql": "CREATE TABLE g1(id INT PRIMARY KEY AUTO_INCREMENT,a INT,b INT AS(a*2) STORED)", "rows": [], "affected": 0}
+{"id": "T1", "sql": "CREATE TRIGGER g1_bi BEFORE INSERT ON g1 FOR EACH ROW SET NEW.b=99", "rows": [], "affected": 0}
+{"id": "T1", "sql": "INSERT INTO g1(a) VALUES(2)", "rows": [], "affected": 1}
+{"id": "T1", "sql": "SELECT * FROM g1", "rows": [[1, 2, 4]], "affected": 1}
+{"id": "T7", "sql": "CREATE TABLE mb(id INT PRIMARY KEY,x INT)", "rows": [], "affected": 0}
+{"id": "T7", "sql": "INSERT INTO mb VALUES(1,10),(2,20),(3,30)", "rows": [], "affected": 3}
+{"id": "T7", "sql": "CREATE VIEW vm AS SELECT * FROM mb WHERE x>0 WITH CASCADED CHECK OPTION", "rows": [], "affected": 0}
+{"id": "T7", "sql": "UPDATE IGNORE vm SET x=x-15", "rows": [], "affected": 2}
+{"id": "T7", "sql": "SHOW WARNINGS", "rows": [["Warning", 1369, "CHECK OPTION failed for view"]], "affected": 1}
+{"id": "T7", "sql": "SELECT * FROM mb ORDER BY id", "rows": [[1, 10], [2, 5], [3, 15]], "affected": 3}
+{"id": "T7", "sql": "INSERT IGNORE INTO vm VALUES(2,99) ON DUPLICATE KEY UPDATE x=x-15", "rows": [], "affected": 0}
+{"id": "T7", "sql": "SHOW WARNINGS", "rows": [["Warning", 1369, "CHECK OPTION failed for view"]], "affected": 1}
+{"id": "T7", "sql": "SELECT * FROM mb ORDER BY id", "rows": [[1, 10], [2, 5], [3, 15]], "affected": 3}
+{"id": "T9", "sql": "CREATE TABLE od(id INT PRIMARY KEY,v INT)", "rows": [], "affected": 0}
+{"id": "T9", "sql": "INSERT INTO od VALUES(1,10)", "rows": [], "affected": 1}
+{"id": "T9", "sql": "INSERT INTO od VALUES(1,20) ON DUPLICATE KEY UPDATE v=NEW.v+1", "error": [1054, "Unknown column 'NEW.v' in 'field list'"]}
+{"id": "T9", "sql": "UPDATE od SET v=NEW.v WHERE id=1", "error": [1054, "Unknown column 'NEW.v' in 'field list'"]}
+{"id": "T9", "sql": "DELETE FROM od WHERE v=OLD.v", "error": [1054, "Unknown column 'OLD.v' in 'where clause'"]}
+{"id": "T12", "sql": "CREATE TABLE t1(a INT PRIMARY KEY)", "rows": [], "affected": 0}
+{"id": "T12", "sql": "CREATE TABLE t2(a INT PRIMARY KEY)", "rows": [], "affected": 0}
+{"id": "T12", "sql": "INSERT INTO t1 VALUES(1),(2)", "rows": [], "affected": 2}
+{"id": "T12", "sql": "INSERT INTO t2 VALUES(1)", "rows": [], "affected": 1}
+{"id": "T12", "sql": "CREATE VIEW vj AS SELECT t1.a FROM t1 JOIN t2 ON t1.a=t2.a WITH CASCADED CHECK OPTION", "error": [1235, "CHECK OPTION on join views is not supported"]}
+{"id": "T12", "sql": "UPDATE vj SET a=-5 WHERE a=1", "error": [1146, "Table 'auditfix1127.vj' doesn't exist"]}
+{"id": "T12", "sql": "SELECT * FROM t1 ORDER BY a", "rows": [[1], [2]], "affected": 2}
+{"id": "T13", "sql": "CREATE DATABASE `auditfix1127:a`", "rows": [], "affected": 1}
+{"id": "T13", "sql": "CREATE TABLE `auditfix1127:a`.t(i INT)", "rows": [], "affected": 0}
+{"id": "T13", "sql": "CREATE TABLE t(i INT)", "rows": [], "affected": 0}
+{"id": "T13", "sql": "CREATE TRIGGER `auditfix1127:a`.b BEFORE INSERT ON `auditfix1127:a`.t FOR EACH ROW SET @c1=1", "rows": [], "affected": 0}
+{"id": "T13", "sql": "CREATE TRIGGER `a:b` BEFORE INSERT ON t FOR EACH ROW SET @c2=2", "rows": [], "affected": 0}
+{"id": "T13", "sql": "DROP TRIGGER `a:b`", "rows": [], "affected": 0}
+{"id": "T13", "sql": "SELECT TRIGGER_SCHEMA,TRIGGER_NAME FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA='auditfix1127:a'", "rows": [["auditfix1127:a", "b"]], "affected": 1}
+{"id": "DEV8", "sql": "SELECT * FROM JSON_TABLE('{}', '$' COLUMNS(v VARCHAR(20) PATH '$.v' DEFAULT 'null' ON EMPTY)) jt", "rows": [["null"]], "affected": 1}

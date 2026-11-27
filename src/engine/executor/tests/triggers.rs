@@ -797,10 +797,10 @@ fn foreign_definer_trigger_requires_set_user_id() {
     .unwrap();
 }
 
-// ── B4 — generated columns readable in OLD/NEW, assignment rejected ──────────
+// ── B4 — generated columns readable in OLD/NEW, BEFORE writes ignored ────────
 
 #[test]
-fn generated_column_visible_in_trigger_and_assignment_rejected() {
+fn generated_column_visible_in_trigger_and_before_assignment_ignored() {
     let dir = tempfile::tempdir().unwrap();
     let engine = open_test_engine(dir.path());
     let mut session = SessionContext::default();
@@ -841,15 +841,20 @@ fn generated_column_visible_in_trigger_and_assignment_rejected() {
     };
     assert_eq!(rs.rows, vec![vec![Value::Int(10), Value::Int(20)]]);
 
-    // Assigning a generated NEW column is rejected with 3105.
+    // BEFORE assignment is ignored and the generated value is recomputed.
     exec(
         &engine,
         &mut session,
         "CREATE TRIGGER bad BEFORE INSERT ON t FOR EACH ROW SET NEW.g = 99",
     )
     .unwrap();
-    let err = exec(&engine, &mut session, "INSERT INTO t (id, b) VALUES (2, 3)").unwrap_err();
-    assert_eq!(err.code(), 3105);
+    exec(&engine, &mut session, "INSERT INTO t (id, b) VALUES (2, 3)").unwrap();
+    let QueryResponse::ResultSet(rs) =
+        exec(&engine, &mut session, "SELECT g FROM t WHERE id=2").unwrap()
+    else {
+        panic!("expected result set");
+    };
+    assert_eq!(rs.rows, vec![vec![Value::Int(6)]]);
 }
 
 // ── C2 — triggers fire on partitioned tables ─────────────────────────────────

@@ -160,7 +160,7 @@ where
     /// from `self.nodes` by swap_remove, which means the entry that was
     /// at `nodes.len() - 1` now sits at the tail's old index — update the
     /// map and its neighbours to keep the linked list intact.
-    fn pop_tail(&mut self) -> Option<(K, V)> {
+    pub(super) fn pop_tail(&mut self) -> Option<(K, V)> {
         let tail = self.tail;
         if tail == NIL {
             return None;

@@ -681,40 +681,6 @@ where
                 ).await;
                 return Ok(());
             }
-            new = new_lsn_rx.changed() => {
-                if new.is_err() {
-                    // master gone — graceful close
-                    return Ok(());
-                }
-                last_known_lsn = *new_lsn_rx.borrow_and_update();
-            }
-            durable = durable_rx.changed() => {
-                if durable.is_err() {
-                    return Ok(());
-                }
-                durable_lsn = *durable_rx.borrow_and_update();
-            }
-            _ = heartbeat.tick() => {
-                if last_inbound.elapsed() >= peer_timeout {
-                    return Err(io_err(std::io::Error::new(std::io::ErrorKind::TimedOut,
-                        "replica sent no complete frame before peer timeout")));
-                }
-                let source = source_wire_state(&env);
-                let msg = Message::Heartbeat(Heartbeat {
-                    master_lsn: last_known_lsn,
-                    durable_lsn,
-                    master_time_ms: now_ms(),
-                    timeline_uuid: source.timeline_uuid,
-                    generation: source.generation,
-                    source_frozen: source.frozen,
-                    fence_lsn: source.fence_lsn,
-                    fence_token_hash: source.fence_token_hash,
-                });
-                if let Err(err) = protocol::write_frame_async(&mut writer, &msg).await {
-                    return Err(io_err(err));
-                }
-                writer.flush().await.map_err(io_err)?;
-            }
             message = &mut inbound => {
                 // Re-arm only after a complete frame. Other select branches
                 // must never discard bytes already consumed by read_exact.
@@ -774,6 +740,41 @@ where
                     Err(err) => return Err(io_err(err)),
                 }
             }
+            new = new_lsn_rx.changed() => {
+                if new.is_err() {
+                    // master gone — graceful close
+                    return Ok(());
+                }
+                last_known_lsn = *new_lsn_rx.borrow_and_update();
+            }
+            durable = durable_rx.changed() => {
+                if durable.is_err() {
+                    return Ok(());
+                }
+                durable_lsn = *durable_rx.borrow_and_update();
+            }
+            _ = heartbeat.tick() => {
+                if last_inbound.elapsed() >= peer_timeout {
+                    return Err(io_err(std::io::Error::new(std::io::ErrorKind::TimedOut,
+                        "replica sent no complete frame before peer timeout")));
+                }
+                let source = source_wire_state(&env);
+                let msg = Message::Heartbeat(Heartbeat {
+                    master_lsn: last_known_lsn,
+                    durable_lsn,
+                    master_time_ms: now_ms(),
+                    timeline_uuid: source.timeline_uuid,
+                    generation: source.generation,
+                    source_frozen: source.frozen,
+                    fence_lsn: source.fence_lsn,
+                    fence_token_hash: source.fence_token_hash,
+                });
+                if let Err(err) = protocol::write_frame_async(&mut writer, &msg).await {
+                    return Err(io_err(err));
+                }
+                writer.flush().await.map_err(io_err)?;
+            }
+
         }
     }
 }

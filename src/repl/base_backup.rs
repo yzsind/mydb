@@ -994,6 +994,12 @@ pub(crate) async fn perform_base_backup_into_with_config(
         Err(err) => return Err(io_err(err)),
     };
     if !ack.accepted {
+        if ack.reason == "base backup concurrency limit reached" {
+            return Err(error(
+                crate::error::catalog::MYDB_ER_BASE_BACKUP_FAILED,
+                format!("base backup temporarily unavailable: {}", ack.reason),
+            ));
+        }
         return Err(QueryError::internal_control(
             crate::error::InternalErrorKind::ReplicaHandshakeRejected,
             crate::error::catalog::ER_NOT_SUPPORTED_YET,
@@ -2007,4 +2013,62 @@ async fn audit1125_authentication_close_is_not_a_retryable_io_error() {
     server.await.unwrap();
     assert!(error.is_internal(crate::error::InternalErrorKind::ReplicaHandshakeRejected));
     assert!(error.message().contains("authentication failed"));
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn audit1127_backup_capacity_rejection_is_retryable() {
+    for (reason, permanent) in [
+        ("base backup concurrency limit reached", false),
+        ("base backup is unavailable on this source", true),
+        ("cluster UUID mismatch", true),
+        ("physical format mismatch", true),
+    ] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            protocol::read_frame_async(&mut socket).await.unwrap();
+            protocol::write_frame_async(
+                &mut socket,
+                &Message::HandshakeAck(HandshakeAck {
+                    heartbeat_ms: 100,
+                    master_uuid: [0; 16],
+                    current_lsn: 1,
+                    durable_lsn: 1,
+                    min_available_lsn: 1,
+                    epoch: 1,
+                    server_version: "test".into(),
+                    accepted: false,
+                    reason: reason.into(),
+                    format_compatibility: String::new(),
+                    semi_sync_required: false,
+                    cluster_uuid: [0; 16],
+                    timeline_uuid: [0; 16],
+                    generation: 1,
+                    source_frozen: false,
+                    fence_lsn: 0,
+                    fence_token_hash: String::new(),
+                }),
+            )
+            .await
+            .unwrap();
+        });
+        let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let err = perform_base_backup_into_with_config(
+            "127.0.0.1",
+            port,
+            &crate::repl::role::generate_uuid_string(),
+            dir.path(),
+            crate::repl::config::ReplConfig::test_defaults(),
+        )
+        .await
+        .unwrap_err();
+        server.await.unwrap();
+        assert_eq!(
+            err.is_internal(crate::error::InternalErrorKind::ReplicaHandshakeRejected),
+            permanent,
+            "{reason}: {err}"
+        );
+    }
 }

@@ -1,0 +1,12 @@
+0 result ((32004000,),) 46.487923374999994
+SELECT 1 ((1,),)
+BEGIN []
+UPDATE m SET v=v+1 WHERE id=1 []
+ROLLBACK []
+SELECT v FROM m WHERE id=1 ((1,),)
+1 result ((32004000,),) 45.046558083
+SELECT 1 ((1,),)
+BEGIN []
+UPDATE m SET v=v+1 WHERE id=1 []
+ROLLBACK []
+SELECT v FROM m WHERE id=1 ((1,),)

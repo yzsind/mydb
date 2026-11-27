@@ -2896,7 +2896,7 @@ fn execute_insert_rows_with_ids<const TRIGGERS: bool>(
                             // The conflict vanished while waiting; retry INSERT.
                             continue;
                         };
-                        let (changed, updated_id) = apply_insert_duplicate::<TRIGGERS>(
+                        let result = apply_insert_duplicate::<TRIGGERS>(
                             db,
                             &mut hooks,
                             txn,
@@ -2908,7 +2908,19 @@ fn execute_insert_rows_with_ids<const TRIGGERS: bool>(
                             view_check_predicate,
                             needs_image,
                             &mut returning,
-                        )?;
+                        );
+                        let (changed, updated_id) = match result {
+                            Ok(result) => result,
+                            Err(err)
+                                if ignore
+                                    && err.is(crate::error::catalog::ER_VIEW_CHECK_FAILED) =>
+                            {
+                                record_ignore_warning(db, &err);
+                                unchanged_duplicates += 1;
+                                continue 'source;
+                            }
+                            Err(err) => return Err(err),
+                        };
                         if changed {
                             ids.last_updated = updated_id;
                         }
