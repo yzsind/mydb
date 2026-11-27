@@ -830,7 +830,7 @@ impl Database {
             #[cfg(test)]
             vector_persist_failure: AtomicU64::new(0),
             vector_pending_wal: parking_lot::Mutex::new(BTreeMap::new()),
-            vector_copy_publications: parking_lot::Mutex::new(HashSet::new()),
+            vector_ddl_publications: parking_lot::Mutex::new(HashSet::new()),
             replica_vector_state: parking_lot::Mutex::new(ReplicaVectorState::default()),
             replica_vector_signal: parking_lot::Condvar::new(),
             vector_retired_graphs: parking_lot::Mutex::new(HashMap::new()),

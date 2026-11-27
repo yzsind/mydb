@@ -445,3 +445,26 @@ BFLOAT16, INT8, and BINARY storage values are exported as their exactly
 representable FLOAT32 coordinates; this does not change stored payloads.
 Use `VECTOR_TO_STRING(value)` for readable SQL-client output, or
 `VECTOR_TO_BINARY(value)` when the native storage payload is required.
+
+## Online index creation
+
+`CREATE INDEX ... USING HNSW` and `USING IVF`, and ALTER statements
+that only add indexes, allow concurrent DML by default and with `LOCK=NONE`.
+This applies to partition-local graphs, supported vector datatypes,
+quantization configurations and partial predicates. A vector column must
+still have a fixed dimension and be NOT NULL.
+
+Preparation and publication use short writer barriers. Heap scanning, graph
+construction, initial image persistence and most committed-change replay run
+outside those barriers. The candidate graph remains private until publication;
+queries continue using the existing indexes or a heap scan. Initial images
+and subsequent candidate replacements are recoverable, and candidate tails
+share the Public catalog transaction's commit decision. A cancelled or failed
+build leaves committed source rows intact and removes its private structures.
+New cosine-index restrictions are validated against the visible build cohort and committed changes, and become business-write constraints only after publication. The initiating statement waits for publication or reports an error.
+
+`LOCK=SHARED` permits readers and excludes writers throughout construction;
+`LOCK=EXCLUSIVE` retains exclusive access. Online construction adds capture
+and replay work while a build is active, so reduced writer exclusion does not
+guarantee lower total DDL elapsed time. Sustained changes that exceed the
+bounded capture or final-tail budget cause the build to fail explicitly.

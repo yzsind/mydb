@@ -623,3 +623,5 @@ mod issues_101_105;
 mod issues_87_99;
 
 mod prepared_numeric;
+
+mod vector_online_ddl;

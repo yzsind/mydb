@@ -1200,7 +1200,8 @@ pub struct Database {
     #[cfg(test)]
     vector_persist_failure: AtomicU64,
     vector_pending_wal: parking_lot::Mutex<BTreeMap<u64, u64>>,
-    vector_copy_publications: parking_lot::Mutex<HashSet<u64>>,
+    /// Private COPY / ADD INDEX tails remain pinned through catalog publication.
+    vector_ddl_publications: parking_lot::Mutex<HashSet<u64>>,
     replica_vector_state: parking_lot::Mutex<ReplicaVectorState>,
     replica_vector_signal: parking_lot::Condvar,
     vector_retired_graphs: parking_lot::Mutex<HashMap<PathBuf, std::sync::Weak<VectorGraph>>>,
@@ -4689,6 +4690,7 @@ include!("core/database/vector_index_paths.rs");
 include!("core/database/ddl.rs");
 include!("core/database/online_drop_column.rs");
 include!("core/database/online_index.rs");
+include!("core/database/online_vector.rs");
 include!("core/database/online_constraints.rs");
 include!("core/database/constraint_index_merge.rs");
 include!("core/database/constraint_baseline.rs");

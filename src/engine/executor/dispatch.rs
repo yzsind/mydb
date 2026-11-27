@@ -9587,7 +9587,7 @@ pub(super) fn execute_qualified_statement(
             {
                 return Err(error(
                     crate::error::catalog::ER_ALTER_OPERATION_NOT_SUPPORTED_REASON,
-                    "LOCK=NONE/SHARED requires a BTREE, FULLTEXT or SPATIAL index",
+                    "LOCK=NONE/SHARED requires a BTREE, FULLTEXT, SPATIAL, HNSW or IVF index",
                 ));
             }
             if is_session_temp_table_ref(session, &stmt.table) {

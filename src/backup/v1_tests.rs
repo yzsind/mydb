@@ -2660,3 +2660,121 @@ fn audit1123_budget_patch_requires_an_existing_repository_binding() {
     assert!(c.control.lock().unwrap().is_none());
     discard_source(source, c);
 }
+
+#[test]
+fn vector_online_ddl_base_and_pitr_preserve_private_image_and_tail() {
+    struct Environment(Vec<(&'static str, Option<String>)>);
+    impl Drop for Environment {
+        fn drop(&mut self) {
+            for (key, old) in &self.0 {
+                if let Some(old) = old {
+                    std::env::set_var(key, old);
+                } else {
+                    std::env::remove_var(key);
+                }
+            }
+        }
+    }
+    let _environment = Environment(
+        [
+            ("MYDB_VECTOR_STORAGE", "memory"),
+            ("MYDB_HNSW_COMPACT_DISABLE", "1"),
+            ("MYDB_HNSW_BRUTE_THRESHOLD", "0"),
+        ]
+        .into_iter()
+        .map(|(key, value)| {
+            let old = std::env::var(key).ok();
+            std::env::set_var(key, value);
+            (key, old)
+        })
+        .collect(),
+    );
+    for backend in ["memory", "paged"] {
+        std::env::set_var("MYDB_VECTOR_STORAGE", backend);
+        for algo in ["HNSW", "IVF"] {
+            let root = root();
+            let source = Arc::new(engine(&root.path().join("source")));
+            source
+                .execute("CREATE TABLE vector_live(id INT PRIMARY KEY,v VECTOR(2) NOT NULL)")
+                .unwrap();
+            source
+                .execute("INSERT INTO vector_live VALUES(1,'[1,1]'),(2,'[2,2]')")
+                .unwrap();
+            let coordinator = Coordinator::get(source.db_handle()).unwrap();
+            let repository = root.path().join("repository");
+            coordinator
+                .configure(&repository, Policy::Manual, false, None)
+                .unwrap();
+            let base = job(&coordinator, coordinator.backup(&repository).unwrap())
+                .base_id
+                .unwrap();
+            let hook = source
+                .db_handle()
+                .install_online_index_validation_test_hook();
+            let worker = source.clone();
+            let ddl = std::thread::spawn(move || {
+                let mut s = crate::engine::SessionContext::default();
+                s.connection_id = 33081;
+                worker.execute_with_session(
+                    &mut s,
+                    &format!("CREATE INDEX ix ON vector_live(v) USING {algo} LOCK=NONE"),
+                )
+            });
+            let reached = hook.wait_until_reached(Duration::from_secs(10));
+            let writes = (|| -> Result<(), QueryError> {
+                source.execute("UPDATE vector_live SET v='[9,9]' WHERE id=1")?;
+                source.execute("DELETE FROM vector_live WHERE id=2")?;
+                source.execute("INSERT INTO vector_live VALUES(3,'[0,0]')")?;
+                source.db_handle().checkpoint()
+            })();
+            hook.release();
+            let result = ddl.join().unwrap();
+            assert!(reached, "{result:?}");
+            writes.unwrap();
+            result.unwrap();
+            let sql="SELECT /*+ HNSW_EF(64) IVF_NPROBE(64) */ id FROM vector_live FORCE INDEX(ix) ORDER BY L2_DISTANCE(v,'[0,0]') LIMIT 2";
+            let expected = vec![vec![Value::Int(3)], vec![Value::Int(1)]];
+            assert_eq!(rows(&source, sql), expected);
+            let scans = crate::storage::Database::vector_build_heap_scans_for_test();
+            let receipt = job(&coordinator, coordinator.backup_wal(&repository).unwrap());
+            let target = root.path().join("pitr");
+            super::restore::restore(
+                &repository,
+                Some(&base),
+                None,
+                Target::Lsn(receipt.requested_lsn),
+                &target,
+                None,
+                false,
+            )
+            .unwrap();
+            let restored = engine(&target);
+            assert_eq!(rows(&restored, sql), expected, "PITR {backend}/{algo}");
+            restored.shutdown().unwrap();
+            drop(restored);
+            let latest = job(&coordinator, coordinator.backup(&repository).unwrap())
+                .base_id
+                .unwrap();
+            let runtime = root.path().join("runtime");
+            let reader = super::open_base(&repository, &latest, &runtime).unwrap();
+            let immutable = StorageQueryEngine::open_backup_image(
+                reader.data_dir.clone(),
+                runtime,
+                Default::default(),
+                Arc::new(crate::engine::session_registry::SessionRegistry::new()),
+                vec![],
+            )
+            .unwrap();
+            assert_eq!(rows(&immutable, sql), expected, "sealed {backend}/{algo}");
+            immutable.shutdown().unwrap();
+            assert_eq!(
+                crate::storage::Database::vector_build_heap_scans_for_test(),
+                scans,
+                "recovery must use the graph image and journal: {backend}/{algo}"
+            );
+            coordinator.shutdown().unwrap();
+            drop(coordinator);
+            drop(source);
+        }
+    }
+}

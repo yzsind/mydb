@@ -345,6 +345,9 @@ impl Database {
         kind.eq_ignore_ascii_case("BTREE")
             || kind.eq_ignore_ascii_case("FULLTEXT")
             || kind.eq_ignore_ascii_case("SPATIAL")
+            || kind.eq_ignore_ascii_case("HNSW")
+            || kind.eq_ignore_ascii_case("VECTOR")
+            || kind.eq_ignore_ascii_case("IVF")
     }
 
     pub(crate) fn add_indexes_for_sql(
@@ -387,7 +390,7 @@ impl Database {
         {
             return Err(error(
                 crate::error::catalog::ER_NOT_SUPPORTED_YET,
-                "online index build requires BTREE, FULLTEXT or SPATIAL indexes",
+                "online index build requires BTREE, FULLTEXT, SPATIAL, HNSW or IVF indexes",
             ));
         }
         let source = self.table(table_name)?;
@@ -414,7 +417,13 @@ impl Database {
         let _barrier_guard = OnlineIndexMdlGuard { db: self, owner };
         self.online_index_barrier_mode(&source, owner, false, barrier_mode)?;
         let prepare_timer = OnlineIndexTimer(&ONLINE_INDEX_PREPARE_US, Instant::now());
-        let ddl_txn = self.begin_read_only_txn()?;
+        // Vector candidates journal their tail and Public metadata in this
+        // transaction. A read-only slot would skip CommitTxn WAL entirely.
+        let ddl_txn = if indexes.iter().any(IndexSchema::is_vector) {
+            self.begin_txn()?
+        } else {
+            self.begin_read_only_txn()?
+        };
         let _txn_guard = OnlineIndexTxnGuard {
             db: self,
             txn_id: ddl_txn.txn_id,
@@ -426,6 +435,8 @@ impl Database {
         let mut prepared_version = source.schema_version;
         let mut names = Vec::new();
         let mut targets = Vec::new();
+        let mut vector_builds = Vec::new();
+        let mut vector_wal = None;
         let key = table_key(&source.database, &source.name);
         let mut publication_started = false;
         let subjects = indexes
@@ -439,20 +450,11 @@ impl Database {
         Self::set_alter_copy_job_state(&job, "INDEX_BUILD");
         let result: Result<(), QueryError> = (|| {
             let prepared = (|| {
-                self.try_online_index_data_barrier_mode(
-                    ddl_txn.txn_id,
-                    &lock_ids,
-                    read_compatible,
-                )?;
+                self.try_online_index_data_barrier_mode(ddl_txn.txn_id, &lock_ids, read_compatible)?;
                 self.pin_online_index_descriptor(&source)?;
                 for index in indexes {
-                    let (_, table, name) = self.prepare_index_build(
-                        table_name,
-                        index,
-                        Some(ddl_txn.txn_id),
-                        true,
-                        true,
-                    )?;
+                    let (_, table, name) =
+                        self.prepare_index_build(table_name, index, Some(ddl_txn.txn_id), true, true)?;
                     names.push(name.clone());
                     let mut index = table
                         .indexes
@@ -513,10 +515,31 @@ impl Database {
             // Source writers are drained. The allocation frontier covers all
             // committed source rows even if another table holds back visible_scn.
             let statistics_view = TxnView {
-                snapshot_scn: self.next_scn_atomic.load(Ordering::Acquire).saturating_sub(1),
+                snapshot_scn: self
+                    .next_scn_atomic
+                    .load(Ordering::Acquire)
+                    .saturating_sub(1),
                 ..ddl_txn
             };
             let prepared_schema = self.table(table_name)?;
+            for index in prepared_schema
+                .indexes
+                .iter()
+                .filter(|i| i.is_vector() && names.contains(&i.name))
+            {
+                if vector_wal.is_none() {
+                    vector_wal = Some(OnlineVectorWalGuard::begin(self, ddl_txn.txn_id));
+                }
+                for storage_id in prepared_schema.storage_ids() {
+                    vector_builds.push(PrivateVectorIndexBuild::new(
+                        self,
+                        prepared_schema.clone(),
+                        index.clone(),
+                        storage_id,
+                        ddl_txn.txn_id,
+                    ));
+                }
+            }
             for id in &lock_ids {
                 self.table_locks_sharded
                     .set_schema_floor(*id, prepared_version);
@@ -542,7 +565,14 @@ impl Database {
             // The snapshot keeps undo and deleted slots alive during scanning
             // and replay; writers still use their ordinary IX/row locks.
             self.build_online_index_targets(&mut targets, options)?;
+            for candidate in &mut vector_builds {
+                candidate.build()?;
+            }
             self.build_online_fulltext_statistics(&source, &prepared_schema, &names, statistics_view)?;
+            #[cfg(test)]
+            if vector_wal.is_some() {
+                self.test_vector_crash_point(21, self.log_state_atomics.next_lsn().saturating_sub(1))?;
+            }
             if let Ok(mut progress) = job.progress.lock() {
                 progress.total_rows = Some(progress.copied_rows);
             }
@@ -569,15 +599,24 @@ impl Database {
             for attempt in 0..64 {
                 crate::engine::cancel::check_cancelled()?;
                 self.replay_online_index_targets(&mut targets, true)?;
+                for candidate in &mut vector_builds {
+                    candidate.replay()?;
+                    candidate.flush()?;
+                }
                 for target in &targets {
                     target.file.as_ref().unwrap().flush()?;
                 }
+                #[cfg(test)]
+                if !vector_builds.is_empty() {
+                    let hook = VECTOR_BUILD_BEFORE_PUBLISH_HOOK.lock().take();
+                    if let Some(hook) = hook { hook(); }
+                }
                 self.online_index_barrier_mode(&source, owner, false, barrier_mode)?;
-                self.try_online_index_data_barrier_mode(
-                    ddl_txn.txn_id,
-                    &lock_ids,
-                    read_compatible,
-                )?;
+                // Admission checks and retry windows also exclude writers.
+                // Count them alongside the final cutover, without counting
+                // the outside replay/training between barrier attempts.
+                let _admission_timer = OnlineIndexTimer(&ONLINE_INDEX_PUBLISH_US, Instant::now());
+                self.try_online_index_data_barrier_mode(ddl_txn.txn_id, &lock_ids, read_compatible)?;
                 let pending: usize = targets
                     .iter()
                     .map(|t| t.log.state.lock().entries.len())
@@ -586,10 +625,37 @@ impl Database {
                     .iter()
                     .map(|t| t.log.state.lock().charge.bytes())
                     .sum();
-                if pending <= 4096 && pending_bytes <= 1024 * 1024 {
-                    ONLINE_INDEX_TAIL_ENTRIES_PEAK.fetch_max(pending as u64, Ordering::Relaxed);
-                    ONLINE_INDEX_TAIL_BYTES_PEAK.fetch_max(pending_bytes as u64, Ordering::Relaxed);
-                    break;
+                let vector_pending =
+                    vector_builds
+                        .iter()
+                        .try_fold((0usize, 0usize), |(rows, bytes), c| {
+                            let (r, b) = c.pending()?;
+                            Ok::<_, QueryError>((rows.saturating_add(r), bytes.saturating_add(b)))
+                        })?;
+                // ANN replacements can relink neighbours and train a pending
+                // model. Give them a smaller final budget than scalar keys.
+                if pending.saturating_add(vector_pending.0) <= 4096
+                    && pending_bytes.saturating_add(vector_pending.1) <= 1024 * 1024
+                    && vector_pending.0 <= 64
+                    && vector_pending.1 <= 256 * 1024
+                {
+                    ONLINE_INDEX_TAIL_ENTRIES_PEAK.fetch_max(
+                        pending.saturating_add(vector_pending.0) as u64,
+                        Ordering::Relaxed,
+                    );
+                    ONLINE_INDEX_TAIL_BYTES_PEAK.fetch_max(
+                        pending_bytes.saturating_add(vector_pending.1) as u64,
+                        Ordering::Relaxed,
+                    );
+                    // First-model training may revisit the whole raw graph.
+                    // Release the source barrier and train in the next outside
+                    // catch-up iteration, even when this tail itself is small.
+                    let training = vector_builds.iter().try_fold(false, |needed, c| {
+                        Ok::<_, QueryError>(needed || c.needs_model_training()?)
+                    })?;
+                    if !training { break; }
+                    #[cfg(test)]
+                    ONLINE_VECTOR_MODEL_RETRIES.fetch_add(1, Ordering::Relaxed);
                 }
                 for id in &lock_ids {
                     self.table_locks_sharded
@@ -604,14 +670,18 @@ impl Database {
                     ));
                 }
             }
+            #[cfg(test)]
+            if vector_wal.is_some() {
+                self.test_vector_crash_point(22, self.log_state_atomics.next_lsn().saturating_sub(1))?;
+            }
             let publish_timer = OnlineIndexTimer(&ONLINE_INDEX_PUBLISH_US, Instant::now());
             let published = (|| {
-                self.try_online_index_data_barrier_mode(
-                    ddl_txn.txn_id,
-                    &lock_ids,
-                    read_compatible,
-                )?;
+                self.try_online_index_data_barrier_mode(ddl_txn.txn_id, &lock_ids, read_compatible)?;
                 self.replay_online_index_targets(&mut targets, true)?;
+                for candidate in &mut vector_builds {
+                    candidate.replay()?;
+                    candidate.flush_pages()?;
+                }
                 for target in &targets {
                     target.file.as_ref().unwrap().flush()?;
                 }
@@ -661,6 +731,16 @@ impl Database {
                         (target.table.id, normalize_name(name)),
                         Arc::new(parking_lot::RwLock::new(file)),
                     );
+                }
+                // Candidates stay private until source commits (including ANN
+                // completion) have drained. Install and dirty-mark together
+                // against checkpoint capture; the WAL guard retains all tails.
+                if !vector_builds.is_empty() {
+                    let _checkpoint = self.vector_purge_snapshot_gate.read();
+                    let mut map = self.vector_indexes.write();
+                    for candidate in &mut vector_builds {
+                        candidate.publish(&mut map)?;
+                    }
                 }
                 // Once publication starts, an ambiguous catalog I/O error
                 // must not delete the flushed tree: recovery can see Public.
@@ -721,8 +801,7 @@ impl Database {
                             col.nullable = false;
                             col.not_null_from_scn = readable_from_scn;
                         }
-                        table.primary_publication_job_id =
-                            PRIMARY_PUBLICATION_JOB_TAG | ddl_txn.txn_id;
+                        table.primary_publication_job_id = PRIMARY_PUBLICATION_JOB_TAG | ddl_txn.txn_id;
                         table.primary_definition_scn = self.visible_scn();
                         self.primary_definition_highwater
                             .fetch_max(table.primary_definition_scn, Ordering::Release);
@@ -740,7 +819,23 @@ impl Database {
                 }
                 self.refresh_heap_codec(source.id)?;
                 self.note_catalog_table(source.id);
-                self.commit_ddl_catalog_txn()?;
+                if vector_wal.is_some() {
+                    // The baseline is already durable. Logical candidate tails
+                    // and Public metadata share this single commit decision.
+                    #[cfg(test)]
+                    self.test_vector_crash_point(
+                        23,
+                        self.log_state_atomics.next_lsn().saturating_sub(1),
+                    )?;
+                    self.commit_catalog_txn_existing(ddl_txn)?;
+                    #[cfg(test)]
+                    self.test_vector_crash_point(
+                        24,
+                        self.log_state_atomics.next_lsn().saturating_sub(1),
+                    )?;
+                } else {
+                    self.commit_ddl_catalog_txn()?;
+                }
                 Ok(())
             })();
             drop(publish_timer);
@@ -765,8 +860,7 @@ impl Database {
         if result.is_err() && !publication_started && !names.is_empty() {
             // Cleanup is a separate correctness operation, not another part
             // of the cancelled/OOM statement. It still uses governed memory.
-            let _cancel =
-                crate::engine::cancel::enter(crate::engine::cancel::QueryCancelToken::noop());
+            let _cancel = crate::engine::cancel::enter(crate::engine::cancel::QueryCancelToken::noop());
             let _deadline = crate::engine::cancel::install_statement_deadline(Duration::ZERO);
             let cleanup = crate::engine::executor::mem_budget::with_query_budget(
                 Arc::new(crate::engine::executor::mem_budget::MemBudget::new(
@@ -791,6 +885,7 @@ impl Database {
                         for target in &mut targets {
                             target.file.take();
                         }
+                        vector_builds.clear();
                         self.discard_online_index_candidates(table_name, &names)
                     })
                 },
@@ -812,7 +907,9 @@ impl Database {
         let result = result.map_err(|err| {
             if err.is(crate::error::catalog::ER_QUERY_INTERRUPTED) {
                 Self::check_alter_copy_cancelled(&job).err().unwrap_or(err)
-            } else { err }
+            } else {
+                err
+            }
         });
         self.unregister_alter_copy_job(source.id, result.as_ref().err());
         result
@@ -840,6 +937,17 @@ impl Database {
                     crate::error::catalog::ER_GET_ERRNO,
                     "refusing to discard a published index",
                 ));
+            }
+            if index.is_vector() {
+                self.evict_vector_graphs(schema.storage_ids().into_iter().map(|id| (
+                    schema.id, id, schema.active_generation.max(1), normalize_name(&index.name)
+                )).collect());
+                for id in schema.storage_ids() {
+                    for path in self.owned_vector_files(&schema, index, id)? {
+                        self.buffer_pool.discard_pages_for_path(&path)?;
+                        self.delete_logged_file(txn_id_for_ddl(), path)?;
+                    }
+                }
             }
             for id in &storage_ids {
                 let path = self.index_path(*id, &index.name);

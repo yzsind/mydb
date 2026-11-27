@@ -4723,9 +4723,7 @@ impl Database {
             return sorter.finish_with_degree(self.data_dir(), degree);
         }
         let key = IndexKey::from(vec![KeyPart::Null]);
-        let cosine = index.is_some_and(|i| {
-            i.vector_meta_for_table(table).metric_enum() == vector::Metric::Cosine
-        });
+        let cosine = index.is_some_and(|i| self.vector_registry_requires_cosine_validation(table, i));
         let columns = if cosine {
             vec![table.column_index(&index.unwrap().columns[0])?]
         } else {
@@ -4971,6 +4969,7 @@ impl Database {
         scratch_bytes: usize,
     ) -> Result<SortedIndexEntries, QueryError> {
         let data_dir = self.data_dir();
+        let validate_cosine = self.vector_registry_requires_cosine_validation(table, index);
         let mut sorter = IndexEntryExternalSorter::with_exact_run_bytes(scratch_bytes);
         self.with_heap_read(table.id, |heap| {
             heap.scan_mvcc_columns_direct_until(
@@ -4978,8 +4977,7 @@ impl Database {
                 |row| {
                     if !row.header.is_deleted() {
                         let keys = table.index_keys(index, row.values)?;
-                        if !keys.is_empty() && index.is_vector()
-                            && index.vector_meta_for_table(table).metric_enum() == vector::Metric::Cosine {
+                        if !keys.is_empty() && validate_cosine {
                             let col = table.column_index(&index.columns[0])?;
                             if matches!(row.values.get(col), Some(Value::Vector(value)) if vector::distance::typed_is_zero(value)) {
                                 return Err(vector::vector_err("COSINE indexes reject existing zero vectors"));

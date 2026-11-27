@@ -940,6 +940,85 @@ mod online_apply {
     }
 
     #[tokio::test]
+    async fn vector_online_ddl_replica_applies_private_base_and_committed_tail() {
+        struct Environment(Option<String>);
+        impl Drop for Environment {
+            fn drop(&mut self) {
+                if let Some(old) = &self.0 {
+                    std::env::set_var("MYDB_VECTOR_STORAGE", old);
+                } else {
+                    std::env::remove_var("MYDB_VECTOR_STORAGE");
+                }
+            }
+        }
+        let _environment = Environment(std::env::var("MYDB_VECTOR_STORAGE").ok());
+        for backend in ["memory", "paged"] {
+            std::env::set_var("MYDB_VECTOR_STORAGE", backend);
+            let (source, _source_dir, service) = build_master_engine().await;
+            let (replica, _replica_dir, mut lifecycle, _status) =
+                spawn_replica(service.bind_addr()).await;
+            for algo in ["HNSW", "IVF"] {
+                let writer = source.clone();
+                tokio::task::spawn_blocking(move || {
+                    writer
+                        .execute("CREATE TABLE vector_live(id INT PRIMARY KEY,v VECTOR(2) NOT NULL)")
+                        .unwrap();
+                    writer
+                        .execute("INSERT INTO vector_live VALUES(1,'[1,1]'),(2,'[2,2]')")
+                        .unwrap();
+                })
+                .await
+                .unwrap();
+                let hook = source
+                    .database_for_replication()
+                    .install_online_index_validation_test_hook();
+                let writer = source.clone();
+                let ddl = tokio::task::spawn_blocking(move || {
+                    let mut session = crate::engine::SessionContext::default();
+                    session.connection_id = 33071;
+                    writer.execute_with_session(
+                        &mut session,
+                        &format!("CREATE INDEX ix ON vector_live(v) USING {algo} LOCK=NONE"),
+                    )
+                });
+                let wait = hook.clone();
+                let reached = tokio::task::spawn_blocking(move || {
+                    wait.wait_until_reached(Duration::from_secs(10))
+                })
+                .await
+                .unwrap();
+                let writer = source.clone();
+                let writes = tokio::task::spawn_blocking(move || {
+                    writer.execute("UPDATE vector_live SET v='[9,9]' WHERE id=1")?;
+                    writer.execute("DELETE FROM vector_live WHERE id=2")?;
+                    writer.execute("INSERT INTO vector_live VALUES(3,'[0,0]')")?;
+                    writer.database_for_replication().checkpoint()
+                })
+                .await
+                .unwrap();
+                hook.release();
+                let result = ddl.await.unwrap();
+                assert!(reached, "{result:?}");
+                writes.unwrap();
+                result.unwrap();
+                let expected = vec![vec![Value::Int(3)], vec![Value::Int(1)]];
+                let query = "SELECT /*+ HNSW_EF(64) IVF_NPROBE(64) */ id FROM vector_live FORCE INDEX(ix) ORDER BY L2_DISTANCE(v,'[0,0]') LIMIT 2";
+                assert_eq!(
+                    poll_select_exact(&replica, query, &expected, 10000).await,
+                    expected,
+                    "{backend}/{algo}"
+                );
+                let writer = source.clone();
+                tokio::task::spawn_blocking(move || writer.execute("DROP TABLE vector_live").unwrap())
+                    .await
+                    .unwrap();
+            }
+            lifecycle.stop_and_wait().await;
+            service.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
     async fn online_primary_key_publication_materializes_before_replica_reads() {
         let (source, _source_dir, service) = build_master_engine().await;
         let (replica, _replica_dir, mut lifecycle, _status) =
@@ -1440,6 +1519,9 @@ mod online_apply {
     #[tokio::test]
     async fn physical_replica_index_retirement_reuses_names_without_local_wal() {
         let (source, _source_dir, service) = build_master_engine().await;
+        // Keep source authority pending until the explicit drain below.
+        // Otherwise legitimate source cleanup WAL can race this assertion.
+        source.database_for_replication().set_catalog_retirement_waker(|| {});
         let (replica, _replica_dir, mut lifecycle, _status) =
             spawn_replica(service.bind_addr()).await;
         let writer = source.clone();

@@ -2372,6 +2372,11 @@ impl HnswIndex {
         self.set_background_quant(true);
     }
 
+    #[cfg(test)]
+    pub(crate) fn background_quant_for_test(&self) -> bool {
+        self.quant_async.load(Ordering::Acquire)
+    }
+
     pub(crate) fn set_background_quant(&self, active: bool) {
         self.quant_async.store(active, Ordering::Release);
     }

@@ -223,7 +223,7 @@ fn validate_row_domain_constraints(table: &TableSchema, values: &[Value]) -> Res
 
 fn validate_cosine_index_rows(table: &TableSchema, values: &[Value], generated_ready: bool) -> Result<(), QueryError> {
     for index in table.indexes.iter().filter(|index| {
-        index.is_vector()
+        index.is_vector() && index.state == crate::storage::IndexState::Public
             && index.vector_meta().metric_enum() == crate::engine::vector::Metric::Cosine
     }) {
         if let Some(predicate) = &index.predicate {

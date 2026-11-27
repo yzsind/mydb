@@ -8892,7 +8892,7 @@ impl Database {
                     graph,
                 );
             }
-            self.vector_copy_publications.lock().remove(&ddl_txn_id);
+            self.vector_ddl_publications.lock().remove(&ddl_txn_id);
             self.vector_pending_wal.lock().remove(&ddl_txn_id);
             self.table_locks_sharded
                 .set_schema_floor(old_table.id, candidate.schema_version);
@@ -12051,10 +12051,13 @@ impl Database {
         // build. Use the existing table-X-lock direct bulk builder instead.
         // This compatibility storage entry point retains the incremental
         // Building -> Public opt-in for its remaining callers. Standalone
-        // secondary BTREE SQL instead uses add_indexes_for_sql: it bulk-loads
+        // index-only SQL instead uses add_indexes_for_sql: it bulk-loads
         // a private target while capturing DML, independent of this switch.
         // PRIMARY and non-opt-in callers here keep the offline bulk path.
-        if index.primary || !self.async_ddl_enabled() {
+        // This compatibility API has no statement SU owner. Vector callers
+        // retain its protected offline path; SQL uses the private writable
+        // candidate protocol in add_indexes_for_sql.
+        if index.primary || index.is_vector() || !self.async_ddl_enabled() {
             return self.add_index_offline_bulk_with_options(table_name, index, options);
         }
         // MySQL DDL completion is synchronous from the issuing connection's
