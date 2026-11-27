@@ -1124,6 +1124,157 @@ mod online_apply {
     }
 
     #[tokio::test]
+    async fn physical_replica_fulltext_retirement_drop_scopes_follow_authority() {
+        for operation in ["index", "table"] {
+            let (source, _source_dir, service) = build_master_engine().await;
+            source
+                .database_for_replication()
+                .set_catalog_retirement_waker(|| {});
+            source
+                .database_for_replication()
+                .set_recyclebin_variable("mydb_recyclebin", 0)
+                .unwrap();
+            let (replica, _replica_dir, mut lifecycle, _status) =
+                spawn_replica(service.bind_addr()).await;
+            let writer = source.clone();
+            tokio::task::spawn_blocking(move || {
+                writer.execute("CREATE TABLE ft_drop(id INT PRIMARY KEY,body TEXT,FULLTEXT ft(body))").unwrap();
+                writer.execute("INSERT INTO ft_drop SELECT n,CONCAT(IF(MOD(n,2)=0,'quartz ','amber '),'item',n) FROM generate_series(1,800) s(n)").unwrap();
+            }).await.unwrap();
+            let old = source
+                .database_for_replication()
+                .table("test.ft_drop")
+                .unwrap();
+            let count_sql = "SELECT COUNT(*) FROM ft_drop WHERE MATCH(body) AGAINST('quartz')";
+            assert_eq!(
+                poll_select_exact(&replica, count_sql, &[vec![Value::Int(400)]], 5000).await,
+                vec![vec![Value::Int(400)]]
+            );
+            let writer = source.clone();
+            tokio::task::spawn_blocking(move || {
+                if operation == "index" {
+                    writer.execute("DROP INDEX ft ON ft_drop").unwrap();
+                    writer.execute("CREATE FULLTEXT INDEX ft ON ft_drop(body)").unwrap();
+                    writer.execute("INSERT INTO ft_drop VALUES(9000,'quartz surviving')").unwrap();
+                } else {
+                    writer.execute("DROP TABLE ft_drop").unwrap();
+                    writer.execute("CREATE TABLE ft_drop(id INT PRIMARY KEY,body TEXT,FULLTEXT ft(body))").unwrap();
+                    writer.execute("INSERT INTO ft_drop VALUES(1,'quartz new'),(2,'amber new'),(3,'quartz surviving')").unwrap();
+                }
+            }).await.unwrap();
+            let expected = vec![vec![Value::Int(if operation == "index" { 401 } else { 2 })]];
+            assert_eq!(
+                poll_select_exact(&replica, count_sql, &expected, 5000).await,
+                expected
+            );
+            let db = replica.database_for_replication().clone();
+            let source_log = source.database_for_replication().wal_log();
+            tokio::task::spawn_blocking(move || {
+                let count_old = || {
+                    let schema = crate::storage::data_dictionary::dd_table_schema(
+                        crate::storage::data_dictionary::DD_FULLTEXT_COUNTERS,
+                    )
+                    .unwrap();
+                    let view = db.begin_read_only_txn().unwrap();
+                    let rows = db
+                        .prefix_index_entries_visible(
+                            &schema,
+                            &schema.indexes[0],
+                            crate::storage::IndexKey::from(vec![
+                                crate::storage::KeyPart::UInt(old.id),
+                                crate::storage::KeyPart::UInt(old.active_generation),
+                                crate::storage::KeyPart::UInt(
+                                    old.indexes[1].fulltext.as_ref().unwrap().corpus_id,
+                                ),
+                            ]),
+                            view,
+                        )
+                        .unwrap()
+                        .len();
+                    db.rollback_txn(view.txn_id).unwrap();
+                    rows
+                };
+                let counters = count_old();
+                assert!(counters > 256);
+                let manifests = db.catalog_retirement_count_for_test();
+                assert!(manifests >= 2);
+                let before = db.wal_log().lock().last_lsn();
+                db.maintain_catalog_retirements_until(|| false).unwrap();
+                assert_eq!(
+                    count_old(),
+                    counters,
+                    "replica must not retire authority counters"
+                );
+                assert_eq!(db.catalog_retirement_count_for_test(), manifests);
+                let after = db.wal_log().lock().last_lsn();
+                if after > before {
+                    let mut received =
+                        crate::wal::WalReader::open(&db.wal_log(), before + 1).unwrap();
+                    let mut source = crate::wal::WalReader::open(&source_log, before + 1).unwrap();
+                    while let Some(chunk) = received.next_chunk(after, 1 << 20).unwrap() {
+                        let expected = source
+                            .next_chunk(chunk.end_lsn, chunk.bytes.len())
+                            .unwrap()
+                            .unwrap();
+                        assert_eq!(
+                            chunk.bytes, expected.bytes,
+                            "replica generated divergent cleanup WAL"
+                        );
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            let replica_epoch = replica
+                .database_for_replication()
+                .catalog_publication_epoch();
+            let writer = source.clone();
+            tokio::task::spawn_blocking(move || {
+                for _ in 0..32 {
+                    if writer
+                        .database_for_replication()
+                        .catalog_retirement_count_for_test()
+                        == 0
+                    {
+                        return;
+                    }
+                    writer
+                        .database_for_replication()
+                        .maintain_catalog_retirements_until(|| false)
+                        .unwrap();
+                }
+                panic!("source retirement did not drain");
+            })
+            .await
+            .unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while replica
+                .database_for_replication()
+                .catalog_retirement_count_for_test()
+                != 0
+            {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "replica did not consume retirement WAL"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert_eq!(
+                poll_select_exact(&replica, count_sql, &expected, 5000).await,
+                expected
+            );
+            assert_eq!(
+                replica
+                    .database_for_replication()
+                    .catalog_publication_epoch(),
+                replica_epoch
+            );
+            lifecycle.stop_and_wait().await;
+            service.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
     async fn physical_replica_online_special_alter_preserves_derivatives() {
         let (source, _source_dir, service) = build_master_engine().await;
         // Keep authority cleanup pending until the replica has demonstrated

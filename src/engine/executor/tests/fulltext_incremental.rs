@@ -698,6 +698,23 @@ fn fulltext_incremental_failed_build_identity_reuse_reinitializes_corpus() {
                 crate::storage::data_dictionary::DD_FULLTEXT_COUNTERS,
             )
             .unwrap();
+            // Even an unpublished build's orphan corpus must be retired
+            // without requiring a public FULLTEXT descriptor at DROP time.
+            assert!(!db
+                .prefix_index_entries_visible(
+                    &counters,
+                    &counters.indexes[0],
+                    crate::storage::IndexKey::from(vec![crate::storage::KeyPart::UInt(id)]),
+                    current(&e),
+                )
+                .unwrap()
+                .is_empty());
+            for _ in 0..16 {
+                if db.catalog_retirement_count_for_test() == 0 {
+                    break;
+                }
+                db.maintain_catalog_retirements_until(|| false).unwrap();
+            }
             assert!(db
                 .prefix_index_entries_visible(
                     &counters,
@@ -716,6 +733,7 @@ fn fulltext_incremental_failed_build_identity_reuse_reinitializes_corpus() {
         assert_corpora(&e, "test.ft_inc", current(&e));
     }
 }
+
 #[test]
 fn fulltext_incremental_exchange_transfers_counters_with_catalog_publication() {
     let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
@@ -879,6 +897,12 @@ fn fulltext_incremental_ddl_retires_counters_without_breaking_old_snapshots() {
     ];
     assert!(count(old_prefix.clone()) > 0);
     e.execute("DROP INDEX fp ON ft_inc").unwrap();
+    for _ in 0..16 {
+        if count(old_prefix.clone()) == 0 {
+            break;
+        }
+        db.maintain_catalog_retirements_until(|| false).unwrap();
+    }
     assert_eq!(count(old_prefix), 0);
     let frozen = db
         .fulltext_corpus_statistics(old, &old_table, old_index, &["quartz".into()], None)
@@ -937,6 +961,12 @@ fn fulltext_incremental_ddl_retires_counters_without_breaking_old_snapshots() {
     e.execute("INSERT INTO ft_inc VALUES(3,'quartz',1)")
         .unwrap();
     e.execute("DROP TABLE ft_inc").unwrap();
+    for _ in 0..16 {
+        if count(vec![old_table.id]) == 0 {
+            break;
+        }
+        db.maintain_catalog_retirements_until(|| false).unwrap();
+    }
     assert_eq!(count(vec![old_table.id]), 0);
 }
 

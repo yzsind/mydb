@@ -3439,6 +3439,8 @@ impl Database {
     }
 
     pub fn drop_tables(&self, names: &[String], if_exists: bool) -> Result<(), QueryError> {
+        #[cfg(test)]
+        let _hold = FulltextDropHoldTimer(Instant::now());
         if self.recyclebin_enabled() {
             self.check_disk_write()?;
             return self.recycle_drop_tables(names, if_exists);
@@ -5570,6 +5572,8 @@ impl Database {
     }
 
     pub fn drop_index(&self, table_name: &str, index_name: &str) -> Result<(), QueryError> {
+        #[cfg(test)]
+        let _hold = FulltextDropHoldTimer(Instant::now());
         let _definition = self.pin_ddl_table(table_name)?;
         let _role = self.zone_map_gate.read_recursive();
         self.ensure_writable()?;

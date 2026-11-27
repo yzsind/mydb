@@ -746,6 +746,7 @@ struct CatalogTxn<'a> {
     sequence_changes: Vec<(Arc<SequenceSchema>, Option<Arc<SequenceSchema>>)>,
     sequence_leases: Vec<SequenceValueLease<'a>>,
     replacements: Vec<CatalogRowReplacement>,
+    fulltext_retirements: BTreeMap<u64, Vec<RetiredFulltextPrefix>>,
     delta_object_ids: Vec<u64>,
     delta_invalidate_all: bool,
     defer_table_publication: bool,
@@ -773,6 +774,7 @@ impl<'a> CatalogTxn<'a> {
             sequence_changes: Vec::new(),
             sequence_leases: Vec::new(),
             replacements: Vec::new(),
+            fulltext_retirements: BTreeMap::new(),
             delta_object_ids: Vec::new(),
             delta_invalidate_all: false,
             defer_table_publication: false,
@@ -810,6 +812,15 @@ impl<'a> CatalogTxn<'a> {
         self.commit_in(txn, false)
     }
 
+    fn retire_fulltext_prefix(&mut self, table_id: u64, prefix: RetiredFulltextPrefix) {
+        let prefixes = self.fulltext_retirements.entry(table_id).or_default();
+        if prefixes.iter().any(|existing| existing.covers(&prefix)) {
+            return;
+        }
+        prefixes.retain(|existing| !prefix.covers(existing));
+        prefixes.push(prefix);
+    }
+
     fn commit_ddl(self) -> Result<(), QueryError> {
         let txn = self.db.begin_txn()?;
         self.commit_in(txn, true)
@@ -824,6 +835,29 @@ impl<'a> CatalogTxn<'a> {
             db: self.db,
             txn_id: txn.txn_id,
         };
+        #[cfg(test)]
+        let retires_fulltext = !self.fulltext_retirements.is_empty();
+        for (table_id, prefixes) in std::mem::take(&mut self.fulltext_retirements) {
+            // Generation zero is outside physical index ownership. The actual
+            // writing transaction provides a durable unique identity, so a
+            // later DROP cannot overwrite a partially reclaimed older job.
+            let intent = DropTableIntent {
+                table_id,
+                retired_index: Some((txn.txn_id, 0)),
+                had_auto_increment: false,
+                database: String::new(),
+                table_name: String::new(),
+                files: Vec::new(),
+                vector_files: Vec::new(),
+                vector_directories: Vec::new(),
+                retired_table_cache: None,
+                retired_fulltext: Some(RetiredFulltextCounters {
+                    prefixes,
+                    resume: None,
+                }),
+            };
+            self.db.add_index_retirement(&mut self, &intent)?;
+        }
         if stage_ddl_binlog {
             if let Some((key, value)) = crate::replication::current_ddl_receipt()? {
                 self.replace(
@@ -1067,6 +1101,16 @@ impl<'a> CatalogTxn<'a> {
                 crate::engine::auth::test_faults::hit("after_dd_rows")?;
             }
             #[cfg(test)]
+            if retires_fulltext {
+                self.db.crash_fulltext_retirement_for_test(txn.txn_id, 1)?;
+            }
+            #[cfg(test)]
+            if self.replacements.iter().any(|replacement| {
+                replacement.dd_table_id == crate::storage::data_dictionary::DD_FULLTEXT_COUNTERS
+            }) {
+                self.db.crash_fulltext_retirement_for_test(txn.txn_id, 3)?;
+            }
+            #[cfg(test)]
             if self.ai_mutation {
                 crate::engine::ai::catalog_faults::hit("after_dd_rows")?;
             }
@@ -1109,6 +1153,10 @@ impl<'a> CatalogTxn<'a> {
             CATALOG_TXN_ROLLBACKS.fetch_add(1, Ordering::Relaxed);
             return Err(err);
         }
+        #[cfg(test)]
+        if retires_fulltext {
+            self.db.crash_fulltext_retirement_for_test(txn.txn_id, 2)?;
+        }
         for id in auto_retirements { self.db.auto_increment.forget_table(id); }
         CATALOG_MUTATED_ROWS.fetch_add(mutation_rows, Ordering::Relaxed);
         CATALOG_TXN_COMMITS.fetch_add(1, Ordering::Relaxed);
@@ -1121,7 +1169,18 @@ impl<'a> CatalogTxn<'a> {
         self.sequence_changes.clear();
         self.db.catalog.publish_dd_object_rows(locator_updates);
         drop(_dd_commit_guards);
-        if !self.defer_table_publication {
+        // Reclaiming unreachable internal rows is not schema publication.
+        // Preserve prepared DML and dependency caches across every cleanup
+        // batch, while retaining normal publication for all defining DDL.
+        let retirement_only = self.delta_object_ids.is_empty()
+            && !self.delta_invalidate_all
+            && !self.replacements.is_empty()
+            && self.replacements.iter().all(|replacement| {
+                matches!(replacement.dd_table_id,
+                    crate::storage::data_dictionary::DD_FULLTEXT_COUNTERS
+                        | crate::storage::data_dictionary::DD_DDL_RETIREMENTS)
+            });
+        if !self.defer_table_publication && !retirement_only {
             self.db.catalog.publish_table_deltas(&self.delta_object_ids);
         }
         if let Some(publication) = security_publication { publication.publish(); }
@@ -1772,8 +1831,7 @@ impl Database {
                     if table.is_none() {
                         // Include private families left by an interrupted
                         // offline build that never acquired catalog metadata.
-                        txn.replace(crate::storage::data_dictionary::DD_FULLTEXT_COUNTERS,
-                            CatalogRowSelector::PrefixValues(vec![Value::UInt(table_id)]), Vec::new());
+                        self.stage_fulltext_table_retirement(&mut txn, table_id)?;
                     } else if let Some((generation, corpora, old_sids)) = old_fulltext.remove(&table_id) {
                         let retained = table.filter(|table| table.active_generation == generation)
                             .map(|table| table.indexes.iter().filter_map(|index| index.fulltext.as_ref().map(|meta| meta.corpus_id)).collect::<HashSet<_>>())
@@ -1804,8 +1862,10 @@ impl Database {
                             self.stage_fulltext_generation_retirement(&mut txn, table, generation)?;
                         } else {
                             for corpus in corpora.difference(&retained) {
-                                txn.replace(crate::storage::data_dictionary::DD_FULLTEXT_COUNTERS,
-                                    CatalogRowSelector::PrefixValues(vec![Value::UInt(table_id), Value::UInt(generation), Value::UInt(*corpus)]), Vec::new());
+                                txn.retire_fulltext_prefix(
+                                    table_id,
+                                    RetiredFulltextPrefix::Corpus { generation, corpus_id: *corpus },
+                                );
                             }
                         }
                     }

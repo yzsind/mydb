@@ -29,6 +29,19 @@
 
 const DROP_TABLE_INTENT_DIR: &str = "ddl/drop_table";
 
+#[cfg(test)]
+static FULLTEXT_DROP_HOLD_US: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+struct FulltextDropHoldTimer(Instant);
+
+#[cfg(test)]
+impl Drop for FulltextDropHoldTimer {
+    fn drop(&mut self) {
+        FULLTEXT_DROP_HOLD_US.fetch_add(self.0.elapsed().as_micros() as u64, Ordering::Relaxed);
+    }
+}
+
 struct CatalogRetirementWaker(Box<dyn Fn() + Send + Sync>);
 
 impl std::fmt::Debug for CatalogRetirementWaker {
@@ -57,16 +70,84 @@ impl RetiredTableCache {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-struct RetiredFulltextGeneration {
-    generation: u64,
+enum RetiredFulltextPrefix {
+    Table,
+    Generation(u64),
+    Corpus { generation: u64, corpus_id: u64 },
+}
+
+impl RetiredFulltextPrefix {
+    fn covers(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Table, _) => true,
+            (Self::Generation(a), Self::Generation(b) | Self::Corpus { generation: b, .. }) => {
+                a == b
+            }
+            (
+                Self::Corpus {
+                    generation: a,
+                    corpus_id: ca,
+                },
+                Self::Corpus {
+                    generation: b,
+                    corpus_id: cb,
+                },
+            ) => a == b && ca == cb,
+            _ => false,
+        }
+    }
+
+    fn key(&self, table_id: u64) -> IndexKey {
+        let mut values = vec![KeyPart::UInt(table_id)];
+        match *self {
+            Self::Table => {}
+            Self::Generation(generation) => values.push(KeyPart::UInt(generation)),
+            Self::Corpus {
+                generation,
+                corpus_id,
+            } => {
+                values.extend([KeyPart::UInt(generation), KeyPart::UInt(corpus_id)]);
+            }
+        }
+        IndexKey::from(values)
+    }
+
+    fn is_live(&self, table: &TableSchema) -> bool {
+        match *self {
+            Self::Table => true,
+            Self::Generation(generation) => table.active_generation == generation,
+            Self::Corpus {
+                generation,
+                corpus_id,
+            } => {
+                table.active_generation == generation
+                    && table.indexes.iter().any(|index| {
+                        index
+                            .fulltext
+                            .as_ref()
+                            .is_some_and(|meta| meta.corpus_id == corpus_id)
+                    })
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct RetiredFulltextCounters {
+    prefixes: Vec<RetiredFulltextPrefix>,
     resume: Option<(IndexKey, RowId)>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static FULLTEXT_RETIREMENT_CRASH_POINT: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct DropTableIntent {
     table_id: u64,
-    /// An index retirement shares the table-drop file protocol, but its
-    /// commit decision is the absence of this stable index/generation pair.
+    /// Physical indexes use (index_id, generation >= 1). Counter-only jobs
+    /// use (committing transaction_id, 0); None owns whole-table files.
     #[serde(default)]
     retired_index: Option<(u64, u64)>,
     #[serde(default)]
@@ -89,10 +170,34 @@ pub(crate) struct DropTableIntent {
     #[serde(default)]
     retired_table_cache: Option<RetiredTableCache>,
     #[serde(default)]
-    retired_fulltext: Option<RetiredFulltextGeneration>,
+    retired_fulltext: Option<RetiredFulltextCounters>,
 }
 
 impl Database {
+    #[cfg(test)]
+    pub(crate) fn fulltext_drop_hold_us_for_test(&self) -> u64 {
+        FULLTEXT_DROP_HOLD_US.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_fulltext_retirement_crash_point_for_test(&self, point: u8) {
+        FULLTEXT_RETIREMENT_CRASH_POINT.with(|slot| slot.set(point));
+    }
+
+    #[cfg(test)]
+    fn crash_fulltext_retirement_for_test(&self, txn_id: u64, point: u8) -> Result<(), QueryError> {
+        if FULLTEXT_RETIREMENT_CRASH_POINT.with(|slot| slot.get()) == point {
+            // Persist partial DD mutations as well as the decision, if any.
+            // Recovery must undo an unfinished batch and its cursor together.
+            self.flush_txn_wal_buffer(txn_id, None)?;
+            self.flush_dirty_data()?;
+            let lsn = self.log.lock().last_lsn();
+            LogManager::sync_durable_to(&self.log, lsn)?;
+            std::process::exit(86);
+        }
+        Ok(())
+    }
+
     pub(crate) fn set_catalog_retirement_waker(&self, wake: impl Fn() + Send + Sync + 'static) {
         *self.ddl_retirement_waker.lock() = Some(CatalogRetirementWaker(Box::new(wake)));
     }
@@ -147,7 +252,7 @@ impl Database {
     fn retirement_is_live(&self, intent: &DropTableIntent) -> bool {
         self.table_by_id(intent.table_id).is_some_and(|table| {
             if let Some(retired) = &intent.retired_fulltext {
-                return table.active_generation == retired.generation;
+                return retired.prefixes.iter().any(|prefix| prefix.is_live(&table));
             }
             intent.retired_index.is_none_or(|(id, generation)| {
                 table.active_generation.max(1) == generation
@@ -172,12 +277,32 @@ impl Database {
                 format!("invalid catalog retirement: {err}"),
             )
         })?;
-        if intent.retired_fulltext.as_ref().is_some_and(|retired| {
-            retired.generation == 0 || intent.retired_index != Some((0, retired.generation))
-        }) {
-            return Err(fulltext_statistics_error(
-                "invalid retired corpus generation",
-            ));
+        if let Some(retired) = &intent.retired_fulltext {
+            let valid = intent
+                .retired_index
+                .is_some_and(|(job, generation)| job != 0 && generation == 0)
+                && intent.files.is_empty()
+                && intent.vector_files.is_empty()
+                && !retired.prefixes.is_empty()
+                && retired.prefixes.iter().all(|prefix| match prefix {
+                    RetiredFulltextPrefix::Table => true,
+                    RetiredFulltextPrefix::Generation(generation) => *generation != 0,
+                    RetiredFulltextPrefix::Corpus {
+                        generation,
+                        corpus_id,
+                    } => *generation != 0 && *corpus_id != 0,
+                });
+            if !valid {
+                return Err(fulltext_statistics_error("invalid retired counter prefix"));
+            }
+            let prefix = retired.prefixes.last().unwrap().key(intent.table_id);
+            if retired
+                .resume
+                .as_ref()
+                .is_some_and(|(key, _)| !key.0.starts_with(&prefix.0))
+            {
+                return Err(fulltext_statistics_error("invalid retired counter cursor"));
+            }
         }
         let (index_id, generation) = intent.retired_index.unwrap_or((0, 0));
         if values.get(..3)
@@ -276,22 +401,34 @@ impl Database {
         table: &TableSchema,
         generation: u64,
     ) -> Result<(), QueryError> {
-        let intent = DropTableIntent {
-            table_id: table.id,
-            retired_index: Some((0, generation)),
-            had_auto_increment: false,
-            database: table.database.clone(),
-            table_name: table.name.clone(),
-            files: Vec::new(),
-            vector_files: Vec::new(),
-            vector_directories: Vec::new(),
-            retired_table_cache: None,
-            retired_fulltext: Some(RetiredFulltextGeneration {
-                generation,
-                resume: None,
-            }),
+        txn.retire_fulltext_prefix(table.id, RetiredFulltextPrefix::Generation(generation));
+        Ok(())
+    }
+
+    fn stage_fulltext_table_retirement(
+        &self,
+        txn: &mut CatalogTxn<'_>,
+        table_id: u64,
+    ) -> Result<(), QueryError> {
+        use crate::storage::data_dictionary::DD_FULLTEXT_COUNTERS;
+        // A single raw entry is a conservative existence probe, including
+        // historical/private families. Ordinary tables with no such keys need
+        // no additional manifest. Never enumerate a dropped table's counters.
+        let prefix = RetiredFulltextPrefix::Table.key(table_id);
+        let low = IndexBound {
+            key: prefix.clone(),
+            inclusive: true,
         };
-        self.add_index_retirement(txn, &intent)
+        let exists = self.with_index_read(DD_FULLTEXT_COUNTERS, "PRIMARY", |index| {
+            Ok(index
+                .range_entries_chunk(Some(&low), None, None, 1)?
+                .first()
+                .is_some_and(|(key, _)| key.0.starts_with(&prefix.0)))
+        })?;
+        if exists {
+            txn.retire_fulltext_prefix(table_id, RetiredFulltextPrefix::Table);
+        }
+        Ok(())
     }
 
     fn retire_fulltext_counter_batch(
@@ -310,11 +447,6 @@ impl Database {
             }
         }
         let retired = intent.retired_fulltext.as_mut().unwrap();
-        if intent.retired_index != Some((0, retired.generation)) || retired.generation == 0 {
-            return Err(fulltext_statistics_error(
-                "invalid retired corpus generation",
-            ));
-        }
         // Bound both the raw traversal (including MVCC tombstones) and the DD
         // transaction. Persist the cursor with each batch so restart resumes
         // without rescanning retained historical keys or skipping live rows.
@@ -325,14 +457,11 @@ impl Database {
         let schema =
             crate::storage::data_dictionary::dd_table_schema(DD_FULLTEXT_COUNTERS).unwrap();
         let primary = Self::dd_primary_index(&schema)?;
-        let prefix = Self::dd_selector_key(
-            &schema,
-            primary,
-            &[
-                Value::UInt(intent.table_id),
-                Value::UInt(retired.generation),
-            ],
-        )?;
+        let prefix = retired
+            .prefixes
+            .last()
+            .ok_or_else(|| fulltext_statistics_error("empty retired prefix list"))?
+            .key(intent.table_id);
         let low = IndexBound {
             key: prefix.clone(),
             inclusive: true,
@@ -342,7 +471,7 @@ impl Database {
         })?;
         for (key, row_id) in entries.iter().take(256) {
             if !key.0.starts_with(&prefix.0) {
-                return Ok(true);
+                break;
             }
             if stop() {
                 return Ok(false);
@@ -363,9 +492,14 @@ impl Database {
             }
             retired.resume = Some((key.clone(), *row_id));
         }
-        Ok(entries
+        if entries
             .get(256)
-            .is_none_or(|(key, _)| !key.0.starts_with(&prefix.0)))
+            .is_none_or(|(key, _)| !key.0.starts_with(&prefix.0))
+        {
+            retired.prefixes.pop();
+            retired.resume = None;
+        }
+        Ok(retired.prefixes.is_empty())
     }
 
     fn add_index_retirement(
