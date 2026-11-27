@@ -341,6 +341,12 @@ impl Database {
         hook
     }
 
+    pub(crate) fn online_index_type_supported(kind: &str) -> bool {
+        kind.eq_ignore_ascii_case("BTREE")
+            || kind.eq_ignore_ascii_case("FULLTEXT")
+            || kind.eq_ignore_ascii_case("SPATIAL")
+    }
+
     pub(crate) fn add_indexes_for_sql(
         self: &Arc<Self>,
         table: &str,
@@ -351,7 +357,7 @@ impl Database {
     ) -> Result<(), QueryError> {
         if indexes
             .iter()
-            .all(|i| i.index_type.eq_ignore_ascii_case("BTREE"))
+            .all(|i| Self::online_index_type_supported(&i.index_type))
         {
             // Shared builds use the same private target and short barriers,
             // with a shared data lock during scanning. The offline builder's
@@ -377,11 +383,11 @@ impl Database {
         }
         if indexes
             .iter()
-            .any(|i| !i.index_type.eq_ignore_ascii_case("BTREE"))
+            .any(|i| !Self::online_index_type_supported(&i.index_type))
         {
             return Err(error(
                 crate::error::catalog::ER_NOT_SUPPORTED_YET,
-                "online index build requires BTREE indexes",
+                "online index build requires BTREE, FULLTEXT or SPATIAL indexes",
             ));
         }
         let source = self.table(table_name)?;
@@ -472,6 +478,15 @@ impl Database {
                         let mut leaf = table.clone();
                         leaf.id = storage_id;
                         leaf.active_generation = self.storage_generation(storage_id);
+                        // R-tree opens require a complete empty page format;
+                        // the logical root prepared above is not a data leaf.
+                        if index.is_spatial() && storage_id != table.id {
+                            self.prepare_empty_index_file_at_path(
+                                storage_id,
+                                &name,
+                                self.index_path_for_table_schema(&table, storage_id, &name),
+                            )?;
+                        }
                         let capture = self.index_handle(storage_id, &name)?;
                         let log = Arc::new(OnlineIndexBuildLog::new());
                         {
@@ -495,6 +510,13 @@ impl Database {
                 Ok(())
             })();
             prepared?;
+            // Source writers are drained. The allocation frontier covers all
+            // committed source rows even if another table holds back visible_scn.
+            let statistics_view = TxnView {
+                snapshot_scn: self.next_scn_atomic.load(Ordering::Acquire).saturating_sub(1),
+                ..ddl_txn
+            };
+            let prepared_schema = self.table(table_name)?;
             for id in &lock_ids {
                 self.table_locks_sharded
                     .set_schema_floor(*id, prepared_version);
@@ -520,6 +542,7 @@ impl Database {
             // The snapshot keeps undo and deleted slots alive during scanning
             // and replay; writers still use their ordinary IX/row locks.
             self.build_online_index_targets(&mut targets, options)?;
+            self.build_online_fulltext_statistics(&source, &prepared_schema, &names, statistics_view)?;
             if let Ok(mut progress) = job.progress.lock() {
                 progress.total_rows = Some(progress.copied_rows);
             }
@@ -659,7 +682,14 @@ impl Database {
                     for index in &mut table.indexes {
                         if names.contains(&index.name) {
                             index.state = IndexState::Public;
-                            index.readable_from_scn = readable_from_scn;
+                            if index.is_fulltext() {
+                                // MATCH still needs the tokenizer definition for
+                                // a pre-publication snapshot's heap fallback.
+                                index.readable_from_scn = 0;
+                                index.fulltext.as_mut().unwrap().snapshot_origin_txn_id = u64::MAX;
+                            } else {
+                                index.readable_from_scn = readable_from_scn;
+                            }
                         }
                     }
                     if let Some(pending) = table.pending_primary_key.take() {

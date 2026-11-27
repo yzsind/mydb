@@ -225,6 +225,7 @@ impl Database {
         txn_id: u64,
         prefix: &[Value],
         deltas: std::collections::BTreeMap<String, (i64, i64)>,
+        shard: u64,
     ) -> Result<(), QueryError> {
         if deltas
             .values()
@@ -247,7 +248,7 @@ impl Database {
             let mut row = prefix.to_vec();
             row.extend([
                 Value::Bytes(token.as_bytes().to_vec()),
-                Value::UInt(txn_id % FULLTEXT_COUNTER_SHARDS),
+                Value::UInt(shard),
                 Value::Int(count),
                 Value::Int(length),
             ]);
@@ -354,7 +355,7 @@ impl Database {
                     }
                 }
             }
-            self.apply_fulltext_counter_deltas(txn_id, &prefix, deltas)?;
+            self.apply_fulltext_counter_deltas(txn_id, &prefix, deltas, txn_id % FULLTEXT_COUNTER_SHARDS)?;
         }
         Ok(())
     }
@@ -448,7 +449,7 @@ impl Database {
         Ok(rows)
     }
 
-    /// Point/range probes read at most 64 MVCC counters per requested term
+    /// Point/range probes read at most 65 MVCC counters per requested term
     /// and physical partition. No user heap is opened for scoring statistics.
     pub(crate) fn fulltext_corpus_statistics(
         &self,
@@ -496,7 +497,7 @@ impl Database {
             values.push(Value::Bytes(token.as_bytes().to_vec()));
             let key = Self::dd_selector_key(&counters, primary, &values)?;
             let entries = self.prefix_index_entries_visible(&counters, primary, key, baseline)?;
-            if entries.len() > FULLTEXT_COUNTER_SHARDS as usize {
+            if entries.len() > (FULLTEXT_COUNTER_SHARDS + 1) as usize {
                 return Err(fulltext_statistics_error("invalid shard count"));
             }
             let (mut count, mut length) = (0i128, 0i128);
@@ -679,6 +680,115 @@ impl Database {
             )?;
         }
         Ok(())
+    }
+
+    /// Baseline at the writer-drained prepare snapshot. DML already maintains
+    /// Building corpora in business shards 0..63; shard 64 cannot conflict with those
+    /// transaction-duration counter locks. Publication fences older readers.
+    fn build_online_fulltext_statistics(
+        &self,
+        source: &TableSchema,
+        prepared: &TableSchema,
+        names: &[String],
+        snapshot: TxnView,
+    ) -> Result<(), QueryError> {
+        let mut seen = std::collections::BTreeSet::new();
+        let mut indexes = Vec::new();
+        for index in prepared
+            .indexes
+            .iter()
+            .filter(|i| i.is_fulltext() && names.contains(&i.name))
+        {
+            let identity = (
+                index.fulltext.as_ref().unwrap().corpus_id,
+                fulltext_corpus_definition(prepared, index)?,
+            );
+            if !seen.insert(identity.clone()) {
+                continue;
+            }
+            if source.indexes.iter().any(|old| {
+                old.is_fulltext()
+                    && old.state == IndexState::Public
+                    && old
+                        .fulltext
+                        .as_ref()
+                        .is_some_and(|m| m.corpus_id == identity.0)
+                    && fulltext_corpus_definition(source, old).is_ok_and(|d| d == identity.1)
+            }) {
+                continue;
+            }
+            indexes.push(index);
+        }
+        if indexes.is_empty() {
+            return Ok(());
+        }
+        let txn = self.begin_txn()?;
+        let result = (|| {
+            for storage_id in prepared.storage_ids() {
+                let pages = self.with_heap_read(storage_id, |heap| heap.page_count())?;
+                for lo in (0..pages).step_by(16) {
+                    crate::engine::cancel::check_cancelled()?;
+                    let rows = self.scan_rows_storage_range(
+                        prepared,
+                        storage_id,
+                        snapshot,
+                        lo,
+                        (lo + 16).min(pages),
+                    )?;
+                    for index in &indexes {
+                        let prefix = self.fulltext_counter_prefix(prepared, index, storage_id)?;
+                        let mut deltas = std::collections::BTreeMap::<String, (i64, i64)>::new();
+                        let mut charge = crate::engine::executor::mem_budget::ScopedCharge::new(0);
+                        for row in &rows {
+                            let (length, terms) =
+                                fulltext_document_statistics(prepared, index, &row.values)?;
+                            let header = deltas.entry(String::new()).or_default();
+                            header.0 = header.0.checked_add(1).ok_or_else(|| {
+                                fulltext_statistics_error("baseline count overflow")
+                            })?;
+                            header.1 = header.1.checked_add(length).ok_or_else(|| {
+                                fulltext_statistics_error("baseline length overflow")
+                            })?;
+                            for term in terms {
+                                if !deltas.contains_key(&term) {
+                                    charge
+                                        .add_non_spillable(112usize.saturating_add(term.len()))?;
+                                }
+                                let count = &mut deltas.entry(term).or_default().0;
+                                *count = count.checked_add(1).ok_or_else(|| {
+                                    fulltext_statistics_error("baseline frequency overflow")
+                                })?;
+                            }
+                        }
+                        self.apply_fulltext_counter_deltas(
+                            txn.txn_id,
+                            &prefix,
+                            deltas,
+                            FULLTEXT_COUNTER_SHARDS,
+                        )?;
+                        #[cfg(test)]
+                        if let Some(hook) = self
+                            .fulltext_copy_statistics_test_hook
+                            .lock()
+                            .unwrap()
+                            .take()
+                        {
+                            hook.pause();
+                        }
+                    }
+                }
+            }
+            self.commit_txn(txn.txn_id)?;
+            #[cfg(test)]
+            if std::env::var_os("MYDB_FT_STATISTICS_TEST_CRASH_AFTER_BUILD").is_some() {
+                std::process::exit(87);
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = self.rollback_txn(txn.txn_id);
+        }
+        result
     }
 
     // Offline FULLTEXT DDL holds the source write barrier. Initialize once

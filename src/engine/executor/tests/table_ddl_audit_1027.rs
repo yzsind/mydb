@@ -192,7 +192,7 @@ fn ddl_1027_auto_increment_partition_shared_step_and_restart() {
 }
 
 #[test]
-fn ddl_1027_auto_increment_overflow_and_unsupported_online_are_atomic() {
+fn ddl_1027_auto_increment_overflow_and_online_copy_are_atomic() {
     let dir = fixture();
     let engine = open_relaxed_test_engine(dir.path());
     engine.execute("CREATE TABLE t(b INT)").unwrap();
@@ -203,15 +203,8 @@ fn ddl_1027_auto_increment_overflow_and_unsupported_online_are_atomic() {
     engine
         .execute(&format!("INSERT INTO t VALUES{input}"))
         .unwrap();
-    assert_eq!(
-        engine
-            .execute("ALTER TABLE t ADD id INT AUTO_INCREMENT, ADD PRIMARY KEY(id), LOCK=NONE")
-            .unwrap_err()
-            .code(),
-        1846
-    );
     assert!(engine
-        .execute("ALTER TABLE t ADD id TINYINT AUTO_INCREMENT, ADD PRIMARY KEY(id)")
+        .execute("ALTER TABLE t ADD id TINYINT AUTO_INCREMENT, ADD PRIMARY KEY(id), LOCK=NONE")
         .is_err());
     assert_eq!(
         engine
@@ -226,7 +219,7 @@ fn ddl_1027_auto_increment_overflow_and_unsupported_online_are_atomic() {
         vec![vec![Value::Int(128)]]
     );
     engine
-        .execute("ALTER TABLE t ADD id INT UNSIGNED AUTO_INCREMENT, ADD PRIMARY KEY(id)")
+        .execute("ALTER TABLE t ADD id INT UNSIGNED AUTO_INCREMENT, ADD PRIMARY KEY(id), LOCK=NONE")
         .unwrap();
     assert_eq!(
         rows(&engine, "SELECT COUNT(DISTINCT id),MIN(id),MAX(id) FROM t"),

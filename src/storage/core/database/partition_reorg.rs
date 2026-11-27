@@ -1472,6 +1472,8 @@ impl Database {
             })?;
             let table_mut = Arc::make_mut(table_arc);
             table_mut.partitioning = candidate.partitioning.clone();
+            table_mut.indexes = candidate.indexes.clone();
+            table_mut.next_index_id = candidate.next_index_id;
             table_mut.stats.partition_stats = shadow_stats;
             table_mut.stats.row_count = table_row_count;
             table_mut.stats.heap_page_count = table_page_count;

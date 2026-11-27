@@ -163,6 +163,21 @@ impl OnlineCopyRows {
 }
 
 impl Database {
+    /// Reserve the private assignments before exposing the new definition.
+    /// A replaced AUTO_INCREMENT column can leave an older cached allocator;
+    /// advancing its floor also preserves source-side reservations and gaps.
+    fn publish_alter_copy_auto_increment(
+        &self,
+        table: &TableSchema,
+        job: &AlterCopyJob,
+    ) -> Result<(), QueryError> {
+        let maximum = job.auto_increment_max.load(Ordering::Relaxed);
+        if maximum != 0 {
+            self.persist_auto_increment_max(table.id, maximum)?;
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(crate) fn install_online_copy_publish_test_hook(&self) -> Arc<DdlBackfillTestHook> {
         let hook = Arc::new(DdlBackfillTestHook::new());
@@ -176,28 +191,23 @@ impl Database {
         &self,
         table_name: &str,
         actions: &[crate::parser::AlterAction],
-        strict: bool,
+        _strict: bool,
         lock: crate::parser::AlterLock,
         copy_requested: bool,
     ) -> bool {
-        if (!strict && lock != crate::parser::AlterLock::Shared)
-            || !ddl_copy_streaming_enabled()
-            || (self.config.durability == DurabilityMode::Memory
-                && lock != crate::parser::AlterLock::Shared)
-        {
+        if !ddl_copy_streaming_enabled() {
             return false;
         }
         use crate::parser::AlterAction as A;
         if actions.is_empty()
             || !actions.iter().all(|a| match a {
-                A::AddColumn(column) => {
-                    !column.auto_increment || lock == crate::parser::AlterLock::Shared
-                }
+                A::AddColumn(_) => true,
                 A::ModifyColumn(_) | A::ChangeColumn { .. } => true,
                 A::AddIndex(i) => i.index_type.eq_ignore_ascii_case("BTREE"),
                 A::Rebuild
                 | A::DropColumn(_)
                 | A::DropIndex(_)
+                | A::DropPrimaryKey
                 | A::MoveColumn { .. }
                 | A::SetColumnComment { .. }
                 | A::ConvertToCharset { .. } => true,
@@ -345,15 +355,24 @@ impl Database {
         let snapshot = StorageReadSnapshot::new(self);
         let read = snapshot.txn;
         let rows = self.take_online_copy_ready_rows(job, read)?;
+        let mut auto_values = BTreeMap::new();
+        let _auto_charge = crate::engine::executor::mem_budget::ControlledMemoryCharge::try_new(
+            crate::engine::executor::mem_budget::ControlledMemoryCategory::DdlOnlineLog,
+            if defaults.auto_increment.is_some() {
+                rows.rows.len().saturating_mul(192)
+            } else {
+                0
+            },
+        )?;
         let mut tail_bytes = 0usize;
         let count = rows.rows.len();
         // Remove the complete cohort before adding its replacement keys. A
         // committed transaction can swap unique values between multiple rows.
-        for (_, row) in &rows.rows {
+        for (storage_id, row) in &rows.rows {
             Self::check_alter_copy_cancelled(job)?;
             check_online_copy_deadline(deadline)?;
             if let Some(old_ref) = mapping.remove(row)? {
-                self.delete_online_copy_value(
+                let assigned = self.delete_online_copy_value(
                     shadow,
                     statistics,
                     ddl_txn,
@@ -361,6 +380,11 @@ impl Database {
                     deadline,
                     &mut tail_bytes,
                 )?;
+                if defaults.auto_increment.is_some() {
+                    if let Some(value) = assigned {
+                        auto_values.insert((*storage_id, *row), value);
+                    }
+                }
             }
         }
         for (storage_id, source_id) in rows.rows {
@@ -373,8 +397,14 @@ impl Database {
                 continue;
             };
             Self::pad_full_row_to_schema(&mut row.values, source);
-            let values =
-                self.prepare_alter_copy_values(shadow, row.values, strict, warnings, &defaults)?;
+            let values = self.prepare_alter_copy_values_with_auto(
+                shadow,
+                row.values,
+                strict,
+                warnings,
+                &defaults,
+                auto_values.remove(&(storage_id, source_id)),
+            )?;
             check_online_copy_tail_value(&values, deadline, &mut tail_bytes)?;
             let location = self.insert_online_copy_value(shadow, statistics, ddl_txn, values)?;
             mapping.insert(source_id, location)?;
@@ -512,7 +542,7 @@ impl Database {
         location: crate::storage::DmlRowRef,
         deadline: Option<Instant>,
         tail_bytes: &mut usize,
-    ) -> Result<(), QueryError> {
+    ) -> Result<Option<Value>, QueryError> {
         let old = self
             .read_mvcc_row(location.storage_id, location.row_id)?
             .ok_or_else(|| {
@@ -556,7 +586,9 @@ impl Database {
             heap.delete(txn.txn_id, location.row_id)
         })?;
         self.free_external_refs(location.storage_id, &refs);
-        Ok(())
+        Ok(target
+            .auto_increment_column_index()
+            .and_then(|idx| old.values.get(idx).cloned()))
     }
 
     fn insert_online_copy_value(
@@ -692,6 +724,15 @@ impl Database {
         let snapshot = StorageReadSnapshot::new(self);
         let read = snapshot.txn;
         let rows = self.take_online_copy_ready_rows(job, read)?;
+        let mut auto_values = BTreeMap::new();
+        let _auto_charge = crate::engine::executor::mem_budget::ControlledMemoryCharge::try_new(
+            crate::engine::executor::mem_budget::ControlledMemoryCategory::DdlOnlineLog,
+            if defaults.auto_increment.is_some() {
+                rows.rows.len().saturating_mul(192)
+            } else {
+                0
+            },
+        )?;
         let mut tail_bytes = 0usize;
         let mut dirty = std::collections::BTreeSet::new();
         for (storage_id, row_id) in &rows.rows {
@@ -701,7 +742,7 @@ impl Database {
                 continue;
             };
             if let Some(old) = map.remove(row_id)? {
-                self.delete_online_copy_value(
+                let assigned = self.delete_online_copy_value(
                     target,
                     statistics,
                     txn,
@@ -709,6 +750,11 @@ impl Database {
                     deadline,
                     &mut tail_bytes,
                 )?;
+                if defaults.auto_increment.is_some() {
+                    if let Some(value) = assigned {
+                        auto_values.insert((*storage_id, *row_id), value);
+                    }
+                }
                 dirty.insert(old.storage_id);
                 *counts.entry(old.storage_id).or_default() -= 1;
             }
@@ -747,8 +793,14 @@ impl Database {
                 continue;
             };
             Self::pad_full_row_to_schema(&mut row.values, source);
-            let values =
-                self.prepare_alter_copy_values(target, row.values, strict, warnings, &defaults)?;
+            let values = self.prepare_alter_copy_values_with_auto(
+                target,
+                row.values,
+                strict,
+                warnings,
+                &defaults,
+                auto_values.remove(&(storage_id, row_id)),
+            )?;
             check_online_copy_tail_value(&values, deadline, &mut tail_bytes)?;
             let target_id = if target.is_partitioned() {
                 target.route_row_to_partition(&values)?.storage_id
@@ -1243,6 +1295,7 @@ impl Database {
                 return Ok(warnings);
             }
             Self::enter_alter_copy_finalizing(&job)?;
+            self.publish_alter_copy_auto_increment(&target, &job)?;
             if is_reorg {
                 let live = self.table(&source.qualified_name())?;
                 target.stats = live.stats.clone();

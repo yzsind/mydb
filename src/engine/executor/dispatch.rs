@@ -8752,7 +8752,7 @@ pub(super) fn execute_qualified_statement(
             let online_index_only = stmt.partition_actions.is_empty()
                 && stmt.algorithm != AlterAlgorithm::Copy
                 && matches!(stmt.lock, AlterLock::None | AlterLock::Default)
-                && stmt.actions.iter().all(|a| matches!(a, AlterAction::AddIndex(i) if i.index_type.eq_ignore_ascii_case("BTREE")));
+                && stmt.actions.iter().all(|a| matches!(a, AlterAction::AddIndex(i) if Database::online_index_type_supported(&i.index_type)));
             if !has_copy_required_action
                 && !online_index_only
                 && stmt.actions.len() + stmt.partition_actions.len() > 1
@@ -8804,7 +8804,7 @@ pub(super) fn execute_qualified_statement(
                     .actions
                     .iter()
                     .all(|a| matches!(a, AlterAction::AddIndex(_)));
-            if stmt.lock == AlterLock::None && (!all_add_index || stmt.actions.iter().any(|a| matches!(
+            if stmt.lock == AlterLock::None && !online_type_copy && (!all_add_index || stmt.actions.iter().any(|a| matches!(
                 a, AlterAction::AddIndex(i) if !i.index_type.eq_ignore_ascii_case("BTREE")
             ))) && stmt.actions.iter().any(|a| matches!(
                 a, AlterAction::AddIndex(i) if i.name.as_deref().is_some_and(|n| n.eq_ignore_ascii_case("PRIMARY"))
@@ -9583,11 +9583,11 @@ pub(super) fn execute_qualified_statement(
                 ));
             }
             if matches!(stmt.lock, AlterLock::None | AlterLock::Shared)
-                && !stmt.index_type.eq_ignore_ascii_case("BTREE")
+                && !Database::online_index_type_supported(&stmt.index_type)
             {
                 return Err(error(
                     crate::error::catalog::ER_ALTER_OPERATION_NOT_SUPPORTED_REASON,
-                    "LOCK=NONE/SHARED requires a BTREE index",
+                    "LOCK=NONE/SHARED requires a BTREE, FULLTEXT or SPATIAL index",
                 ));
             }
             if is_session_temp_table_ref(session, &stmt.table) {

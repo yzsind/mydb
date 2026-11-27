@@ -73,16 +73,28 @@ impl RetiredTableCache {
 enum RetiredFulltextPrefix {
     Table,
     Generation(u64),
-    Corpus { generation: u64, corpus_id: u64 },
+    Corpus {
+        generation: u64,
+        corpus_id: u64,
+    },
+    Storage {
+        generation: u64,
+        corpus_id: u64,
+        definition: Vec<u8>,
+        storage_id: u64,
+    },
 }
 
 impl RetiredFulltextPrefix {
     fn covers(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Table, _) => true,
-            (Self::Generation(a), Self::Generation(b) | Self::Corpus { generation: b, .. }) => {
-                a == b
-            }
+            (
+                Self::Generation(a),
+                Self::Generation(b)
+                | Self::Corpus { generation: b, .. }
+                | Self::Storage { generation: b, .. },
+            ) => a == b,
             (
                 Self::Corpus {
                     generation: a,
@@ -91,8 +103,27 @@ impl RetiredFulltextPrefix {
                 Self::Corpus {
                     generation: b,
                     corpus_id: cb,
+                }
+                | Self::Storage {
+                    generation: b,
+                    corpus_id: cb,
+                    ..
                 },
             ) => a == b && ca == cb,
+            (
+                Self::Storage {
+                    generation: a,
+                    corpus_id: ca,
+                    definition: da,
+                    storage_id: sa,
+                },
+                Self::Storage {
+                    generation: b,
+                    corpus_id: cb,
+                    definition: db,
+                    storage_id: sb,
+                },
+            ) => a == b && ca == cb && da == db && sa == sb,
             _ => false,
         }
     }
@@ -107,6 +138,19 @@ impl RetiredFulltextPrefix {
                 corpus_id,
             } => {
                 values.extend([KeyPart::UInt(generation), KeyPart::UInt(corpus_id)]);
+            }
+            Self::Storage {
+                generation,
+                corpus_id,
+                ref definition,
+                storage_id,
+            } => {
+                values.extend([
+                    KeyPart::UInt(generation),
+                    KeyPart::UInt(corpus_id),
+                    KeyPart::Bytes(definition.clone()),
+                    KeyPart::UInt(storage_id),
+                ]);
             }
         }
         IndexKey::from(values)
@@ -126,6 +170,23 @@ impl RetiredFulltextPrefix {
                             .fulltext
                             .as_ref()
                             .is_some_and(|meta| meta.corpus_id == corpus_id)
+                    })
+            }
+            Self::Storage {
+                generation,
+                corpus_id,
+                ref definition,
+                storage_id,
+            } => {
+                table.active_generation == generation
+                    && table.storage_ids().contains(&storage_id)
+                    && table.indexes.iter().any(|index| {
+                        index
+                            .fulltext
+                            .as_ref()
+                            .is_some_and(|meta| meta.corpus_id == corpus_id)
+                            && fulltext_corpus_definition(table, index)
+                                .map_or(true, |live| live == *definition)
                     })
             }
         }
@@ -250,7 +311,26 @@ impl Database {
     }
 
     fn retirement_is_live(&self, intent: &DropTableIntent) -> bool {
+        // EXCHANGE can return an existing leaf to this exact counter prefix.
+        // A live reverse-map entry protects that identity even while a DDL
+        // has revised the descriptor but not yet published its ownership map.
+        if intent.retired_fulltext.as_ref().is_some_and(|retired| {
+            retired.prefixes.iter().any(|prefix| {
+                matches!(prefix,
+                RetiredFulltextPrefix::Storage { storage_id, .. }
+                if *storage_id != intent.table_id
+                    && self.catalog.table_key_by_id(*storage_id).is_some())
+            })
+        }) {
+            return true;
+        }
         self.table_by_id(intent.table_id).is_some_and(|table| {
+            // A former standalone owner can now be a leaf of another table.
+            // Its namespace may return through EXCHANGE with that table's
+            // index identities. Keep both counters and files until it retires.
+            if table.id != intent.table_id {
+                return true;
+            }
             if let Some(retired) = &intent.retired_fulltext {
                 return retired.prefixes.iter().any(|prefix| prefix.is_live(&table));
             }
@@ -291,6 +371,18 @@ impl Database {
                         generation,
                         corpus_id,
                     } => *generation != 0 && *corpus_id != 0,
+                    RetiredFulltextPrefix::Storage {
+                        generation,
+                        corpus_id,
+                        definition,
+                        storage_id,
+                    } => {
+                        *generation != 0
+                            && *corpus_id != 0
+                            && *storage_id != 0
+                            && !definition.is_empty()
+                            && definition.len() <= 8192
+                    }
                 });
             if !valid {
                 return Err(fulltext_statistics_error("invalid retired counter prefix"));
@@ -439,13 +531,6 @@ impl Database {
         stop: &dyn Fn() -> bool,
     ) -> Result<bool, QueryError> {
         use crate::storage::data_dictionary::DD_FULLTEXT_COUNTERS;
-        #[cfg(test)]
-        {
-            let hook = self.retirement_cleanup_test_hook.lock().unwrap().take();
-            if let Some(hook) = hook {
-                hook.pause();
-            }
-        }
         let retired = intent.retired_fulltext.as_mut().unwrap();
         // Bound both the raw traversal (including MVCC tombstones) and the DD
         // transaction. Persist the cursor with each batch so restart resumes
@@ -498,6 +583,13 @@ impl Database {
         {
             retired.prefixes.pop();
             retired.resume = None;
+        }
+        #[cfg(test)]
+        {
+            let hook = self.retirement_cleanup_test_hook.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook.pause();
+            }
         }
         Ok(retired.prefixes.is_empty())
     }

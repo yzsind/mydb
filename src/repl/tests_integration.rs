@@ -1125,7 +1125,7 @@ mod online_apply {
 
     #[tokio::test]
     async fn physical_replica_fulltext_retirement_drop_scopes_follow_authority() {
-        for operation in ["index", "table"] {
+        for operation in ["index", "table", "leaf"] {
             let (source, _source_dir, service) = build_master_engine().await;
             source
                 .database_for_replication()
@@ -1138,7 +1138,7 @@ mod online_apply {
                 spawn_replica(service.bind_addr()).await;
             let writer = source.clone();
             tokio::task::spawn_blocking(move || {
-                writer.execute("CREATE TABLE ft_drop(id INT PRIMARY KEY,body TEXT,FULLTEXT ft(body))").unwrap();
+                writer.execute(&format!("CREATE TABLE ft_drop(id INT PRIMARY KEY,body TEXT,FULLTEXT ft(body)){}",if operation == "leaf" {" PARTITION BY RANGE(id)(PARTITION p0 VALUES LESS THAN(401),PARTITION p1 VALUES LESS THAN MAXVALUE)"} else {""})).unwrap();
                 writer.execute("INSERT INTO ft_drop SELECT n,CONCAT(IF(MOD(n,2)=0,'quartz ','amber '),'item',n) FROM generate_series(1,800) s(n)").unwrap();
             }).await.unwrap();
             let old = source
@@ -1156,13 +1156,16 @@ mod online_apply {
                     writer.execute("DROP INDEX ft ON ft_drop").unwrap();
                     writer.execute("CREATE FULLTEXT INDEX ft ON ft_drop(body)").unwrap();
                     writer.execute("INSERT INTO ft_drop VALUES(9000,'quartz surviving')").unwrap();
+                } else if operation == "leaf" {
+                    writer.execute("ALTER TABLE ft_drop DROP PARTITION p0").unwrap();
+                    writer.execute("INSERT INTO ft_drop VALUES(9000,'quartz surviving')").unwrap();
                 } else {
                     writer.execute("DROP TABLE ft_drop").unwrap();
                     writer.execute("CREATE TABLE ft_drop(id INT PRIMARY KEY,body TEXT,FULLTEXT ft(body))").unwrap();
                     writer.execute("INSERT INTO ft_drop VALUES(1,'quartz new'),(2,'amber new'),(3,'quartz surviving')").unwrap();
                 }
             }).await.unwrap();
-            let expected = vec![vec![Value::Int(if operation == "index" { 401 } else { 2 })]];
+            let expected = vec![vec![Value::Int(if operation == "index" { 401 } else if operation == "leaf" { 201 } else { 2 })]];
             assert_eq!(
                 poll_select_exact(&replica, count_sql, &expected, 5000).await,
                 expected
@@ -1197,7 +1200,7 @@ mod online_apply {
                 let counters = count_old();
                 assert!(counters > 256);
                 let manifests = db.catalog_retirement_count_for_test();
-                assert!(manifests >= 2);
+                assert!(manifests >= if operation == "leaf" { 1 } else { 2 });
                 let before = db.wal_log().lock().last_lsn();
                 db.maintain_catalog_retirements_until(|| false).unwrap();
                 assert_eq!(
@@ -1416,6 +1419,20 @@ mod online_apply {
             poll_select_exact(&replica, score_sql, &score, 5000).await,
             score
         );
+        let writer = source.clone();
+        let assigned = tokio::task::spawn_blocking(move || {
+            writer.execute("ALTER TABLE transformed ADD seq BIGINT AUTO_INCREMENT,ADD UNIQUE seq_key(seq),LOCK=NONE").unwrap();
+            writer.execute("INSERT INTO transformed(id,n,body,g) VALUES(4,40,'quartz alum',POINT(5,5))").unwrap();
+            let QueryResponse::ResultSet(result) = writer.execute("SELECT id,seq FROM transformed ORDER BY id").unwrap().materialize().unwrap() else { panic!("rows") };
+            assert_eq!(result.rows.last(), Some(&vec![Value::Int(4),Value::Int(4)]));
+            result.rows
+        }).await.unwrap();
+        assert_eq!(poll_select_exact(&replica,"SELECT id,seq FROM transformed ORDER BY id",&assigned,5000).await,assigned);
+        let db = replica.database_for_replication().clone();
+        tokio::task::spawn_blocking(move || {
+            let table = db.table("test.transformed").unwrap();
+            assert_eq!(db.auto_increment_next_value(&table).unwrap(),Some(5));
+        }).await.unwrap();
         lifecycle.stop_and_wait().await;
         service.shutdown().await;
     }

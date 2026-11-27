@@ -72,9 +72,9 @@ pub(super) fn plan_persistent_alter(
             .all(|a| matches!(a, AlterAction::AddIndex(_)))
         && stmt.partition_actions.is_empty()
         && stmt.algorithm != AlterAlgorithm::Copy;
-    let btree_indexes = indexes
+    let online_indexes = indexes
         && stmt.actions.iter().all(
-            |a| matches!(a, AlterAction::AddIndex(i) if i.index_type.eq_ignore_ascii_case("BTREE")),
+            |a| matches!(a, AlterAction::AddIndex(i) if Database::online_index_type_supported(&i.index_type)),
         );
     // A later action can bind a column introduced by an earlier action. Such
     // actions cannot be classified against the live source descriptor. The
@@ -173,10 +173,10 @@ pub(super) fn plan_persistent_alter(
                 | AlterAction::SetColumnComment { .. }
         )
     });
-    if indexes && !btree_indexes && stmt.actions.len() > 1 {
+    if indexes && !online_indexes && stmt.actions.len() > 1 {
         return Err(error(
             crate::error::catalog::ER_ALTER_OPERATION_NOT_SUPPORTED_REASON,
-            "atomic multi-index ALTER currently requires BTREE indexes",
+            "atomic multi-index ALTER requires BTREE, FULLTEXT or SPATIAL indexes",
         ));
     }
     let compound = stmt.actions.len() + stmt.partition_actions.len() > 1;
@@ -220,7 +220,7 @@ pub(super) fn plan_persistent_alter(
     if stmt.lock == AlterLock::None
         && scan
         && !constraints
-        && !btree_indexes
+        && !online_indexes
         && !online_copy
         && !partition_online
         && !online_drop_column
@@ -232,7 +232,7 @@ pub(super) fn plan_persistent_alter(
         && !partition_shared_build
         && scan
         && !constraints
-        && !btree_indexes
+        && !online_indexes
         && !online_copy
         && !online_drop_column
         && !(validation_scan && metadata_atomic && read_compatible_column_action(stmt).is_some())
@@ -260,7 +260,7 @@ pub(super) fn plan_persistent_alter(
         // A separate transaction-duration SNW ticket is acquired by the
         // executor; retain SU to serialize competing DDL.
         MdlLockType::SharedUpgradable
-    } else if constraints || btree_indexes || online_copy {
+    } else if constraints || online_indexes || online_copy {
         match stmt.lock {
             AlterLock::Exclusive => MdlLockType::Exclusive,
             AlterLock::Shared => MdlLockType::SharedNoWrite,
@@ -308,7 +308,7 @@ pub(super) fn alter_table_statement_mdl(
         // ticket. Starting with SNW would let two LOCK=SHARED DDLs race.
         AlterLock::Shared => MdlLockType::SharedUpgradable,
         AlterLock::Default if stmt.actions.iter().any(|action|
-            matches!(action, AlterAction::AddIndex(i) if !i.index_type.eq_ignore_ascii_case("BTREE"))) => MdlLockType::SharedNoWrite,
+            matches!(action, AlterAction::AddIndex(i) if !Database::online_index_type_supported(&i.index_type))) => MdlLockType::SharedNoWrite,
         AlterLock::Default | AlterLock::None => MdlLockType::SharedUpgradable,
     })
 }

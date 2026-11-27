@@ -1,13 +1,3 @@
-fn validate_add_index_backend(table: &TableSchema, index: &IndexSchema) -> Result<(), QueryError> {
-    if table.partitioning.is_some() && index.is_spatial() {
-        return Err(error(
-            crate::error::catalog::ER_NOT_SUPPORTED_YET,
-            "ADD SPATIAL INDEX on a partitioned table is not supported; define the index in CREATE TABLE",
-        ));
-    }
-    Ok(())
-}
-
 fn set_column_default_in_candidate(
     table: &mut TableSchema,
     idx: usize,
@@ -619,6 +609,15 @@ impl<'a> AlterCopyDefaults<'a> {
     }
 
     fn apply(&self, target: &TableSchema, values: &mut Vec<Value>) -> Result<(), QueryError> {
+        self.apply_with_auto(target, values, None)
+    }
+
+    fn apply_with_auto(
+        &self,
+        target: &TableSchema,
+        values: &mut Vec<Value>,
+        assigned: Option<Value>,
+    ) -> Result<(), QueryError> {
         while values.len() < target.columns.len() {
             values.push(
                 crate::engine::executor::insert::column_read_backfill_default(
@@ -627,20 +626,24 @@ impl<'a> AlterCopyDefaults<'a> {
             );
         }
         if let Some(idx) = self.auto_increment {
-            let mut current = self.job.auto_increment_max.load(Ordering::Relaxed);
-            let next = loop {
-                let next = next_auto_increment_after(current, self.step, self.offset)?;
-                match self.job.auto_increment_max.compare_exchange_weak(
-                    current,
-                    next,
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                ) {
-                    Ok(_) => break next,
-                    Err(actual) => current = actual,
-                }
-            };
-            values[idx] = generated_auto_increment_value(next, &target.columns[idx])?;
+            if let Some(assigned) = assigned {
+                values[idx] = assigned;
+            } else {
+                let mut current = self.job.auto_increment_max.load(Ordering::Relaxed);
+                let next = loop {
+                    let next = next_auto_increment_after(current, self.step, self.offset)?;
+                    match self.job.auto_increment_max.compare_exchange_weak(
+                        current,
+                        next,
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    ) {
+                        Ok(_) => break next,
+                        Err(actual) => current = actual,
+                    }
+                };
+                values[idx] = generated_auto_increment_value(next, &target.columns[idx])?;
+            }
         }
         for (idx, expr) in &self.expressions {
             values[*idx] = crate::engine::expr::eval_expr(expr, target, values)?;
@@ -4324,7 +4327,6 @@ impl Database {
         index: &IndexSchema,
     ) -> Result<(), QueryError> {
         let table = self.table(table_name)?;
-        validate_add_index_backend(&table, index)?;
         if index.primary && !index.unique {
             enforce_existing_primary_key_not_null(self, &table, &index.columns)?;
         }
@@ -4640,7 +4642,6 @@ impl Database {
             .ok_or_else(|| ddl_table_not_found(&table_name))?;
         implicit_spatial_index(&mut index, &table);
         warn_btree_descending(&index.index_type, &index.column_directions);
-        validate_add_index_backend(&table, &index)?;
         if index.is_fulltext() {
             let collation = index.columns.first().and_then(|name| table.column_index(name).ok())
                 .and_then(|position| table.columns[position].collation.as_deref())
@@ -8177,6 +8178,7 @@ impl Database {
             }
 
             Self::enter_alter_copy_finalizing(&job)?;
+            self.publish_alter_copy_auto_increment(&candidate, &job)?;
             self.begin_alter_copy_crash_marker(&old_table, &candidate)?;
             {
                 let mut catalog = self.catalog_write()?;
@@ -8756,6 +8758,7 @@ impl Database {
                 }
             }
             Self::enter_alter_copy_finalizing(&job)?;
+            self.publish_alter_copy_auto_increment(&candidate, &job)?;
             let swap_started = Instant::now();
             let memory_graphs =
                 if !vector_storage_paged() || self.config.durability == DurabilityMode::Memory {
@@ -10118,12 +10121,26 @@ impl Database {
     fn prepare_alter_copy_values(
         &self,
         candidate: &TableSchema,
-        mut values: Vec<Value>,
+        values: Vec<Value>,
         strict: bool,
         warnings: &mut Vec<crate::engine::api::SqlWarning>,
         defaults: &AlterCopyDefaults<'_>,
     ) -> Result<Vec<Value>, QueryError> {
-        defaults.apply(candidate, &mut values)?;
+        self.prepare_alter_copy_values_with_auto(
+            candidate, values, strict, warnings, defaults, None,
+        )
+    }
+
+    fn prepare_alter_copy_values_with_auto(
+        &self,
+        candidate: &TableSchema,
+        mut values: Vec<Value>,
+        strict: bool,
+        warnings: &mut Vec<crate::engine::api::SqlWarning>,
+        defaults: &AlterCopyDefaults<'_>,
+        assigned: Option<Value>,
+    ) -> Result<Vec<Value>, QueryError> {
+        defaults.apply_with_auto(candidate, &mut values, assigned)?;
         coerce_row_for_alter_copy(candidate, &mut values, strict, warnings)?;
         materialize_generated_columns(candidate, &mut values, None)?;
         self.check_not_null_constraints(candidate, &values)?;
@@ -11378,11 +11395,15 @@ fn push_alter_copy_warning(
     spec: crate::error::ErrorSpec,
     message: impl Into<String>,
 ) {
-    warnings.push(crate::engine::api::SqlWarning::known(
-        crate::error::ConditionLevel::Warning,
-        spec,
-        message,
-    ));
+    let warning =
+        crate::engine::api::SqlWarning::known(crate::error::ConditionLevel::Warning, spec, message);
+    // SQL diagnostics counts every conversion but retains max_error_count
+    // conditions. Direct storage callers still receive the returned warnings.
+    if crate::engine::api::current_statement_warning_sink().is_some() {
+        crate::engine::api::push_sql_warning(warning);
+    } else {
+        warnings.push(warning);
+    }
 }
 
 /// Warning text for a lossy numeric coercion during ALTER COPY, keyed by
@@ -12085,7 +12106,7 @@ impl Database {
         } else {
             None
         };
-        match action {
+        let result = match action {
             A::DropPartitions(names) => self.drop_partitions(table_name, &names),
             A::TruncatePartitions(targets) => {
                 self.rewrite_partition_storage_ids(table_name, &targets, false, true, cutover)
@@ -12131,7 +12152,11 @@ impl Database {
                 with_validation,
             } => self.exchange_partition(table_name, &partition, &table, with_validation),
             A::PartitionBy(def) => self.repartition_table(table_name, def, cutover),
+        };
+        if result.is_ok() {
+            self.request_catalog_retirement_cleanup();
         }
+        result
     }
 
     fn partition_maintenance_storage_ids(
@@ -12426,6 +12451,8 @@ impl Database {
     /// and LIST partition tables — MySQL rejects DROP PARTITION on
     /// HASH/KEY tables.
     fn drop_partitions(&self, table_name: &str, names: &[String]) -> Result<(), QueryError> {
+        #[cfg(test)]
+        let _hold = FulltextDropHoldTimer(Instant::now());
         let qualified = table_name.to_string();
         let (database, name) = split_table_name(DEFAULT_DATABASE, &qualified);
         let key = table_key(&database, &name);
@@ -13089,6 +13116,28 @@ impl Database {
         // the sole shadow storage id we build + fill.
         let mut candidate = table.as_ref().clone();
         candidate.partitioning = None;
+        // The logical root is reused as physical storage. Give every shared
+        // FULLTEXT corpus a fresh identity so deferred old-root retirement and
+        // its retained MVCC versions cannot alias the new incarnation.
+        let mut corpora = BTreeMap::new();
+        for index in &mut candidate.indexes {
+            let Some(meta) = index.fulltext.as_mut() else {
+                continue;
+            };
+            let next = match corpora.get(&meta.corpus_id) {
+                Some(id) => *id,
+                None => {
+                    let id = candidate.next_index_id.max(1);
+                    candidate.next_index_id = id
+                        .checked_add(1)
+                        .ok_or_else(|| fulltext_statistics_error("corpus identity exhausted"))?;
+                    corpora.insert(meta.corpus_id, id);
+                    id
+                }
+            };
+            meta.corpus_id = next;
+            meta.snapshot_origin_txn_id = u64::MAX;
+        }
         candidate.build_column_index();
         let build_sids = vec![table.id];
 
@@ -13127,6 +13176,8 @@ impl Database {
                 .ok_or_else(|| ddl_table_not_found(&table_name))?;
             let table_mut = Arc::make_mut(table_arc);
             table_mut.partitioning = None;
+            table_mut.indexes = candidate.indexes.clone();
+            table_mut.next_index_id = candidate.next_index_id;
             table_mut.bump_schema_version();
         }
         self.create_logged_file(txn_id_for_ddl(), self.table_path(table.id), Vec::new())?;

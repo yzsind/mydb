@@ -593,14 +593,45 @@ impl CatalogManager {
         } else {
             Vec::new()
         };
+        // Remove the previous physical aliases before installing any new
+        // owner. EXCHANGE can reuse another changed object's id, so removing
+        // and inserting in one loop makes the result depend on object order.
+        let old_aliases = self
+            .table_headers
+            .read()
+            .map(|headers| {
+                known_keys
+                    .iter()
+                    .filter_map(|(id, key)| {
+                        let key = key.as_ref()?;
+                        let old = headers.get(key).filter(|old| old.id == *id)?;
+                        Some((
+                            key.clone(),
+                            std::iter::once(old.id)
+                                .chain(old.storage_ids())
+                                .collect::<Vec<_>>(),
+                        ))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
         let descriptors = changes
             .iter()
             .filter_map(|(_, current)| current.clone())
             .collect::<Vec<_>>();
         if let Ok(mut keys) = self.table_keys_by_id.write() {
+            for (key, aliases) in old_aliases {
+                for id in aliases {
+                    if keys.get(&id) == Some(&key) {
+                        keys.remove(&id);
+                    }
+                }
+            }
+            for (object_id, _) in &changes {
+                keys.remove(object_id);
+            }
             let mut installed = std::collections::BTreeSet::new();
-            for (object_id, current) in changes {
-                keys.remove(&object_id);
+            for (_, current) in changes {
                 if let Some((key, table)) = current {
                     if !installed.insert(key.clone()) {
                         continue;
@@ -1845,13 +1876,12 @@ impl Database {
                                         .as_ref()
                                         .is_some_and(|meta| retained.contains(&meta.corpus_id))
                                 }) {
-                                    txn.replace(
-                                        crate::storage::data_dictionary::DD_FULLTEXT_COUNTERS,
-                                        CatalogRowSelector::PrefixValues(
-                                            self.fulltext_counter_prefix(table, index, *sid)?,
-                                        ),
-                                        Vec::new(),
-                                    );
+                                    txn.retire_fulltext_prefix(table_id, RetiredFulltextPrefix::Storage {
+                                        generation,
+                                        corpus_id: index.fulltext.as_ref().unwrap().corpus_id,
+                                        definition: fulltext_corpus_definition(table, index)?,
+                                        storage_id: *sid,
+                                    });
                                 }
                             }
                         }
@@ -2959,7 +2989,12 @@ mod audit1123_fulltext_retirement_tests {
     #[test]
     fn audit1123_partition_ddl_retires_fulltext_counter_leaves() {
         let root = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
-        let engine = crate::engine::StorageQueryEngine::open(root.path()).unwrap();
+        let engine =
+            crate::engine::StorageQueryEngine::open_with_storage_config_without_background_workers(
+                root.path(),
+                crate::storage::StorageConfig::from_env(),
+            )
+            .unwrap();
         engine.execute("CREATE TABLE ft(k INT,s TEXT,FULLTEXT KEY f(s)) PARTITION BY RANGE(k)(PARTITION p0 VALUES LESS THAN(10),PARTITION pmax VALUES LESS THAN MAXVALUE)").unwrap();
         engine
             .execute("INSERT INTO ft VALUES(1,'alpha beta'),(11,'gamma delta')")
@@ -2974,7 +3009,18 @@ mod audit1123_fulltext_retirement_tests {
             .unwrap()
         };
         assert!(!counter_rows().is_empty());
+        let old_sids = db.table("ft").unwrap().storage_ids();
         engine.execute("ALTER TABLE ft DROP PARTITION p0").unwrap();
+        let current = db.table("ft").unwrap().storage_ids();
+        for sid in old_sids.iter().filter(|sid| !current.contains(sid)) {
+            assert!(db.catalog.table_key_by_id(*sid).is_none(), "retired leaf alias survived publication");
+        }
+        for _ in 0..32 {
+            if db.catalog_retirement_count_for_test() == 0 {
+                break;
+            }
+            db.maintain_catalog_retirements_until(|| false).unwrap();
+        }
         let live = db.table("ft").unwrap().storage_ids();
         assert!(counter_rows()
             .iter()

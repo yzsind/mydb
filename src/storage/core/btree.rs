@@ -3818,6 +3818,14 @@ impl IndexFile {
         wal_owner: Option<&Database>,
     ) -> Result<(), QueryError> {
         if let Some(spatial) = &self.spatial {
+            if let Some(log) = &self.online_build_log {
+                log.record(std::iter::once(IndexBatchEntry {
+                    kind: WalIndexOpKind::Insert,
+                    key,
+                    row_id,
+                }));
+                return Ok(());
+            }
             return spatial.apply(
                 txn_id,
                 [IndexBatchEntry {
@@ -3868,6 +3876,14 @@ impl IndexFile {
         wal_owner: Option<&Database>,
     ) -> Result<(), QueryError> {
         if let Some(spatial) = &self.spatial {
+            if let Some(log) = &self.online_build_log {
+                log.record(entries.into_iter().map(|(key, row_id)| IndexBatchEntry {
+                    kind: WalIndexOpKind::Insert,
+                    key,
+                    row_id,
+                }));
+                return Ok(());
+            }
             return spatial.insert_many(txn_id, entries);
         }
         if entries.is_empty() {
@@ -3917,6 +3933,10 @@ impl IndexFile {
         wal_owner: Option<&Database>,
     ) -> Result<(), QueryError> {
         if let Some(spatial) = &self.spatial {
+            if let Some(log) = &self.online_build_log {
+                log.record(entries);
+                return Ok(());
+            }
             return spatial.apply(txn_id, entries);
         }
         if let Some(log) = &self.online_build_log {
@@ -3939,6 +3959,10 @@ impl IndexFile {
         wal_owner: Option<&Database>,
     ) -> Result<(), QueryError> {
         if let Some(spatial) = &self.spatial {
+            if let Some(log) = &self.online_build_log {
+                log.record(entries);
+                return Ok(());
+            }
             return spatial.apply(txn_id, entries);
         }
         if let Some(log) = &self.online_build_log {
@@ -7450,6 +7474,14 @@ impl IndexFile {
         wal_owner: Option<&Database>,
     ) -> Result<(), QueryError> {
         if let Some(spatial) = &self.spatial {
+            if let Some(log) = &self.online_build_log {
+                log.record(std::iter::once(IndexBatchEntry {
+                    kind: WalIndexOpKind::Delete,
+                    key,
+                    row_id,
+                }));
+                return Ok(());
+            }
             return spatial.apply(
                 txn_id,
                 [IndexBatchEntry {
@@ -10766,7 +10798,11 @@ impl IndexFile {
 
     fn is_empty(&self) -> Result<bool, QueryError> {
         if let Some(spatial) = &self.spatial {
-            return spatial.is_empty();
+            return if self.online_build_log.is_some() {
+                Ok(false)
+            } else {
+                spatial.is_empty()
+            };
         }
         if self.online_build_log.is_some() {
             // LOAD DATA must use its incremental writer, never replace the

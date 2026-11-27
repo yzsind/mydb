@@ -460,6 +460,7 @@ mod online_ddl;
 mod online_drop_column;
 mod online_special_alter;
 mod fulltext_retirement;
+mod ddl_remaining;
 mod operators;
 mod order_by_nulls;
 mod order_by_ordinal;
