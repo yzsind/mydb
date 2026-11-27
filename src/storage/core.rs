@@ -1583,6 +1583,8 @@ pub struct Database {
     /// Only statistics maintenance takes these locks; DML never waits here.
     /// Weak entries let idle/dropped tables release their maintenance state.
     analyze_locks: parking_lot::Mutex<HashMap<String, std::sync::Weak<parking_lot::Mutex<()>>>>,
+    /// COPY/checkpoint state; ordinary DML does not consult this registry.
+    copy_publication_wal: parking_lot::Mutex<BTreeMap<u64, u64>>,
     #[cfg(test)]
     analyze_batch_test_hook: Mutex<Option<Arc<DdlBackfillTestHook>>>,
     #[cfg(test)]
@@ -1607,6 +1609,10 @@ pub struct Database {
     vector_apply_test_hook: Mutex<Option<Arc<DdlBackfillTestHook>>>,
     #[cfg(test)]
     online_index_validation_test_hook: Mutex<Option<Arc<DdlBackfillTestHook>>>,
+    #[cfg(test)]
+    copy_file_stage_test_hook: Mutex<Option<(u8, Arc<DdlBackfillTestHook>)>>,
+    #[cfg(test)]
+    copy_sync_failure: AtomicBool,
 }
 
 #[cfg(not(test))]
@@ -4695,6 +4701,7 @@ include!("core/database/online_constraints.rs");
 include!("core/database/constraint_index_merge.rs");
 include!("core/database/constraint_baseline.rs");
 include!("core/database/online_copy.rs");
+include!("core/database/copy_file_publication.rs");
 include!("core/database/partition_reorg.rs");
 include!("core/database/ctas_recovery.rs");
 include!("core/database/drop_table_recovery.rs");

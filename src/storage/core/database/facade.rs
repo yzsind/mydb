@@ -985,6 +985,7 @@ impl Database {
             online_index_descriptors: parking_lot::RwLock::new(HashMap::new()),
             pending_primary_recovery: parking_lot::Mutex::new(Vec::new()),
             analyze_locks: parking_lot::Mutex::new(HashMap::new()),
+            copy_publication_wal: parking_lot::Mutex::new(BTreeMap::new()),
             #[cfg(test)]
             analyze_batch_test_hook: Mutex::new(None),
             #[cfg(test)]
@@ -1009,6 +1010,10 @@ impl Database {
             vector_apply_test_hook: Mutex::new(None),
             #[cfg(test)]
             online_index_validation_test_hook: Mutex::new(None),
+            #[cfg(test)]
+            copy_file_stage_test_hook: Mutex::new(None),
+            #[cfg(test)]
+            copy_sync_failure: AtomicBool::new(false),
         };
         for (table_id, (version, max_value, lsn)) in auto_increment_recovery {
             db.auto_increment.install(table_id, version, max_value)?;

@@ -13,7 +13,7 @@ use crate::util::bytes::read_u64;
 pub(crate) use backup::{visit_pinned_range, visit_raw_prefix};
 use checksum::{CrcShift, PayloadChecksum};
 pub(crate) use ordered_time::{advance_ordered_time, TimedRecord};
-pub(crate) use replay::{ReplayScan, WalRecordSource};
+pub(crate) use replay::{PublishedReplay, ReplayScan, WalRecordSource, validate_file_publication};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -395,6 +395,10 @@ pub enum WalRecordType {
     SpatialIndexUndo = 42,
     SpatialIndexClr = 43,
     CommitVisibility = 44,
+    /// Committed private-generation redo is rebound to a fresh final path.
+    FilePublish = 45,
+    /// All locally published COPY files have completed their data barrier.
+    FilePublishComplete = 46,
 }
 
 impl WalRecordType {
@@ -443,6 +447,8 @@ impl WalRecordType {
             42 => Self::SpatialIndexUndo,
             43 => Self::SpatialIndexClr,
             44 => Self::CommitVisibility,
+            45 => Self::FilePublish,
+            46 => Self::FilePublishComplete,
             38 => Self::VectorIndexModel,
             _ => {
                 return Err(error(
@@ -691,6 +697,10 @@ pub enum WalPayload {
         object_ids: Vec<u64>,
         invalidate_all: bool,
     },
+    /// The containing transaction decides this fresh-generation binding.
+    /// The complete private base and all subsequent redo precede this record.
+    FilePublish { source: String, target: String },
+    FilePublishComplete { txn_id: u64 },
     DdlCommit {
         job_id: u64,
         /// Physical generations superseded only if this transaction commits.
@@ -5047,6 +5057,8 @@ impl WalPayload {
             WalPayload::SpatialIndexClr { .. } => WalRecordType::SpatialIndexClr,
             WalPayload::CatalogDelta { .. } => WalRecordType::CatalogDelta,
             WalPayload::DdlCommit { .. } => WalRecordType::DdlCommit,
+            WalPayload::FilePublish { .. } => WalRecordType::FilePublish,
+            WalPayload::FilePublishComplete { .. } => WalRecordType::FilePublishComplete,
             WalPayload::AutoIncrementAdvance { .. } => WalRecordType::AutoIncrementAdvance,
             WalPayload::SequenceState { .. } => WalRecordType::SequenceState,
             WalPayload::PrepareTxn { .. } => WalRecordType::PrepareTxn,
@@ -6362,6 +6374,11 @@ fn encode_payload_into(payload: &WalPayload, mut out: &mut Vec<u8>) -> Result<()
                 write_u64_vec(&mut out, *object_id);
             }
         }
+        WalPayload::FilePublishComplete { txn_id } => write_u64_vec(&mut out, *txn_id),
+        WalPayload::FilePublish { source, target } => {
+            write_bytes(&mut out, source.as_bytes())?;
+            write_bytes(&mut out, target.as_bytes())?;
+        }
         WalPayload::DdlCommit {
             job_id,
             retired_paths,
@@ -6763,6 +6780,10 @@ fn encoded_payload_len(payload: &WalPayload) -> Result<usize, QueryError> {
         WalPayload::CatalogDelta { object_ids, .. } => {
             checked_add(1 + 4, object_ids.len().saturating_mul(8))
         }
+        WalPayload::FilePublishComplete { .. } => Ok(8),
+        WalPayload::FilePublish { source, target } => checked_sum([
+            encoded_bytes_len(source.len())?, encoded_bytes_len(target.len())?,
+        ]),
         WalPayload::DdlCommit { retired_paths, .. } => {
             let mut len = 12;
             for path in retired_paths {
@@ -7281,6 +7302,11 @@ fn decode_payload(record_type: WalRecordType, input: &[u8]) -> Result<WalPayload
                 invalidate_all,
             }
         }
+        WalRecordType::FilePublishComplete => WalPayload::FilePublishComplete { txn_id: read_u64_checked(input, &mut offset)? },
+        WalRecordType::FilePublish => WalPayload::FilePublish {
+            source: read_string(input, &mut offset)?,
+            target: read_string(input, &mut offset)?,
+        },
         WalRecordType::DdlCommit => {
             let job_id = read_u64_checked(input, &mut offset)?;
             let count = read_u32_checked(input, &mut offset)? as usize;
@@ -11616,6 +11642,30 @@ mod audit1122_append_failures {
             assert_eq!(log.append(0, payload()).unwrap(), before);
             log.flush().unwrap();
             assert_eq!(LogManager::scan(dir.path()).unwrap().next_lsn, before + 1);
+        }
+    }
+}
+
+#[cfg(test)]
+mod file_publication_tests {
+    use super::*;
+    #[test]
+    fn copy_file_publication_roundtrip_and_committed_redirection() {
+        let source="objects/tables/9/2.heap".to_owned();let target="objects/tables/1/2.heap".to_owned();
+        let binding=WalPayload::FilePublish { source: source.clone(), target: target.clone() };
+        let record=WalRecord { source_time_us: 0, lsn: 3, prev_txn_lsn: 2, txn_id: 5, payload: binding.clone() };
+        let encoded=encode_record(&record).unwrap();
+        assert_eq!(decode_payload(WalRecordType::FilePublish,&encoded[WAL_FRAME_HEADER_LEN..]).unwrap(),binding);
+        let records=vec![WalRecord {source_time_us:0,lsn:1,prev_txn_lsn:0,txn_id:5,payload:WalPayload::FileCreate {path:source.clone(),after:vec![1]}},WalRecord {source_time_us:0,lsn:2,prev_txn_lsn:1,txn_id:5,payload:WalPayload::HeapDelete {path:source.clone(),page_id:1,slot_id:0,before:Vec::new(),undo_lsn:None}},record];
+        for decided in [true,false] {
+            let replay=PublishedReplay::new(&records,|txn|decided&&txn==5).unwrap();
+            let expected=if decided {&target}else{&source};
+            assert_eq!(replay.redo_path(0).unwrap().unwrap().as_ref(),expected);
+            assert_eq!(replay.redo_path(1).unwrap().unwrap().as_ref(),expected);
+            assert!(matches!(&replay.record(0).unwrap().payload,WalPayload::FileCreate {path,..} if path==expected));
+        }
+        for bad in ["objects/tables/1/1.heap","../objects/tables/1/2.heap","system/catalog/1.heap","objects/tables/9/2.heap"] {
+            assert!(validate_file_publication(&source,bad).is_err());
         }
     }
 }

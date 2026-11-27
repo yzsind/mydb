@@ -941,6 +941,8 @@ impl Database {
         } else {
             Some(StorageReadSnapshot::new(self))
         };
+        let mut sync_guard = (self.config.durability != DurabilityMode::Memory)
+            .then(|| CopyPublicationGuard::new(self, job.job_id)).transpose()?;
         let txn = self.begin_txn()?;
         let _txn = OnlineCopyTxnGuard {
             db: self,
@@ -1206,6 +1208,9 @@ impl Database {
                         self.flush_online_copy_shadow(&leaf)?;
                         self.flush_online_copy_vectors(&target, *id)?;
                     }
+                    if let Some(guard) = &mut sync_guard {
+                        for id in &build_ids { guard.retain_storage(&target, *id)?; }
+                    }
                     for map in maps.values_mut() {
                         map.prepare_final_tail()?;
                     }
@@ -1261,10 +1266,11 @@ impl Database {
                         // Every target was flushed before taking X. Only
                         // tail-touched leaves require a second flush here.
                         for id in &dirty_targets {
-                            let mut leaf = target.clone();
-                            leaf.id = *id;
-                            self.flush_online_copy_shadow(&leaf)?;
-                            self.flush_online_copy_vectors(&target, *id)?;
+                            if let Some(guard) = &mut sync_guard {
+                                guard.retain_storage(&target, *id)?;
+                                guard.pending = true;
+                                self.flush_copy_storage_pages_without_sync(&target, *id)?;
+                            }
                         }
                         _held = Some(held);
                         break;
@@ -1342,6 +1348,8 @@ impl Database {
                 .tables
                 .insert(key.clone(), Arc::new(target.clone()));
             self.note_catalog_table(source.id);
+            #[cfg(test)]
+            self.copy_file_test_point(3)?;
             if let Err(err) = self.commit_catalog_txn_existing(txn) {
                 self.quarantine_mvcc(format!(
                     "online partition publication failed; restart recovery required: {}",
@@ -1352,6 +1360,8 @@ impl Database {
             }
             self.drop_table_modification_delta(source.id);
             committed = true;
+            #[cfg(test)]
+            self.copy_file_test_point(4)?;
             if is_reorg && partition_reorg_crash_at("after_swap") {
                 preserve_intent = true;
             }
@@ -1385,13 +1395,24 @@ impl Database {
                         .map(|(_, graph)| graph.clone()),
                 );
         }
-        if !committed {
+        if !committed && !self.mvcc_quarantined.load(Ordering::Acquire) {
             let _ = self.rollback_txn(txn.txn_id);
         }
         // Release the barriers before reclaiming obsolete private/source files.
         if let Some(owner) = owner {
             self.release_mdl_duration(owner, MdlDuration::Transaction);
         }
+        #[cfg(test)]
+        self.copy_file_test_point(5)?;
+        if let Some(guard) = &mut sync_guard {
+            if let Err(err) = guard.sync() {
+                self.quarantine_mvcc(format!("partition COPY deferred sync needs recovery: {}", err.message()));
+                self.unregister_reorg_storage_locs(&build_ids);
+                return Err(err);
+            }
+        }
+        #[cfg(test)]
+        self.copy_file_test_point(6)?;
         if preserve_intent {
             self.unregister_reorg_storage_locs(&build_ids);
             return result;
@@ -1587,7 +1608,16 @@ impl AlterCopyChangeLog {
     }
 }
 
-type OnlineCopyTxnGuard<'a> = RollbackTxnGuard<'a, true>;
+struct OnlineCopyTxnGuard<'a> { db: &'a Database, txn_id: u64 }
+impl Drop for OnlineCopyTxnGuard<'_> {
+    fn drop(&mut self) {
+        // An uncertain catalog decision is fail-stop; only restart may undo
+        // it. Ordinary pre-decision failures still roll back their candidate.
+        if !self.db.mvcc_quarantined.load(Ordering::Acquire)
+            && self.db.txns.read().slot(self.txn_id).is_some_and(|slot| slot.status == TxnStatus::Active)
+        { let _ = self.db.rollback_txn(self.txn_id); }
+    }
+}
 
 impl Database {
     fn build_online_copy_vectors(

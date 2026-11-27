@@ -625,3 +625,7 @@ mod issues_87_99;
 mod prepared_numeric;
 
 mod vector_online_ddl;
+
+mod copy_file_publication;
+
+mod copy_publication_perf;

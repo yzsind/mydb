@@ -10,7 +10,7 @@ The current development format is incompatible with earlier versions. If version
 | --- | --- |
 | storage control / owner-transfer proof | 1 / 1 |
 | row codec specification | 1 |
-| catalog / WAL | 75 / 41 |
+| catalog / WAL | 75 / 42 |
 | heap page / MVCC row | 15 / 9 |
 | B-tree index file / page | 25 / 16 |
 | undo binary / tablespace | 15 / 3 |

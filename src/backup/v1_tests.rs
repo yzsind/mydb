@@ -2778,3 +2778,53 @@ fn vector_online_ddl_base_and_pitr_preserve_private_image_and_tail() {
         }
     }
 }
+
+#[test]
+fn copy_file_publication_base_and_pitr_cover_both_decisions() {
+    for backend in ["memory", "paged"] {
+        for algo in ["HNSW", "IVF"] {
+            let old = std::env::var("MYDB_VECTOR_STORAGE").ok();
+            std::env::set_var("MYDB_VECTOR_STORAGE", backend);
+            let root = root();
+            let source = Arc::new(engine(&root.path().join("source")));
+            source.execute(&format!("CREATE TABLE copy_live(id INT PRIMARY KEY,n INT UNIQUE,b LONGTEXT,v VECTOR(2) NOT NULL,INDEX ix(v) USING {algo})")).unwrap();
+            source.execute("INSERT INTO copy_live VALUES(1,10,REPEAT('base',6000),'[1,1]'),(2,20,REPEAT('base',6000),'[2,2]')").unwrap();
+            let coordinator = Coordinator::get(source.db_handle()).unwrap();
+            let repository = root.path().join("repository");
+            coordinator.configure(&repository,Policy::Manual,false,None).unwrap();
+            let base = job(&coordinator,coordinator.backup(&repository).unwrap()).base_id.unwrap();
+            let hook = source.db_handle().install_online_copy_publish_test_hook();
+            let worker = source.clone();
+            let ddl = std::thread::spawn(move || worker.execute("ALTER TABLE copy_live MODIFY n BIGINT,LOCK=NONE"));
+            let reached = hook.wait_until_reached(Duration::from_secs(15));
+            let changes = (|| -> Result<(),QueryError> {
+                source.execute("UPDATE copy_live SET n=11,b=REPEAT('x',20000),v='[9,9]' WHERE id=1")?;
+                source.execute("DELETE FROM copy_live WHERE id=2")?;
+                source.execute("INSERT INTO copy_live VALUES(3,30,REPEAT('y',24000),'[0,0]')")?;
+                source.db_handle().checkpoint()
+            })();
+            let before = source.db_handle().storage_status().current_lsn.saturating_sub(1);
+            hook.release();let result=ddl.join().unwrap();assert!(reached,"{result:?}");changes.unwrap();result.unwrap();
+            let sql="SELECT id,n,LENGTH(b) FROM copy_live ORDER BY id";
+            let expected=vec![vec![Value::Int(1),Value::Int(11),Value::Int(20000)],vec![Value::Int(3),Value::Int(30),Value::Int(24000)]];
+            assert_eq!(rows(&source,sql),expected);
+            let receipt=job(&coordinator,coordinator.backup_wal(&repository).unwrap());
+            for (label,lsn,new) in [("before",before,false),("after",receipt.requested_lsn,true)] {
+                let target=root.path().join(label);
+                super::restore::restore(&repository,Some(&base),None,Target::Lsn(lsn),&target,None,false).unwrap_or_else(|err|panic!("{backend}/{algo}/{label}: {err:?}"));
+                let restored=engine(&target);
+                assert_eq!(rows(&restored,sql),expected,"{backend}/{algo}/{label}");
+                assert_eq!(restored.db_handle().table("test.copy_live").unwrap().active_generation>=2,new);
+                assert_eq!(rows(&restored,"SELECT id FROM copy_live FORCE INDEX(ix) ORDER BY L2_DISTANCE(v,'[0,0]') LIMIT 1"),vec![vec![Value::Int(3)]]);
+                drop(restored);
+                assert_eq!(rows(&engine(&target),sql),expected);
+            }
+            let latest=job(&coordinator,coordinator.backup(&repository).unwrap()).base_id.unwrap();
+            let runtime=root.path().join("runtime");let reader=super::open_base(&repository,&latest,&runtime).unwrap();
+            let immutable=StorageQueryEngine::open_backup_image(reader.data_dir.clone(),runtime,Default::default(),Arc::new(crate::engine::session_registry::SessionRegistry::new()),vec![]).unwrap();
+            assert_eq!(rows(&immutable,sql),expected);immutable.shutdown().unwrap();
+            coordinator.shutdown().unwrap();drop(coordinator);drop(source);
+            if let Some(old)=old {std::env::set_var("MYDB_VECTOR_STORAGE",old);} else {std::env::remove_var("MYDB_VECTOR_STORAGE");}
+        }
+    }
+}

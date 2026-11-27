@@ -693,6 +693,10 @@ impl SpatialIndexFile {
             }
         }
     }
+    pub(super) fn flush_without_sync(&self) -> Result<(), QueryError> {
+        self.healthy()?;
+        self.pool.flush_file_pages(&self.file_key)
+    }
     pub(super) fn flush(&self) -> Result<(), QueryError> {
         self.healthy()?;
         if self.durability != DurabilityMode::Memory

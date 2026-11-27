@@ -491,6 +491,36 @@ impl Database {
                     self.note_replicated_table_mutation(txn_id, path, 1, 1);
                 }
             }
+            WalPayload::FilePublish { source, target } => {
+                crate::wal::validate_file_publication(source, target)?;
+                // The fresh generation is unreachable until CommitTxn reloads
+                // the DD. All source redo precedes this binding in the stream.
+                if source.ends_with(".idx") {
+                    // No master B-tree image is copied. The fresh final path
+                    // stays absent, and normal catalog publication materializes
+                    // the replica's derived layout. Startup-only repair markers
+                    // must not be introduced into an online descriptor switch.
+                    return Ok(());
+                }
+                heap_redo.files.remove(source);
+                heap_redo.files.remove(target);
+                self.buffer_pool.discard_pages_for_path(&self.data_dir.join(target))?;
+                let source_path = self.data_dir.join(source);
+                let target_path = self.data_dir.join(target);
+                if let Some(parent) = target_path.parent() { fs::create_dir_all(parent).map_err(io_err)?; }
+                if !target_path.try_exists().map_err(io_err)? {
+                    hard_link_owned_file(&source_path, &target_path).map_err(io_err)?;
+                } else if page_owner_result(&source_path)? != page_owner_result(&target_path)? {
+                    return Err(error(crate::error::catalog::ER_GET_ERRNO, "replicated COPY owner mismatch"));
+                }
+                self.replica_restartpoint_tracker.lock().map_err(|_| error(
+                    crate::error::catalog::ER_GET_ERRNO, "replica restartpoint tracker lock poisoned"
+                ))?.register(target)?;
+            }
+            WalPayload::FilePublishComplete { .. } => {
+                // Source B-tree layout/coverage cannot certify a replica's
+                // independent derived layout. Local restartpoint owns it.
+            }
             WalPayload::DdlCommit { .. } => {
                 // CommitTxn is the visibility/durability authority. This
                 // marker lets recovery and diagnostics identify the DDL

@@ -4404,7 +4404,8 @@ impl Database {
             let begin_lsn = self.temporal_history.checkpoint_barrier(|| {
                 self.append_wal(txn_id_for_ddl(), WalPayload::CheckpointBegin)
             })?;
-            let vector_redo_floor = self.vector_pending_wal.lock().values().copied().min();
+            let vector_redo_floor = self.vector_pending_wal.lock().values().copied().min()
+                .into_iter().chain(self.copy_publication_wal.lock().values().copied()).min();
             let vector_publish_floor = self.vector_pending_publication_floor();
             let dirty = self
                 .auto_increment_dirty

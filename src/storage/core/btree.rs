@@ -9413,9 +9413,13 @@ impl IndexFile {
         }
     }
 
-    fn flush(&self) -> Result<(), QueryError> {
+    fn flush(&self) -> Result<(), QueryError> { self.flush_with_sync(true) }
+
+    fn flush_without_sync(&self) -> Result<(), QueryError> { self.flush_with_sync(false) }
+
+    fn flush_with_sync(&self, sync: bool) -> Result<(), QueryError> {
         if let Some(spatial) = &self.spatial {
-            return spatial.flush();
+            return if sync { spatial.flush() } else { spatial.flush_without_sync() };
         }
         #[cfg(test)]
         INDEX_FLUSH_TEST_HOOK.with(|hook| {
@@ -9458,11 +9462,11 @@ impl IndexFile {
         file.set_len(next_page_id * PAGE_SIZE as u64)
             .map_err(io_err)?;
         file.flush().map_err(io_err)?;
-        self.buffer_pool.sync_cached_and_direct_file(
-            &self.file_key,
-            file,
-            self.durability == DurabilityMode::Strict,
-        )?;
+        if sync {
+            self.buffer_pool.sync_cached_and_direct_file(
+                &self.file_key, file, self.durability == DurabilityMode::Strict,
+            )?;
+        }
         self.dirty_meta.store(false, Ordering::Release);
         self.dirty.store(false, Ordering::Release);
         Ok(())

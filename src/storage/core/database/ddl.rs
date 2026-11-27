@@ -552,6 +552,7 @@ struct PreparedCreateTableSchema {
 }
 
 /// Crash-safe file exchange shared by ALTER COPY and bulk shadow loads.
+#[derive(Clone)]
 struct ShadowGenerationFileSwap {
     in_place_schema: Option<Arc<TableSchema>>,
     old_to_backup: Vec<(PathBuf, PathBuf)>,
@@ -8270,6 +8271,10 @@ impl Database {
         // RC writer transactions do not retain undo for the source scan.
         // Register before choosing the writer view, atomically with purge.
         let _source_snapshot = StorageReadSnapshot::new(self);
+        let mut sync_guard = (self.config.durability != DurabilityMode::Memory)
+            .then(|| CopyPublicationGuard::new(self, job.job_id)).transpose()?;
+        let mut prepared_files: Option<PreparedCopyFiles> = None;
+        let mut deciding = false;
         let ddl_txn = self.begin_txn()?;
         let ddl_txn_id = ddl_txn.txn_id;
         candidate.row_generation_txn_id = ddl_txn_id;
@@ -8589,6 +8594,15 @@ impl Database {
             btree_logical_wal::set_bulk_sync_deferred(previous_deferred_sync);
             btree_logical_wal::set(previous_index_lsn);
             index_result?;
+            if !external {
+                // Direct appends advanced the on-disk allocation frontier.
+                // Lazy LOB initialization may have cached its earlier meta
+                // page. A subsequent LOB flag update must not overwrite that
+                // frontier with the pre-build value. The private direct pass
+                // has no buffered heap writes to preserve here.
+                let key = self.heap_handle(shadow_id)?.read().file_key.clone();
+                self.buffer_pool.discard_page(&PageKey { file: key, page_id: 0 })?;
+            }
             self.build_online_copy_vectors(&shadow_table, shadow_id)?;
             self.flush_online_copy_vectors(&shadow_table, shadow_id)?;
             if external {
@@ -8669,12 +8683,26 @@ impl Database {
                     )
                 }));
             DDL_COPY_SHADOW_BYTES.fetch_add(shadow_bytes, Ordering::Relaxed);
-            if online_barrier.is_some() {
-                // Direct bulk output has no row redo. Declare and seed the
-                // private heap before catch-up emits logical row mutations.
-                // Do this outside publication X; the final public baseline is
-                // still logged atomically with the catalog switch below.
-                self.log_copied_page_file(ddl_txn_id, &shadow_heap_path)?;
+            if let Some(guard) = &mut sync_guard {
+                let files = PreparedCopyFiles::new(self, &old_table, &candidate, shadow_id, job.job_id);
+                // A single complete private baseline precedes every logical
+                // tail. The commit-time binding reuses this history remotely.
+                let private = ShadowGenerationFileSwap {
+                    in_place_schema: None, old_to_backup: Vec::new(),
+                    shadow_to_live: files.expected.iter().map(|(path, _)| (path.clone(), path.clone())).collect(),
+                };
+                self.log_copied_generation(ddl_txn_id, &private)?;
+                #[cfg(test)]
+                self.copy_file_test_point(1)?;
+                self.flush_online_copy_shadow(&old_table)?;
+                prepared_files = Some(files);
+                let files = prepared_files.as_mut().unwrap();
+                files.prepare(self, guard)?;
+                if files.swap.shadow_to_live.iter().any(|(path, _)| path.extension().is_some_and(|ext| ext == "idx")) {
+                    guard.index_publication_txn = Some(ddl_txn_id);
+                }
+                #[cfg(test)]
+                self.copy_file_test_point(2)?;
             }
             self.backfill_copied_fulltext_statistics(ddl_txn, &candidate, shadow_id, candidate.id)?;
             if let Some((owner, _)) = online_barrier {
@@ -8704,6 +8732,14 @@ impl Database {
                     )?;
                     self.flush_online_copy_shadow(&shadow_table)?;
                     self.flush_online_copy_shadow(&old_table)?;
+                    if let (Some(files), Some(guard)) = (&mut prepared_files, &mut sync_guard) {
+                        files.prepare(self, guard)?;
+                        for index in shadow_table.indexes.iter().filter(|index| index.is_vector()) {
+                            for path in self.owned_vector_files(&shadow_table, index, shadow_id)? {
+                                guard.retain_file(&path)?;
+                            }
+                        }
+                    }
                     #[cfg(test)]
                     {
                         let hook = self.online_copy_publish_test_hook.lock().unwrap().take();
@@ -8740,9 +8776,21 @@ impl Database {
                             &mut warnings,
                             Some(online_copy_deadline()),
                         )?;
-                        self.flush_online_copy_shadow(&shadow_table)?;
-                        _final_hold = Some(held);
-                        break;
+                        let unbound = prepared_files.as_ref().map_or(Ok(false), PreparedCopyFiles::has_unbound)?;
+                        if !unbound {
+                            if let Some(guard) = &mut sync_guard {
+                                // Retain any source LOB created since the last
+                                // outside flush, including when COPY drops it.
+                                guard.retain_file(&self.overflow_path(old_table.id))?;
+                                guard.pending = true;
+                                self.flush_copy_pages_without_sync(&old_table)?;
+                                self.flush_copy_pages_without_sync(&shadow_table)?;
+                            }
+                            _final_hold = Some(held);
+                            break;
+                        }
+                        // A new optional file needs a durable binding. Prepare
+                        // it outside X, then retry; never fsync it under X.
                     }
                     self.table_locks_sharded
                         .downgrade_exclusive_to_intent_shared(ddl_txn_id, old_table.id)?;
@@ -8821,8 +8869,13 @@ impl Database {
             }
             self.evict_table_vector_graphs(old_table.id);
             self.evict_table_vector_graphs(shadow_id);
-            let file_swap =
-                self.swap_shadow_generation_files(&old_table, &candidate, shadow_id, job.job_id)?;
+            // The links and directory durability were prepared outside X.
+            // Final-tail pages are already written, with redo pinned until the
+            // deferred data fsync completes after releasing source exclusion.
+            self.invalidate_generation_handles(&old_table)?;
+            self.invalidate_generation_handles(&shadow_table)?;
+            let file_swap = prepared_files.as_ref().expect("durable COPY binding").swap.clone();
+            if let Some(guard) = &mut sync_guard { guard.pending = true; }
 
             let key = table_key(&candidate.database, &candidate.name);
             {
@@ -8843,9 +8896,9 @@ impl Database {
                 .chain(file_swap.shadow_to_live.iter().map(|(shadow, _)| shadow))
                 .map(|path| self.relative_path(path))
                 .collect();
-            self.publish_copied_vector_owners(&candidate, &old_table, shadow_id, old_table.id, &memory_graphs)?;
             let publish = self
-                .log_copied_generation(ddl_txn_id, &file_swap)
+                .publish_copied_vector_owners(&candidate, &old_table, shadow_id, old_table.id, &memory_graphs)
+                .and_then(|_| self.log_copy_file_bindings(ddl_txn_id, prepared_files.as_ref().unwrap()))
                 .and_then(|_| {
                     self.append_wal(
                         ddl_txn_id,
@@ -8855,8 +8908,17 @@ impl Database {
                         },
                     )
                 })
-                .and_then(|_| self.commit_catalog_txn_existing(ddl_txn));
+                .and_then(|_| {
+                    #[cfg(test)]
+                    self.copy_file_test_point(3)?;
+                    deciding = true;
+                    self.commit_catalog_txn_existing(ddl_txn)
+                });
             if let Err(err) = publish {
+                if deciding {
+                    self.quarantine_mvcc(format!("COPY catalog decision needs recovery: {}", err.message()));
+                    return Err(err);
+                }
                 if let Ok(mut catalog) = self.catalog_write() {
                     if let Some(table_arc) = catalog.tables.get_mut(&key) {
                         *Arc::make_mut(table_arc) = old_table.as_ref().clone();
@@ -8871,6 +8933,18 @@ impl Database {
                 return Err(err);
             }
             published = true;
+            // Commit-time deferred index work can dirty handles again. Write
+            // those bounded changes before letting a new final-path writer in;
+            // data fsync and its completion proof still happen after release.
+            if let Err(err) = self.flush_copy_pages_without_sync(&shadow_table)
+                .and_then(|_| self.flush_copy_pages_without_sync(&candidate))
+            {
+                self.quarantine_mvcc(format!("COPY committed page writeback needs recovery: {}", err.message()));
+                return Err(err);
+            }
+            self.invalidate_generation_handles(&shadow_table)?;
+            #[cfg(test)]
+            self.copy_file_test_point(4)?;
             #[cfg(test)]
             if let Some(hook) = self.vector_copy_committed_test_hook.lock().unwrap().take() {
                 hook.pause();
@@ -8926,7 +9000,7 @@ impl Database {
             Ok(warnings)
         })();
 
-        if result.is_err() {
+        if result.is_err() && !deciding {
             let active = self
                 .txns
                 .read()
@@ -8941,6 +9015,28 @@ impl Database {
             self.notify_non_row_lock_waiters();
         }
         drop(_final_hold);
+        if deciding && result.is_err() {
+            // Preserve all files and redo once a catalog decision was attempted.
+            // A committed writeback error also requires restart, not cleanup.
+            self.quarantine_mvcc("COPY publication requires restart recovery");
+            return result;
+        }
+        #[cfg(test)]
+        self.copy_file_test_point(5)?;
+        if let Some(guard) = &mut sync_guard {
+            if !published { guard.index_publication_txn = None; }
+            if let Err(err) = guard.sync() {
+                self.quarantine_mvcc(format!("COPY deferred data sync needs recovery: {}", err.message()));
+                return Err(err);
+            }
+        }
+        #[cfg(test)]
+        self.copy_file_test_point(6)?;
+        if !published {
+            if let Some(files) = &prepared_files {
+                self.rollback_shadow_generation_file_swap(&files.swap)?;
+            }
+        }
         let _ = self.remove_heap_cache_entry(shadow_id);
         for index in &candidate.indexes {
             let _ = self.remove_index_cache_entry(shadow_id, &index.name);
@@ -9704,9 +9800,9 @@ impl Database {
         Ok(())
     }
 
-    /// Direct COPY output is durable locally but has no row redo. Publish a
-    /// bounded physical baseline at its final paths before committing the DD.
-    /// Replication and backup replay cannot follow local hard links or intents.
+    /// Declare direct COPY output in bounded physical records before tail
+    /// replay. FilePublish later reuses this private history at final paths;
+    /// replicas and backup replay never depend on source-local hard links.
     fn log_copied_generation(
         &self,
         txn_id: u64,
