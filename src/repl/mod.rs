@@ -656,17 +656,10 @@ pub fn after_local_commit_durable(commit_lsn: u64) {
     // during the wait window, collapsing semi-sync throughput to a
     // single in-flight commit (Pf1).
     let waiter = { manager.slots.lock().semi_sync_waiter() };
-    let t0 = std::time::Instant::now();
     let outcome = waiter.wait_for_ack(
         commit_lsn,
         manager.config.semi_sync_wait_count,
         manager.config.semi_sync_timeout,
-    );
-    eprintln!(
-        "[semi-sync-probe] lsn={} outcome={:?} waited_ms={}",
-        commit_lsn,
-        outcome,
-        t0.elapsed().as_millis()
     );
     match outcome {
         master::slot::SemiSyncOutcome::Acknowledged => {
