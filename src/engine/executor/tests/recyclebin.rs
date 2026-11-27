@@ -762,7 +762,6 @@ fn recyclebin_retirement_cleanup_respects_backup_capture() {
         table.active_generation.max(1),
         "heap",
     );
-    engine.db.fail_next_ddl_cleanup_for_test();
     engine.execute("DROP TABLE retired").unwrap();
     assert!(heap.exists());
     assert_eq!(engine.db.catalog_retirement_count_for_test(), 1);

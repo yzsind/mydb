@@ -4720,7 +4720,9 @@ impl TableSchema {
     }
 
     pub fn auto_increment_column_index(&self) -> Option<usize> {
-        self.columns.iter().position(|column| column.auto_increment)
+        self.columns
+            .iter()
+            .position(|column| column.auto_increment && column.state != ColumnState::Dropped)
     }
 
     pub fn column_index(&self, name: &str) -> Result<usize, QueryError> {

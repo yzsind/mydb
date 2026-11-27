@@ -260,8 +260,16 @@ fn recover_from_wal_with_options(
     // a shared, internally locked LogManager. Records for one index stay on
     // one worker in LSN order; distinct index files are physically independent
     // and can therefore replay concurrently after the heap pass.
+    let published = crate::wal::PublishedReplay::new(&scan.records, |txn| committed.contains(&txn))?;
+    // Bulk-built B-trees are derived, without a physical redo baseline. An
+    // undecided data-sync suffix must not leave a valid but stale tree warm.
+    for path in published.indexes_requiring_rebuild(physical_replica || context.continuation_base.is_some()) {
+        let path = data_dir.join(path);
+        if let Some(parent) = path.parent() { fs::create_dir_all(parent).map_err(io_err)?; }
+        IndexFile::persist_planned_rebuild_marker(&path)?;
+    }
     let (heap_partitions, index_partitions) = plan_redo_file_partitions_with_context(
-        &scan.records,
+        &published,
         &redoable,
         &committed,
         redo_cutoff,
@@ -291,7 +299,7 @@ fn recover_from_wal_with_options(
         for &rec_idx in heap_partitions.values().flatten() {
             apply_redo_record(
                 data_dir,
-                scan.records.record(rec_idx)?.as_ref(),
+                published.record(rec_idx)?.as_ref(),
                 &redoable,
                 redo_cutoff,
                 physical_replica,
@@ -305,7 +313,7 @@ fn recover_from_wal_with_options(
         // a few large files don't idle the rest.
         let work: Vec<&Vec<usize>> = heap_partitions.values().collect();
         let next = std::sync::atomic::AtomicUsize::new(0);
-        let records = &scan.records;
+        let records = &published;
         let redoable_ref = &redoable;
         let first_err: std::sync::Mutex<Option<QueryError>> = std::sync::Mutex::new(None);
         let redone_total = std::sync::atomic::AtomicUsize::new(0);
@@ -382,14 +390,14 @@ fn recover_from_wal_with_options(
             let mut state = RedoState::with_context(Some(log), context);
             if precheck_indexes {
                 for partition in index_partitions.values() {
-                    precheck_recovery_index(data_dir, &scan.records, partition, &mut state)?;
+                    precheck_recovery_index(data_dir, &published, partition, &mut state)?;
                 }
             }
             for &rec_idx in index_partitions.values().flatten() {
-                if skip_prechecked_index_record(&scan.records, rec_idx, &mut state)? {
+                if skip_prechecked_index_record(&published, rec_idx, &mut state)? {
                     continue;
                 }
-                let record = scan.records.record(rec_idx)?;
+                let record = published.record(rec_idx)?;
                 apply_redo_record(
                     data_dir,
                     &record,
@@ -417,7 +425,7 @@ fn recover_from_wal_with_options(
             let first_err = std::sync::Mutex::new(None::<QueryError>);
             let redone_total = std::sync::atomic::AtomicUsize::new(0);
             let skipped_total = std::sync::atomic::AtomicUsize::new(0);
-            let records = &scan.records;
+            let records = &published;
             let redoable_ref = &redoable;
             crate::util::thread_spawn::scope(|scope| {
                 for _ in 0..worker_count {
@@ -1002,6 +1010,30 @@ fn recover_from_wal_with_options(
         // One barrier covers the entire compensation suffix and all endings.
         if end_lsn != 0 {
             LogManager::sync_durable_to(&log, end_lsn)?;
+        }
+    }
+    if !physical_replica {
+        // A replica may have prepared a fresh binding before receiving the
+        // source decision. Promotion/local loser recovery removes only the
+        // last undecided incarnation, never a later committed reuse.
+        let mut last = BTreeMap::<String, u64>::new();
+        for i in 0..scan.records.len() {
+            if scan.records.header(i)?.record_type == crate::wal::WalRecordType::FilePublish {
+                let record = scan.records.record(i)?;
+                if let WalPayload::FilePublish { target, .. } = &record.payload {
+                    last.insert(target.clone(), record.txn_id);
+                }
+            }
+        }
+        for (target, txn) in last {
+            if !committed.contains(&txn) && !prepared.contains(&txn) {
+                invalidate_recovery_page_io(data_dir, &target);
+                match fs::remove_file(data_dir.join(&target)) {
+                    Ok(()) => { retire_page_owner_proof(&data_dir.join(&target)); }
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(err) => return Err(io_err(err)),
+                }
+            }
         }
     }
     if wal_modified {

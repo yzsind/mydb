@@ -2344,6 +2344,17 @@ fn prepare_query(sql: &str, query: &Query) -> Result<PreparedQuery, ParseError> 
                 return Err(err);
             }
             let body_stmt = convert_query_ref(sql, body)?;
+            if alias
+                .columns
+                .iter()
+                .any(|column| column.data_type.is_some())
+            {
+                let mut err = ParseError::at_zero(
+                    "Typed CTE column declarations are not supported; use CAST in the anchor query",
+                );
+                err.spec = crate::error::catalog::ER_NOT_SUPPORTED_YET;
+                return Err(err);
+            }
             let columns = alias.columns.iter().map(|c| c.name.value.clone()).collect();
             ctes.push(CteDef {
                 name,
@@ -2966,8 +2977,7 @@ fn convert_select(
         Ok(order) => order,
         Err(unsupported) => return Ok(unsupported),
     };
-    let resolved_named =
-        resolve_named_windows(named_windows).map_err(|msg| parse_error_at_zero(msg))?;
+    let resolved_named = resolve_named_windows(named_windows).map_err(window_resolution_error)?;
     let mut projection = projection;
     // Aggregate ownership is query-block scoped and must be decided after
     // binding.  Rejecting it here loses both scope and MySQL's argument/type
@@ -2979,20 +2989,18 @@ fn convert_select(
     for item in &mut projection {
         if let SelectItem::Expr { expr, .. } = item {
             resolve_window_inherits_in_expr(expr, &resolved_named)
-                .map_err(|msg| parse_error_at_zero(msg))?;
+                .map_err(window_resolution_error)?;
         }
     }
     if let Some(sel) = selection.as_mut() {
-        resolve_window_inherits_in_expr(sel, &resolved_named)
-            .map_err(|msg| parse_error_at_zero(msg))?;
+        resolve_window_inherits_in_expr(sel, &resolved_named).map_err(window_resolution_error)?;
     }
     if let Some(h) = having.as_mut() {
-        resolve_window_inherits_in_expr(h, &resolved_named)
-            .map_err(|msg| parse_error_at_zero(msg))?;
+        resolve_window_inherits_in_expr(h, &resolved_named).map_err(window_resolution_error)?;
     }
     for o in &mut order_by {
         resolve_window_inherits_in_expr(&mut o.expr, &resolved_named)
-            .map_err(|msg| parse_error_at_zero(msg))?;
+            .map_err(window_resolution_error)?;
     }
     let (query_hints, hint_warnings) = select
         .optimizer_hint
@@ -4445,7 +4453,11 @@ fn is_hexbit_literal(expr: &Expr) -> bool {
 fn is_numeric_constant_literal(expr: &Expr) -> bool {
     match expr {
         Expr::Literal(
-            Literal::Int(_) | Literal::UInt(_) | Literal::Float(_) | Literal::Decimal(_),
+            Literal::Int(_)
+            | Literal::UInt(_)
+            | Literal::Float(_)
+            | Literal::Decimal(_)
+            | Literal::Bool(_),
         ) => true,
         Expr::Unary {
             op: UnaryOp::Neg,
@@ -4610,6 +4622,13 @@ pub(super) fn has_numeric_literal_children(expr: &Expr) -> bool {
 #[inline(never)]
 fn convert_expr_checked(expr: &SqlExpr) -> Result<Expr, ParseError> {
     let mut converted = convert_expr_inner(expr)?;
+    if let Expr::Function { name, args, .. } = &converted {
+        crate::engine::expr::validate_native_function_arity(name, args).map_err(|error| {
+            let mut parsed = ParseError::at_zero(error.message());
+            parsed.spec = crate::error::catalog::ER_WRONG_PARAMCOUNT_TO_NATIVE_FCT;
+            parsed
+        })?;
+    }
     if matches!(&converted, Expr::Function { name, args, .. }
         if name.eq_ignore_ascii_case("NULLIF") && args.len() == 2 && nullif_compares_numerically(args))
     {
@@ -5368,6 +5387,7 @@ fn convert_expr_inner(expr: &SqlExpr) -> Result<Expr, ParseError> {
                                 order_by: Vec::new(),
                                 frame: None,
                                 inherits: Some(window_name.value.clone()),
+                                direct_reference: true,
                             }),
                         });
                     }
@@ -5386,6 +5406,7 @@ fn convert_expr_inner(expr: &SqlExpr) -> Result<Expr, ParseError> {
                                 order_by,
                                 frame,
                                 inherits,
+                                direct_reference: false,
                             }),
                         });
                     }
@@ -5776,7 +5797,22 @@ fn convert_expr_inner(expr: &SqlExpr) -> Result<Expr, ParseError> {
                         & crate::engine::api::TEMPORAL_MODE_ALLOW_INVALID_DATES
                         != 0
                     && crate::util::temporal::parse_delimited_datetime_components(&s).is_some();
-            if !valid && !allowed_invalid_date {
+            let forbidden_zero = matches!(
+                ts.data_type,
+                SqlDataType::Date | SqlDataType::Datetime(..) | SqlDataType::Timestamp(..)
+            ) && crate::util::temporal::parse_delimited_datetime_components(
+                &s,
+            )
+            .is_some_and(|parts| {
+                let bits = current_parser_sql_mode_bits();
+                if parts.year == 0 && parts.month == 0 && parts.day == 0 {
+                    bits & crate::engine::api::TEMPORAL_MODE_NO_ZERO_DATE != 0
+                } else {
+                    (parts.month == 0 || parts.day == 0)
+                        && bits & crate::engine::api::TEMPORAL_MODE_NO_ZERO_IN_DATE != 0
+                }
+            });
+            if forbidden_zero || !valid && !allowed_invalid_date {
                 let mut err = parse_error_at_span(
                     expr.span(),
                     format!("Incorrect {} value: '{}'", ts.data_type, s),
@@ -6265,8 +6301,8 @@ fn convert_cast_data_type(data_type: &SqlDataType) -> Result<(String, Vec<Expr>)
             ("CHAR".to_string(), extra)
         }
         SqlDataType::Date => ("DATE".to_string(), vec![]),
-        SqlDataType::Datetime(p) => ("DATETIME".to_string(), cast_fsp_extra(*p)),
-        SqlDataType::Time(p, _) => ("TIME".to_string(), cast_fsp_extra(*p)),
+        SqlDataType::Datetime(p) => ("DATETIME".to_string(), cast_fsp_extra(*p)?),
+        SqlDataType::Time(p, _) => ("TIME".to_string(), cast_fsp_extra(*p)?),
         SqlDataType::Decimal(info) | SqlDataType::Dec(info) => {
             let mut extra = vec![];
             match info {
@@ -8691,7 +8727,21 @@ fn resolve_named_windows(mut items: Vec<NamedWindowDef>) -> Result<Vec<NamedWind
     Ok(items)
 }
 
+fn window_resolution_error(message: String) -> ParseError {
+    let mut err = ParseError::at_zero(message);
+    if err.message.contains("has a frame definition") {
+        err.spec = crate::error::catalog::ER_WINDOW_NO_INHERIT_FRAME;
+    }
+    err
+}
+
 fn validate_window_inherit(parent: &NamedWindowDef, child: &NamedWindowDef) -> Result<(), String> {
+    if parent.frame.is_some() {
+        return Err(format!(
+            "Window '{}' has a frame definition, so cannot be referenced by another window.",
+            parent.name
+        ));
+    }
     if !child.partition_by.is_empty() {
         return Err(format!(
             "window '{}' inheriting from '{}' cannot redefine PARTITION BY",
@@ -8733,6 +8783,7 @@ fn resolve_window_inherits_in_expr(
                 order_by,
                 frame,
                 inherits,
+                direct_reference,
                 ..
             } = spec.as_mut();
 
@@ -8742,6 +8793,9 @@ fn resolve_window_inherits_in_expr(
                     .iter()
                     .find(|w| w.name.eq_ignore_ascii_case(&parent_name))
                     .ok_or_else(|| format!("named window '{}' is not defined", parent_name))?;
+                if parent.frame.is_some() && !*direct_reference {
+                    return Err(format!("Window '{}' has a frame definition, so cannot be referenced by another window.", parent.name));
+                }
                 if !partition_by.is_empty() {
                     return Err(format!(
                         "OVER ({} ...) cannot redefine PARTITION BY",
@@ -8761,6 +8815,7 @@ fn resolve_window_inherits_in_expr(
                 if frame.is_none() {
                     *frame = parent.frame.clone();
                 }
+                *direct_reference = false;
             }
             Ok(())
         }
@@ -9050,13 +9105,17 @@ fn is_sql_interval_expr(expr: &SqlExpr) -> bool {
 }
 
 /// Pass a `CAST(x AS DATETIME(N))` / `TIME(N)` fractional-seconds precision
-/// through to the evaluator as an extra integer argument. Clamped to MySQL's
-/// 0..=6 range; absent precision produces no extra arg (fsp 0).
-fn cast_fsp_extra(p: Option<u64>) -> Vec<Expr> {
-    match p {
-        Some(n) => vec![Expr::Literal(Literal::Int(n.min(6) as i64))],
-        None => vec![],
+/// through to the evaluator as an extra integer argument after validation.
+fn cast_fsp_extra(p: Option<u64>) -> Result<Vec<Expr>, ParseError> {
+    if let Some(n) = p.filter(|n| *n > 6) {
+        let mut err = ParseError::at_zero(format!(
+            "Too-big precision {n} specified for 'CAST'. Maximum is 6."
+        ));
+        err.spec = crate::error::catalog::ER_TOO_BIG_PRECISION;
+        return Err(err);
     }
+    Ok(p.map(|n| vec![Expr::Literal(Literal::Int(n as i64))])
+        .unwrap_or_default())
 }
 
 fn function_args_distinct(args: &FunctionArguments) -> bool {

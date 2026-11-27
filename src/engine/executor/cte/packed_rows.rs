@@ -74,7 +74,20 @@ impl PackedRows {
         let heap = row.iter().map(Value::allocated_bytes).sum::<usize>();
         let bytes = self.prepare_row(row.len(), heap)?;
         for (column, value) in self.columns.iter_mut().zip(row) {
-            column.push(value.clone());
+            // Inline cells need no general heap-owning Value clone dispatcher.
+            // Payload-bearing lanes retain their existing deep-copy behavior.
+            column.push(match value {
+                Value::Null => Value::Null,
+                Value::Int(value) => Value::Int(*value),
+                Value::UInt(value) => Value::UInt(*value),
+                Value::Float(value) => Value::Float(*value),
+                Value::Double(value) => Value::Double(*value),
+                Value::DecimalCompact(magnitude, scale) => {
+                    Value::DecimalCompact(*magnitude, *scale)
+                }
+                Value::Decimal128(magnitude, scale) => Value::Decimal128(*magnitude, *scale),
+                other => other.clone(),
+            });
         }
         self.finish_row(bytes)
     }

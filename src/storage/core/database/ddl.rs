@@ -1,13 +1,3 @@
-fn validate_add_index_backend(table: &TableSchema, index: &IndexSchema) -> Result<(), QueryError> {
-    if table.partitioning.is_some() && index.is_spatial() {
-        return Err(error(
-            crate::error::catalog::ER_NOT_SUPPORTED_YET,
-            "ADD SPATIAL INDEX on a partitioned table is not supported; define the index in CREATE TABLE",
-        ));
-    }
-    Ok(())
-}
-
 fn set_column_default_in_candidate(
     table: &mut TableSchema,
     idx: usize,
@@ -562,6 +552,7 @@ struct PreparedCreateTableSchema {
 }
 
 /// Crash-safe file exchange shared by ALTER COPY and bulk shadow loads.
+#[derive(Clone)]
 struct ShadowGenerationFileSwap {
     in_place_schema: Option<Arc<TableSchema>>,
     old_to_backup: Vec<(PathBuf, PathBuf)>,
@@ -619,6 +610,15 @@ impl<'a> AlterCopyDefaults<'a> {
     }
 
     fn apply(&self, target: &TableSchema, values: &mut Vec<Value>) -> Result<(), QueryError> {
+        self.apply_with_auto(target, values, None)
+    }
+
+    fn apply_with_auto(
+        &self,
+        target: &TableSchema,
+        values: &mut Vec<Value>,
+        assigned: Option<Value>,
+    ) -> Result<(), QueryError> {
         while values.len() < target.columns.len() {
             values.push(
                 crate::engine::executor::insert::column_read_backfill_default(
@@ -627,20 +627,24 @@ impl<'a> AlterCopyDefaults<'a> {
             );
         }
         if let Some(idx) = self.auto_increment {
-            let mut current = self.job.auto_increment_max.load(Ordering::Relaxed);
-            let next = loop {
-                let next = next_auto_increment_after(current, self.step, self.offset)?;
-                match self.job.auto_increment_max.compare_exchange_weak(
-                    current,
-                    next,
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                ) {
-                    Ok(_) => break next,
-                    Err(actual) => current = actual,
-                }
-            };
-            values[idx] = generated_auto_increment_value(next, &target.columns[idx])?;
+            if let Some(assigned) = assigned {
+                values[idx] = assigned;
+            } else {
+                let mut current = self.job.auto_increment_max.load(Ordering::Relaxed);
+                let next = loop {
+                    let next = next_auto_increment_after(current, self.step, self.offset)?;
+                    match self.job.auto_increment_max.compare_exchange_weak(
+                        current,
+                        next,
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    ) {
+                        Ok(_) => break next,
+                        Err(actual) => current = actual,
+                    }
+                };
+                values[idx] = generated_auto_increment_value(next, &target.columns[idx])?;
+            }
         }
         for (idx, expr) in &self.expressions {
             values[*idx] = crate::engine::expr::eval_expr(expr, target, values)?;
@@ -3435,79 +3439,12 @@ impl Database {
     }
 
     pub fn drop_table(&self, name: &str) -> Result<(), QueryError> {
-        if self.disk_space_limited() {
-            return self.drop_tables(&[name.to_owned()], false);
-        }
-        if self.recyclebin_enabled() { return self.recycle_drop_tables(&[name.to_string()], false); }
-        let (database, table_name) = split_table_name(DEFAULT_DATABASE, name);
-        check_table_ddl_writable(&database)?;
-        let key = table_key(&database, &table_name);
-        // Resolve a complete descriptor before entering any catalog critical
-        // section. After restart `catalog.tables` may contain only a compact
-        // header; path/FK/index cleanup needs the lazily decoded descriptor,
-        // and the intent path helpers need the catalog row to remain live.
-        let Some(table) = self.table_by_key(&key) else {
-            return Err(error(
-                crate::error::catalog::ER_BAD_TABLE_ERROR,
-                format!("unknown table '{name}'"),
-            ));
-        };
-        // M2.2 - DDL X lock semantics: ensure no active DML holds IX/S/SIX.
-        self.check_ddl_table_lock(table.id)?;
-        // Refuse to drop a table another table references via FK — unless the
-        // session set `foreign_key_checks=0`, which MySQL 8.0 honours for DROP
-        // (the child's constraint is left dangling). This is the standard
-        // mysqldump / ordered-rebuild idiom.
-        if fk_checks_enabled() {
-            self.fk_reject_table_referenced(&table, false)?;
-        }
-        // Crash-safe DROP (commit-first, see drop_table_recovery.rs): record a
-        // durable intent listing every physical file, commit the catalog change
-        // (the atomic point), then unlink the files. A crash before the commit
-        // leaves table + files + intent intact (recovery drops the stale
-        // intent); a crash after it is finished by `recover_drop_tables`.
-        let intent = self.build_drop_table_intent(&table)?;
-        self.stage_table_retirement(&intent)?;
-        let intent_path = None;
-        // Catalog commit point.
-        {
-            let mut catalog = self.catalog_write()?;
-            if catalog.tables.remove(&key).is_none() {
-                // A concurrent drop won the race and already purged the files.
-                self.remove_drop_table_intent(intent_path.as_ref());
-                return Ok(());
-            }
-            catalog.triggers.retain(|_, trigger| {
-                let keep = normalize_name(&trigger.table_database) != database
-                    || normalize_name(&trigger.table_name) != table_name;
-                if !keep {
-                    self.note_catalog_trigger(&trigger.database, &trigger.name);
-                }
-                keep
-            });
-            // Rebuild reverse FK caches only when the dropped table referenced
-            // other tables (child side): that is the sole case that leaves a
-            // stale `fk_referenced_by` entry on a surviving parent. Dropping a
-            // table with no outbound FK cannot invalidate any other table's
-            // caches, so we skip the O(catalog) rebuild entirely (PF1).
-            if !table.foreign_keys.is_empty() {
-                build_fk_runtime(&mut catalog);
-            }
-        }
-        self.note_catalog_table(table.id);
-        self.commit_ddl_catalog_txn()?;
-        // Post-commit physical purge (idempotent; recovery redoes it on crash).
-        let caches_evicted = self.evict_dropped_table_caches(&table).is_ok();
-        self.catalog.forget_dropped_table(&key, &table);
-        self.table_write_epochs.write().remove(&table.id);
-        self.drop_table_modification_delta_without_epoch(table.id);
-        if caches_evicted && self.purge_dropped_table_files(&intent) {
-            self.remove_drop_table_intent(intent_path.as_ref());
-        }
-        Ok(())
+        self.drop_tables(&[name.to_owned()], false)
     }
 
     pub fn drop_tables(&self, names: &[String], if_exists: bool) -> Result<(), QueryError> {
+        #[cfg(test)]
+        let _hold = FulltextDropHoldTimer(Instant::now());
         if self.recyclebin_enabled() {
             self.check_disk_write()?;
             return self.recycle_drop_tables(names, if_exists);
@@ -3578,6 +3515,22 @@ impl Database {
                 }
             }
         }
+        // SQL MDL drains SQL writers; storage locks also fence direct callers
+        // until every retired identity has a rejecting schema floor.
+        let lock_txn = self.begin_read_only_txn()?;
+        let _storage_guard = OnlineIndexTxnGuard {
+            db: self,
+            txn_id: lock_txn.txn_id,
+        };
+        let mut lock_ids = resolved
+            .iter()
+            .flat_map(|(_, table)| table.storage_ids().into_iter().chain([table.id]))
+            .collect::<Vec<_>>();
+        lock_ids.sort_unstable();
+        lock_ids.dedup();
+        for id in lock_ids {
+            self.acquire_table_exclusive(lock_txn.txn_id, id)?;
+        }
         // Snapshot the tables to drop and their intent file lists while the
         // catalog still points at them (the intent builder resolves paths via
         // `table_loc_fs`, which needs the live catalog row). Crash-safe DROP is
@@ -3635,17 +3588,15 @@ impl Database {
             self.note_catalog_table(table.id);
         }
         self.commit_ddl_catalog_txn()?;
-        // Post-commit physical purge (idempotent; recovery redoes it on crash).
-        for (table, intent, intent_path) in &dropped {
-            let caches_evicted = self.evict_dropped_table_caches(table).is_ok();
-            let key = table_key(&table.database, &table.name);
-            self.catalog.forget_dropped_table(&key, table);
-            self.table_write_epochs.write().remove(&table.id);
-            self.drop_table_modification_delta_without_epoch(table.id);
-            if caches_evicted && self.purge_dropped_table_files(intent) {
-                self.remove_drop_table_intent(intent_path.as_ref());
+        for (table, intent, _) in &dropped {
+            self.finish_retired_table_publication(table);
+            // Emergency DROP must still release disk headroom before returning.
+            // Ordinary cleanup runs from the committed retirement manifest.
+            if disk_limited {
+                self.purge_dropped_table_files(intent);
             }
         }
+        self.request_catalog_retirement_cleanup();
         Ok(())
     }
 
@@ -3725,6 +3676,8 @@ impl Database {
         let retired_path: Option<PathBuf> = None;
         if recycled.is_none() { self.stage_table_retirement(&retired)?; }
         let mut private = DropTableIntent {
+            retired_table_cache: None,
+            retired_fulltext: None,
             retired_index: None,
             table_id: candidate.id,
             had_auto_increment: candidate.auto_increment_column_index().is_some(),
@@ -3817,15 +3770,11 @@ impl Database {
             return Err(err);
         }
         self.remove_drop_table_intent(private_path.as_ref());
-        if recycled.is_none() && self.evict_dropped_table_caches(&table).is_ok()
-            && self.purge_dropped_table_files(&retired)
-        {
-            self.remove_drop_table_intent(retired_path.as_ref());
-        }
-        self.catalog.forget_dropped_table(&key, &table);
         if recycled.is_none() {
-            self.table_write_epochs.write().remove(&table.id);
-            self.drop_table_modification_delta_without_epoch(table.id);
+            self.finish_retired_table_publication(&table);
+            self.request_catalog_retirement_cleanup();
+        } else {
+            self.catalog.forget_dropped_table(&key, &table);
         }
         Ok(())
     }
@@ -4379,7 +4328,6 @@ impl Database {
         index: &IndexSchema,
     ) -> Result<(), QueryError> {
         let table = self.table(table_name)?;
-        validate_add_index_backend(&table, index)?;
         if index.primary && !index.unique {
             enforce_existing_primary_key_not_null(self, &table, &index.columns)?;
         }
@@ -4695,7 +4643,6 @@ impl Database {
             .ok_or_else(|| ddl_table_not_found(&table_name))?;
         implicit_spatial_index(&mut index, &table);
         warn_btree_descending(&index.index_type, &index.column_directions);
-        validate_add_index_backend(&table, &index)?;
         if index.is_fulltext() {
             let collation = index.columns.first().and_then(|name| table.column_index(name).ok())
                 .and_then(|position| table.columns[position].collation.as_deref())
@@ -5400,7 +5347,7 @@ impl Database {
         Ok(())
     }
 
-    /// INSTANT DROP COLUMN — flips the target column's lifecycle state
+    /// Prepare the DROP COLUMN candidate by changing its lifecycle state
     /// to [`ColumnState::Dropped`] (tombstone) without rewriting any
     /// heap data. Existing row layouts remain readable by `layout_id`,
     /// while the newly-published active layout omits the dropped column
@@ -5412,16 +5359,11 @@ impl Database {
     /// PRIMARY/foreign-key and expression dependencies are validated before
     /// mutation. Secondary-index cascades build private replacement trees and
     /// publish them with the tombstone; the heap is never copied.
-    pub fn drop_column(&self, table_name: &str, column_name: &str) -> Result<(), QueryError> {
-        let (database, table_only) = split_table_name(DEFAULT_DATABASE, table_name);
-        check_table_ddl_writable(&database)?;
-        let key = table_key(&database, &table_only);
-        // Pre-checks + index cascade planning on a read snapshot, so the
-        // cascade (drop_index / add_index) can take their own catalog locks
-        // before we grab the write lock for the column tombstone.
-        let snapshot = self
-            .table_by_key(&key)
-            .ok_or_else(|| ddl_table_not_found(&table_name))?;
+    fn drop_column_candidate(
+        &self,
+        snapshot: &TableSchema,
+        column_name: &str,
+    ) -> Result<TableSchema, QueryError> {
         if snapshot.visible_column_count() <= 1 {
             return Err(error(
                 crate::error::catalog::ER_CANT_REMOVE_ALL_FIELDS,
@@ -5460,12 +5402,11 @@ impl Database {
         // MySQL: dropping a column referenced by an index cascades to the
         // index — a single-column / functional / special index is dropped,
         // and a plain composite index drops just that column (issue #83).
-        // Only foreign-key backing indexes still block the drop (handled by
-        // fk_reject_column_referenced above). Execute the cascade via the
-        // self-locking helpers before the tombstone.
+        // Foreign-key backing indexes still block the drop (validated above).
+        // Build and validate every replacement before publishing this candidate.
         let (indexes_to_drop, indexes_to_rebuild) =
             plan_index_cascade_for_drop_column(&snapshot, column_name)?;
-        let mut candidate = snapshot.as_ref().clone();
+        let mut candidate = snapshot.clone();
         candidate
             .indexes
             .retain(|index| !indexes_to_drop.contains(&index.name));
@@ -5492,6 +5433,22 @@ impl Database {
         candidate.build_column_index();
         validate_auto_increment_schema(&candidate)?;
         candidate.bump_schema_version();
+        Ok(candidate)
+    }
+
+    pub fn drop_column(&self, table_name: &str, column_name: &str) -> Result<(), QueryError> {
+        #[cfg(test)]
+        let _hold = DropColumnHoldTimer::start();
+        let (database, table_only) = split_table_name(DEFAULT_DATABASE, table_name);
+        check_table_ddl_writable(&database)?;
+        let key = table_key(&database, &table_only);
+        // Pre-checks + index cascade planning on a read snapshot, so the
+        // cascade (drop_index / add_index) can take their own catalog locks
+        // before we grab the write lock for the column tombstone.
+        let snapshot = self
+            .table_by_key(&key)
+            .ok_or_else(|| ddl_table_not_found(&table_name))?;
+        let candidate = self.drop_column_candidate(&snapshot, column_name)?;
         let replacements = candidate
             .indexes
             .iter()
@@ -5517,6 +5474,8 @@ impl Database {
             lock_ids.sort_unstable();
             lock_ids.dedup();
             self.try_online_index_data_barrier(txn.txn_id, &lock_ids)?;
+            #[cfg(test)]
+            self.pause_ddl_backfill_for_test();
             let mut paths = Vec::new();
             let result = (|| {
                 let _lsn = btree_logical_wal::LsnScope::new(Some(self.log.lock().last_lsn()));
@@ -5616,6 +5575,8 @@ impl Database {
     }
 
     pub fn drop_index(&self, table_name: &str, index_name: &str) -> Result<(), QueryError> {
+        #[cfg(test)]
+        let _hold = FulltextDropHoldTimer(Instant::now());
         let _definition = self.pin_ddl_table(table_name)?;
         let _role = self.zone_map_gate.read_recursive();
         self.ensure_writable()?;
@@ -5697,6 +5658,8 @@ impl Database {
             (table_snapshot, dropped_index)
         };
         let mut retired = DropTableIntent {
+            retired_table_cache: None,
+            retired_fulltext: None,
             table_id: table_snapshot.id,
             retired_index: Some((
                 dropped_index.index_id,
@@ -5773,9 +5736,7 @@ impl Database {
             self.table_locks_sharded
                 .set_schema_floor(id, table_snapshot.schema_version.saturating_add(1));
         }
-        if self.config.durability != DurabilityMode::Relaxed {
-            self.purge_dropped_table_files(&retired);
-        }
+        self.request_catalog_retirement_cleanup();
         Ok(())
     }
 
@@ -8037,17 +7998,6 @@ impl Database {
                 "online OPTIMIZE TABLE requires a durable storage backend",
             ));
         }
-        if source.indexes.iter().any(|index| {
-            !["BTREE", "FULLTEXT", "SPATIAL"]
-                .iter()
-                .any(|kind| index.index_type.eq_ignore_ascii_case(kind))
-                && !index.is_vector()
-        }) {
-            return Err(error(
-                crate::error::catalog::ER_NOT_SUPPORTED_YET,
-                "online OPTIMIZE TABLE does not support this index type",
-            ));
-        }
         // FULLTEXT candidates currently carry only RowId, which is local to
         // one partition. Compaction can make previously distinct local ids
         // collide in that query path. Reject before changing any files until
@@ -8056,6 +8006,12 @@ impl Database {
             return Err(error(
                 crate::error::catalog::ER_NOT_SUPPORTED_YET,
                 "online OPTIMIZE TABLE does not support partitioned FULLTEXT indexes",
+            ));
+        }
+        if !online_copy_indexes_supported(&source) {
+            return Err(error(
+                crate::error::catalog::ER_NOT_SUPPORTED_YET,
+                "online OPTIMIZE TABLE does not support this index type",
             ));
         }
         let mut target = source.as_ref().clone();
@@ -8097,6 +8053,8 @@ impl Database {
         strict: bool,
     ) -> Result<Vec<crate::engine::api::SqlWarning>, QueryError> {
         #[cfg(test)]
+        let _offline_hold = OnlineCopyHoldTimer(Instant::now());
+        #[cfg(test)]
         if !ddl_copy_streaming_enabled() {
             return self.rewrite_table_for_alter_copy_legacy_oracle(
                 table_name, old_table, candidate, strict,
@@ -8105,7 +8063,7 @@ impl Database {
         candidate.reset_row_layouts_for_rewrite();
         candidate.build_column_index();
         let _binlog = crate::binlog::SessionSqlLogBinGuard::new(false);
-        if old_table.is_partitioned() {
+        let result = if old_table.is_partitioned() {
             let job = self.register_alter_copy_job(&old_table);
             let id = old_table.id;
             let result =
@@ -8116,7 +8074,11 @@ impl Database {
             self.rewrite_table_for_alter_copy_streaming_direct(
                 table_name, old_table, candidate, strict, None, None,
             )
+        };
+        if result.is_ok() {
+            self.request_catalog_retirement_cleanup();
         }
+        result
     }
 
     // Differential oracle only: production never destructively rewrites a live heap.
@@ -8218,6 +8180,7 @@ impl Database {
             }
 
             Self::enter_alter_copy_finalizing(&job)?;
+            self.publish_alter_copy_auto_increment(&candidate, &job)?;
             self.begin_alter_copy_crash_marker(&old_table, &candidate)?;
             {
                 let mut catalog = self.catalog_write()?;
@@ -8309,6 +8272,10 @@ impl Database {
         // RC writer transactions do not retain undo for the source scan.
         // Register before choosing the writer view, atomically with purge.
         let _source_snapshot = StorageReadSnapshot::new(self);
+        let mut sync_guard = (self.config.durability != DurabilityMode::Memory)
+            .then(|| CopyPublicationGuard::new(self, job.job_id)).transpose()?;
+        let mut prepared_files: Option<PreparedCopyFiles> = None;
+        let mut deciding = false;
         let ddl_txn = self.begin_txn()?;
         let ddl_txn_id = ddl_txn.txn_id;
         candidate.row_generation_txn_id = ddl_txn_id;
@@ -8628,6 +8595,15 @@ impl Database {
             btree_logical_wal::set_bulk_sync_deferred(previous_deferred_sync);
             btree_logical_wal::set(previous_index_lsn);
             index_result?;
+            if !external {
+                // Direct appends advanced the on-disk allocation frontier.
+                // Lazy LOB initialization may have cached its earlier meta
+                // page. A subsequent LOB flag update must not overwrite that
+                // frontier with the pre-build value. The private direct pass
+                // has no buffered heap writes to preserve here.
+                let key = self.heap_handle(shadow_id)?.read().file_key.clone();
+                self.buffer_pool.discard_page(&PageKey { file: key, page_id: 0 })?;
+            }
             self.build_online_copy_vectors(&shadow_table, shadow_id)?;
             self.flush_online_copy_vectors(&shadow_table, shadow_id)?;
             if external {
@@ -8708,10 +8684,37 @@ impl Database {
                     )
                 }));
             DDL_COPY_SHADOW_BYTES.fetch_add(shadow_bytes, Ordering::Relaxed);
+            if let Some(guard) = &mut sync_guard {
+                let files = PreparedCopyFiles::new(self, &old_table, &candidate, shadow_id, job.job_id);
+                // A single complete private baseline precedes every logical
+                // tail. The commit-time binding reuses this history remotely.
+                let private = ShadowGenerationFileSwap {
+                    in_place_schema: None, old_to_backup: Vec::new(),
+                    shadow_to_live: files.expected.iter().map(|(path, _)| (path.clone(), path.clone())).collect(),
+                };
+                self.log_copied_generation(ddl_txn_id, &private)?;
+                #[cfg(test)]
+                self.copy_file_test_point(1)?;
+                self.flush_online_copy_shadow(&old_table)?;
+                prepared_files = Some(files);
+                let files = prepared_files.as_mut().unwrap();
+                files.prepare(self, guard)?;
+                if files.swap.shadow_to_live.iter().any(|(path, _)| path.extension().is_some_and(|ext| ext == "idx")) {
+                    guard.index_publication_txn = Some(ddl_txn_id);
+                }
+                #[cfg(test)]
+                self.copy_file_test_point(2)?;
+            }
+            self.backfill_copied_fulltext_statistics(ddl_txn, &candidate, shadow_id, candidate.id)?;
             if let Some((owner, _)) = online_barrier {
                 Self::set_alter_copy_job_state(&job, "CATCH_UP");
                 let _replay_timer = OnlineIndexTimer(&DDL_COPY_REPLAY_US, Instant::now());
                 let mut mapping = online_rows.lock();
+                let statistics = candidate
+                    .indexes
+                    .iter()
+                    .any(IndexSchema::is_fulltext)
+                    .then_some(&candidate);
                 let mut attempts = 0;
                 loop {
                     Self::check_alter_copy_cancelled(&job)?;
@@ -8720,6 +8723,7 @@ impl Database {
                     self.replay_online_copy_rows(
                         &old_table,
                         &shadow_table,
+                        statistics,
                         ddl_txn,
                         &job,
                         &mut mapping,
@@ -8729,6 +8733,14 @@ impl Database {
                     )?;
                     self.flush_online_copy_shadow(&shadow_table)?;
                     self.flush_online_copy_shadow(&old_table)?;
+                    if let (Some(files), Some(guard)) = (&mut prepared_files, &mut sync_guard) {
+                        files.prepare(self, guard)?;
+                        for index in shadow_table.indexes.iter().filter(|index| index.is_vector()) {
+                            for path in self.owned_vector_files(&shadow_table, index, shadow_id)? {
+                                guard.retain_file(&path)?;
+                            }
+                        }
+                    }
                     #[cfg(test)]
                     {
                         let hook = self.online_copy_publish_test_hook.lock().unwrap().take();
@@ -8757,6 +8769,7 @@ impl Database {
                         self.replay_online_copy_rows(
                             &old_table,
                             &shadow_table,
+                            statistics,
                             ddl_txn,
                             &job,
                             &mut mapping,
@@ -8764,9 +8777,21 @@ impl Database {
                             &mut warnings,
                             Some(online_copy_deadline()),
                         )?;
-                        self.flush_online_copy_shadow(&shadow_table)?;
-                        _final_hold = Some(held);
-                        break;
+                        let unbound = prepared_files.as_ref().map_or(Ok(false), PreparedCopyFiles::has_unbound)?;
+                        if !unbound {
+                            if let Some(guard) = &mut sync_guard {
+                                // Retain any source LOB created since the last
+                                // outside flush, including when COPY drops it.
+                                guard.retain_file(&self.overflow_path(old_table.id))?;
+                                guard.pending = true;
+                                self.flush_copy_pages_without_sync(&old_table)?;
+                                self.flush_copy_pages_without_sync(&shadow_table)?;
+                            }
+                            _final_hold = Some(held);
+                            break;
+                        }
+                        // A new optional file needs a durable binding. Prepare
+                        // it outside X, then retry; never fsync it under X.
                     }
                     self.table_locks_sharded
                         .downgrade_exclusive_to_intent_shared(ddl_txn_id, old_table.id)?;
@@ -8781,8 +8806,8 @@ impl Database {
                     }
                 }
             }
-            self.backfill_copied_fulltext_statistics(ddl_txn, &candidate, shadow_id, candidate.id)?;
             Self::enter_alter_copy_finalizing(&job)?;
+            self.publish_alter_copy_auto_increment(&candidate, &job)?;
             let swap_started = Instant::now();
             let memory_graphs =
                 if !vector_storage_paged() || self.config.durability == DurabilityMode::Memory {
@@ -8845,8 +8870,13 @@ impl Database {
             }
             self.evict_table_vector_graphs(old_table.id);
             self.evict_table_vector_graphs(shadow_id);
-            let file_swap =
-                self.swap_shadow_generation_files(&old_table, &candidate, shadow_id, job.job_id)?;
+            // The links and directory durability were prepared outside X.
+            // Final-tail pages are already written, with redo pinned until the
+            // deferred data fsync completes after releasing source exclusion.
+            self.invalidate_generation_handles(&old_table)?;
+            self.invalidate_generation_handles(&shadow_table)?;
+            let file_swap = prepared_files.as_ref().expect("durable COPY binding").swap.clone();
+            if let Some(guard) = &mut sync_guard { guard.pending = true; }
 
             let key = table_key(&candidate.database, &candidate.name);
             {
@@ -8867,9 +8897,9 @@ impl Database {
                 .chain(file_swap.shadow_to_live.iter().map(|(shadow, _)| shadow))
                 .map(|path| self.relative_path(path))
                 .collect();
-            self.publish_copied_vector_owners(&candidate, &old_table, shadow_id, old_table.id, &memory_graphs)?;
             let publish = self
-                .log_copied_generation(ddl_txn_id, &file_swap)
+                .publish_copied_vector_owners(&candidate, &old_table, shadow_id, old_table.id, &memory_graphs)
+                .and_then(|_| self.log_copy_file_bindings(ddl_txn_id, prepared_files.as_ref().unwrap()))
                 .and_then(|_| {
                     self.append_wal(
                         ddl_txn_id,
@@ -8879,8 +8909,17 @@ impl Database {
                         },
                     )
                 })
-                .and_then(|_| self.commit_catalog_txn_existing(ddl_txn));
+                .and_then(|_| {
+                    #[cfg(test)]
+                    self.copy_file_test_point(3)?;
+                    deciding = true;
+                    self.commit_catalog_txn_existing(ddl_txn)
+                });
             if let Err(err) = publish {
+                if deciding {
+                    self.quarantine_mvcc(format!("COPY catalog decision needs recovery: {}", err.message()));
+                    return Err(err);
+                }
                 if let Ok(mut catalog) = self.catalog_write() {
                     if let Some(table_arc) = catalog.tables.get_mut(&key) {
                         *Arc::make_mut(table_arc) = old_table.as_ref().clone();
@@ -8895,6 +8934,18 @@ impl Database {
                 return Err(err);
             }
             published = true;
+            // Commit-time deferred index work can dirty handles again. Write
+            // those bounded changes before letting a new final-path writer in;
+            // data fsync and its completion proof still happen after release.
+            if let Err(err) = self.flush_copy_pages_without_sync(&shadow_table)
+                .and_then(|_| self.flush_copy_pages_without_sync(&candidate))
+            {
+                self.quarantine_mvcc(format!("COPY committed page writeback needs recovery: {}", err.message()));
+                return Err(err);
+            }
+            self.invalidate_generation_handles(&shadow_table)?;
+            #[cfg(test)]
+            self.copy_file_test_point(4)?;
             #[cfg(test)]
             if let Some(hook) = self.vector_copy_committed_test_hook.lock().unwrap().take() {
                 hook.pause();
@@ -8916,7 +8967,7 @@ impl Database {
                     graph,
                 );
             }
-            self.vector_copy_publications.lock().remove(&ddl_txn_id);
+            self.vector_ddl_publications.lock().remove(&ddl_txn_id);
             self.vector_pending_wal.lock().remove(&ddl_txn_id);
             self.table_locks_sharded
                 .set_schema_floor(old_table.id, candidate.schema_version);
@@ -8950,7 +9001,7 @@ impl Database {
             Ok(warnings)
         })();
 
-        if result.is_err() {
+        if result.is_err() && !deciding {
             let active = self
                 .txns
                 .read()
@@ -8965,6 +9016,28 @@ impl Database {
             self.notify_non_row_lock_waiters();
         }
         drop(_final_hold);
+        if deciding && result.is_err() {
+            // Preserve all files and redo once a catalog decision was attempted.
+            // A committed writeback error also requires restart, not cleanup.
+            self.quarantine_mvcc("COPY publication requires restart recovery");
+            return result;
+        }
+        #[cfg(test)]
+        self.copy_file_test_point(5)?;
+        if let Some(guard) = &mut sync_guard {
+            if !published { guard.index_publication_txn = None; }
+            if let Err(err) = guard.sync() {
+                self.quarantine_mvcc(format!("COPY deferred data sync needs recovery: {}", err.message()));
+                return Err(err);
+            }
+        }
+        #[cfg(test)]
+        self.copy_file_test_point(6)?;
+        if !published {
+            if let Some(files) = &prepared_files {
+                self.rollback_shadow_generation_file_swap(&files.swap)?;
+            }
+        }
         let _ = self.remove_heap_cache_entry(shadow_id);
         for index in &candidate.indexes {
             let _ = self.remove_index_cache_entry(shadow_id, &index.name);
@@ -9689,9 +9762,48 @@ impl Database {
         })
     }
 
-    /// Direct COPY output is durable locally but has no row redo. Publish a
-    /// bounded physical baseline at its final paths before committing the DD.
-    /// Replication and backup replay cannot follow local hard links or intents.
+    // Private and published page files use the same bounded WAL baseline.
+    // No replica may consume a private heap delta before this declaration.
+    fn log_copied_page_file(&self, txn_id: u64, path: &Path) -> Result<(), QueryError> {
+        if self.config.durability == DurabilityMode::Memory {
+            return Ok(());
+        }
+        let _charge = crate::engine::executor::mem_budget::ControlledMemoryCharge::try_new(
+            crate::engine::executor::mem_budget::ControlledMemoryCategory::DdlCopy,
+            4 * PAGE_SIZE,
+        )?;
+        let relative = self.relative_path(path);
+        let mut file = File::open(path).map_err(io_err)?;
+        let total = file.metadata().map_err(io_err)?.len();
+        if total == 0 || total % PAGE_SIZE as u64 != 0 {
+            return Err(error(
+                crate::error::catalog::ER_GET_ERRNO,
+                "copied generation has invalid page file length",
+            ));
+        }
+        let mut page = vec![0; PAGE_SIZE];
+        file.read_exact(&mut page).map_err(io_err)?;
+        self.append_wal(
+            txn_id,
+            WalPayload::FileCreate {
+                path: relative.clone(),
+                after: page.clone(),
+            },
+        )?;
+        for page_id in 1..total / PAGE_SIZE as u64 {
+            crate::engine::cancel::check_cancelled()?;
+            file.read_exact(&mut page).map_err(io_err)?;
+            self.append_wal(
+                txn_id,
+                WalPayload::full_page_image(relative.clone(), page_id, page.clone()),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Declare direct COPY output in bounded physical records before tail
+    /// replay. FilePublish later reuses this private history at final paths;
+    /// replicas and backup replay never depend on source-local hard links.
     fn log_copied_generation(
         &self,
         txn_id: u64,
@@ -9700,19 +9812,15 @@ impl Database {
         if self.config.durability == DurabilityMode::Memory {
             return Ok(());
         }
-        let _charge = crate::engine::executor::mem_budget::ControlledMemoryCharge::try_new(
-            crate::engine::executor::mem_budget::ControlledMemoryCategory::DdlCopy,
-            4 * PAGE_SIZE,
-        )?;
         for (_, path) in &swap.shadow_to_live {
             let ext = path.extension().and_then(|ext| ext.to_str()).unwrap_or("");
             if matches!(ext, "idx" | "vmanifest") || !path.try_exists().map_err(io_err)? {
                 continue;
             }
-            let relative = self.relative_path(path);
-            let mut file = File::open(path).map_err(io_err)?;
-            let total = file.metadata().map_err(io_err)?.len();
             if matches!(ext, "hvec" | "hnsw") {
+                let relative = self.relative_path(path);
+                let mut file = File::open(path).map_err(io_err)?;
+                let total = file.metadata().map_err(io_err)?.len();
                 let _vector_charge =
                     crate::engine::executor::mem_budget::ControlledMemoryCharge::try_new(
                         crate::engine::executor::mem_budget::ControlledMemoryCategory::DdlCopy,
@@ -9736,29 +9844,7 @@ impl Database {
                 }
                 continue;
             }
-            if total == 0 || total % PAGE_SIZE as u64 != 0 {
-                return Err(error(
-                    crate::error::catalog::ER_GET_ERRNO,
-                    "copied generation has invalid page file length",
-                ));
-            }
-            let mut page = vec![0; PAGE_SIZE];
-            file.read_exact(&mut page).map_err(io_err)?;
-            self.append_wal(
-                txn_id,
-                WalPayload::FileCreate {
-                    path: relative.clone(),
-                    after: page.clone(),
-                },
-            )?;
-            for page_id in 1..total / PAGE_SIZE as u64 {
-                crate::engine::cancel::check_cancelled()?;
-                file.read_exact(&mut page).map_err(io_err)?;
-                self.append_wal(
-                    txn_id,
-                    WalPayload::full_page_image(relative.clone(), page_id, page.clone()),
-                )?;
-            }
+            self.log_copied_page_file(txn_id, path)?;
         }
         Ok(())
     }
@@ -10132,12 +10218,26 @@ impl Database {
     fn prepare_alter_copy_values(
         &self,
         candidate: &TableSchema,
-        mut values: Vec<Value>,
+        values: Vec<Value>,
         strict: bool,
         warnings: &mut Vec<crate::engine::api::SqlWarning>,
         defaults: &AlterCopyDefaults<'_>,
     ) -> Result<Vec<Value>, QueryError> {
-        defaults.apply(candidate, &mut values)?;
+        self.prepare_alter_copy_values_with_auto(
+            candidate, values, strict, warnings, defaults, None,
+        )
+    }
+
+    fn prepare_alter_copy_values_with_auto(
+        &self,
+        candidate: &TableSchema,
+        mut values: Vec<Value>,
+        strict: bool,
+        warnings: &mut Vec<crate::engine::api::SqlWarning>,
+        defaults: &AlterCopyDefaults<'_>,
+        assigned: Option<Value>,
+    ) -> Result<Vec<Value>, QueryError> {
+        defaults.apply_with_auto(candidate, &mut values, assigned)?;
         coerce_row_for_alter_copy(candidate, &mut values, strict, warnings)?;
         materialize_generated_columns(candidate, &mut values, None)?;
         self.check_not_null_constraints(candidate, &values)?;
@@ -11392,11 +11492,15 @@ fn push_alter_copy_warning(
     spec: crate::error::ErrorSpec,
     message: impl Into<String>,
 ) {
-    warnings.push(crate::engine::api::SqlWarning::known(
-        crate::error::ConditionLevel::Warning,
-        spec,
-        message,
-    ));
+    let warning =
+        crate::engine::api::SqlWarning::known(crate::error::ConditionLevel::Warning, spec, message);
+    // SQL diagnostics counts every conversion but retains max_error_count
+    // conditions. Direct storage callers still receive the returned warnings.
+    if crate::engine::api::current_statement_warning_sink().is_some() {
+        crate::engine::api::push_sql_warning(warning);
+    } else {
+        warnings.push(warning);
+    }
 }
 
 /// Warning text for a lossy numeric coercion during ALTER COPY, keyed by
@@ -12044,10 +12148,13 @@ impl Database {
         // build. Use the existing table-X-lock direct bulk builder instead.
         // This compatibility storage entry point retains the incremental
         // Building -> Public opt-in for its remaining callers. Standalone
-        // secondary BTREE SQL instead uses add_indexes_for_sql: it bulk-loads
+        // index-only SQL instead uses add_indexes_for_sql: it bulk-loads
         // a private target while capturing DML, independent of this switch.
         // PRIMARY and non-opt-in callers here keep the offline bulk path.
-        if index.primary || !self.async_ddl_enabled() {
+        // This compatibility API has no statement SU owner. Vector callers
+        // retain its protected offline path; SQL uses the private writable
+        // candidate protocol in add_indexes_for_sql.
+        if index.primary || index.is_vector() || !self.async_ddl_enabled() {
             return self.add_index_offline_bulk_with_options(table_name, index, options);
         }
         // MySQL DDL completion is synchronous from the issuing connection's
@@ -12099,7 +12206,7 @@ impl Database {
         } else {
             None
         };
-        match action {
+        let result = match action {
             A::DropPartitions(names) => self.drop_partitions(table_name, &names),
             A::TruncatePartitions(targets) => {
                 self.rewrite_partition_storage_ids(table_name, &targets, false, true, cutover)
@@ -12145,7 +12252,11 @@ impl Database {
                 with_validation,
             } => self.exchange_partition(table_name, &partition, &table, with_validation),
             A::PartitionBy(def) => self.repartition_table(table_name, def, cutover),
+        };
+        if result.is_ok() {
+            self.request_catalog_retirement_cleanup();
         }
+        result
     }
 
     fn partition_maintenance_storage_ids(
@@ -12440,6 +12551,8 @@ impl Database {
     /// and LIST partition tables — MySQL rejects DROP PARTITION on
     /// HASH/KEY tables.
     fn drop_partitions(&self, table_name: &str, names: &[String]) -> Result<(), QueryError> {
+        #[cfg(test)]
+        let _hold = FulltextDropHoldTimer(Instant::now());
         let qualified = table_name.to_string();
         let (database, name) = split_table_name(DEFAULT_DATABASE, &qualified);
         let key = table_key(&database, &name);
@@ -13103,6 +13216,28 @@ impl Database {
         // the sole shadow storage id we build + fill.
         let mut candidate = table.as_ref().clone();
         candidate.partitioning = None;
+        // The logical root is reused as physical storage. Give every shared
+        // FULLTEXT corpus a fresh identity so deferred old-root retirement and
+        // its retained MVCC versions cannot alias the new incarnation.
+        let mut corpora = BTreeMap::new();
+        for index in &mut candidate.indexes {
+            let Some(meta) = index.fulltext.as_mut() else {
+                continue;
+            };
+            let next = match corpora.get(&meta.corpus_id) {
+                Some(id) => *id,
+                None => {
+                    let id = candidate.next_index_id.max(1);
+                    candidate.next_index_id = id
+                        .checked_add(1)
+                        .ok_or_else(|| fulltext_statistics_error("corpus identity exhausted"))?;
+                    corpora.insert(meta.corpus_id, id);
+                    id
+                }
+            };
+            meta.corpus_id = next;
+            meta.snapshot_origin_txn_id = u64::MAX;
+        }
         candidate.build_column_index();
         let build_sids = vec![table.id];
 
@@ -13141,6 +13276,8 @@ impl Database {
                 .ok_or_else(|| ddl_table_not_found(&table_name))?;
             let table_mut = Arc::make_mut(table_arc);
             table_mut.partitioning = None;
+            table_mut.indexes = candidate.indexes.clone();
+            table_mut.next_index_id = candidate.next_index_id;
             table_mut.bump_schema_version();
         }
         self.create_logged_file(txn_id_for_ddl(), self.table_path(table.id), Vec::new())?;

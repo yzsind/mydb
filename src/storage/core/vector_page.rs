@@ -1175,6 +1175,9 @@ impl VectorIndexFile {
 
     /// Flush every dirty frame belonging to this vector file. Atomic rebuild
     /// uses this before publishing the temporary file with `rename(2)`.
+    pub(crate) fn flush_without_sync(&self) -> Result<(), QueryError> {
+        self.buffer_pool.flush_file_pages(&self.file_key)
+    }
     pub(crate) fn flush(&self) -> Result<(), QueryError> {
         self.buffer_pool.flush_file(&self.file_key)
     }

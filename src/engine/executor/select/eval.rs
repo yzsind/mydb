@@ -1172,7 +1172,11 @@ fn eval_plan_expr_legacy_inner(expr: &Expr, row: &PlanRow) -> Result<Value, Quer
             op: UnaryOp::Neg,
             expr,
         } => {
-            let value = eval_plan_expr_legacy(expr, row)?;
+            let value = crate::engine::expr::prepared_arithmetic_expr_value(
+                expr,
+                eval_plan_expr_legacy(expr, row)?,
+                BinaryOp::Sub,
+            )?;
             crate::engine::expr::duplicate_negated_int_div_zero_warning(expr, &value);
             let evaluate = || crate::engine::expr::eval_negate(value);
             if plan_expr_uses_silent_implicit_string_conversion(expr, row) {
@@ -2289,7 +2293,11 @@ fn eval_plan_expr_with_db_inner(
         }
         Expr::Unary { op, expr } => match op {
             UnaryOp::Neg => {
-                let value = eval_plan_expr_with_db(db, txn, expr, row, eval_ctx)?;
+                let value = crate::engine::expr::prepared_arithmetic_expr_value(
+                    expr,
+                    eval_plan_expr_with_db(db, txn, expr, row, eval_ctx)?,
+                    BinaryOp::Sub,
+                )?;
                 let evaluate = || crate::engine::expr::eval_negate(value);
                 if eval_ctx
                     .row_expr_metadata(expr, row)
@@ -2340,6 +2348,8 @@ fn eval_plan_expr_with_db_inner(
             } else {
                 eval_plan_expr_with_db(db, txn, left, row, eval_ctx)?
             };
+            left_value =
+                crate::engine::expr::prepared_arithmetic_expr_value(left, left_value, *op)?;
             let mut right_value = if comparison {
                 crate::engine::expr::exact_decimal_comparison_literal(right)
                     .map(Ok)
@@ -2347,6 +2357,8 @@ fn eval_plan_expr_with_db_inner(
             } else {
                 eval_plan_expr_with_db(db, txn, right, row, eval_ctx)?
             };
+            right_value =
+                crate::engine::expr::prepared_arithmetic_expr_value(right, right_value, *op)?;
             if matches!(
                 op,
                 BinaryOp::Add
@@ -2578,7 +2590,11 @@ fn eval_aggregate_expr_inner(
         }
         Expr::Unary { op, expr } => match op {
             UnaryOp::Neg => {
-                let value = eval_aggregate_expr(expr, group, row)?;
+                let value = crate::engine::expr::prepared_arithmetic_expr_value(
+                    expr,
+                    eval_aggregate_expr(expr, group, row)?,
+                    BinaryOp::Sub,
+                )?;
                 let evaluate = || crate::engine::expr::eval_negate(value);
                 if plan_expr_uses_silent_implicit_string_conversion(expr, row) {
                     crate::engine::expr::with_suppressed_expression_warnings(evaluate)
@@ -2607,6 +2623,8 @@ fn eval_aggregate_expr_inner(
             } else {
                 eval_aggregate_expr(left, group, row)?
             };
+            left_value =
+                crate::engine::expr::prepared_arithmetic_expr_value(left, left_value, *op)?;
             let mut right_value = if comparison {
                 crate::engine::expr::exact_decimal_comparison_literal(right)
                     .map(Ok)
@@ -2614,6 +2632,8 @@ fn eval_aggregate_expr_inner(
             } else {
                 eval_aggregate_expr(right, group, row)?
             };
+            right_value =
+                crate::engine::expr::prepared_arithmetic_expr_value(right, right_value, *op)?;
             if crate::parser::boolean::is_comparison!(*op) {
                 crate::engine::expr::coerce_json_boolean_comparison(
                     left,
@@ -3217,6 +3237,7 @@ pub(super) fn eval_plan_binary_legacy(
     } else {
         eval_plan_expr_legacy(left, row)?
     };
+    left_value = crate::engine::expr::prepared_arithmetic_expr_value(left, left_value, op)?;
     let mut right_value = if comparison {
         crate::engine::expr::exact_decimal_comparison_literal(right)
             .map(Ok)
@@ -3224,6 +3245,7 @@ pub(super) fn eval_plan_binary_legacy(
     } else {
         eval_plan_expr_legacy(right, row)?
     };
+    right_value = crate::engine::expr::prepared_arithmetic_expr_value(right, right_value, op)?;
     if comparison {
         crate::engine::expr::coerce_json_boolean_comparison(
             left,

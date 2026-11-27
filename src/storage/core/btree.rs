@@ -3187,7 +3187,6 @@ impl IndexFile {
         log: Arc<crate::wal::LogMutex>,
         rec_lsn: u64,
     ) -> Result<Self, QueryError> {
-        Self::check_rebuild_marker(&path)?;
         // Each replay partition has one owner and already supplies file-level
         // parallelism. Use synchronous eviction without speculative readers:
         // background workers can retain this private pool after IndexFile drops,
@@ -3201,6 +3200,16 @@ impl IndexFile {
             0,
         );
         buffer_pool.shutdown_flusher();
+        Self::open_for_recovery_with_buffer_pool(path, log, rec_lsn, buffer_pool)
+    }
+
+    fn open_for_recovery_with_buffer_pool(
+        path: PathBuf,
+        log: Arc<crate::wal::LogMutex>,
+        rec_lsn: u64,
+        buffer_pool: Arc<BufferPool>,
+    ) -> Result<Self, QueryError> {
+        Self::check_rebuild_marker(&path)?;
         let mut file = crate::storage::image_io::open_data_file(&path).map_err(io_err)?;
         let len = file.metadata().map_err(io_err)?.len();
         if len > 0 && len < PAGE_SIZE as u64 {
@@ -3818,6 +3827,14 @@ impl IndexFile {
         wal_owner: Option<&Database>,
     ) -> Result<(), QueryError> {
         if let Some(spatial) = &self.spatial {
+            if let Some(log) = &self.online_build_log {
+                log.record(std::iter::once(IndexBatchEntry {
+                    kind: WalIndexOpKind::Insert,
+                    key,
+                    row_id,
+                }));
+                return Ok(());
+            }
             return spatial.apply(
                 txn_id,
                 [IndexBatchEntry {
@@ -3868,6 +3885,14 @@ impl IndexFile {
         wal_owner: Option<&Database>,
     ) -> Result<(), QueryError> {
         if let Some(spatial) = &self.spatial {
+            if let Some(log) = &self.online_build_log {
+                log.record(entries.into_iter().map(|(key, row_id)| IndexBatchEntry {
+                    kind: WalIndexOpKind::Insert,
+                    key,
+                    row_id,
+                }));
+                return Ok(());
+            }
             return spatial.insert_many(txn_id, entries);
         }
         if entries.is_empty() {
@@ -3917,6 +3942,10 @@ impl IndexFile {
         wal_owner: Option<&Database>,
     ) -> Result<(), QueryError> {
         if let Some(spatial) = &self.spatial {
+            if let Some(log) = &self.online_build_log {
+                log.record(entries);
+                return Ok(());
+            }
             return spatial.apply(txn_id, entries);
         }
         if let Some(log) = &self.online_build_log {
@@ -3939,6 +3968,10 @@ impl IndexFile {
         wal_owner: Option<&Database>,
     ) -> Result<(), QueryError> {
         if let Some(spatial) = &self.spatial {
+            if let Some(log) = &self.online_build_log {
+                log.record(entries);
+                return Ok(());
+            }
             return spatial.apply(txn_id, entries);
         }
         if let Some(log) = &self.online_build_log {
@@ -7450,6 +7483,14 @@ impl IndexFile {
         wal_owner: Option<&Database>,
     ) -> Result<(), QueryError> {
         if let Some(spatial) = &self.spatial {
+            if let Some(log) = &self.online_build_log {
+                log.record(std::iter::once(IndexBatchEntry {
+                    kind: WalIndexOpKind::Delete,
+                    key,
+                    row_id,
+                }));
+                return Ok(());
+            }
             return spatial.apply(
                 txn_id,
                 [IndexBatchEntry {
@@ -9381,9 +9422,13 @@ impl IndexFile {
         }
     }
 
-    fn flush(&self) -> Result<(), QueryError> {
+    fn flush(&self) -> Result<(), QueryError> { self.flush_with_sync(true) }
+
+    fn flush_without_sync(&self) -> Result<(), QueryError> { self.flush_with_sync(false) }
+
+    fn flush_with_sync(&self, sync: bool) -> Result<(), QueryError> {
         if let Some(spatial) = &self.spatial {
-            return spatial.flush();
+            return if sync { spatial.flush() } else { spatial.flush_without_sync() };
         }
         #[cfg(test)]
         INDEX_FLUSH_TEST_HOOK.with(|hook| {
@@ -9426,11 +9471,11 @@ impl IndexFile {
         file.set_len(next_page_id * PAGE_SIZE as u64)
             .map_err(io_err)?;
         file.flush().map_err(io_err)?;
-        self.buffer_pool.sync_cached_and_direct_file(
-            &self.file_key,
-            file,
-            self.durability == DurabilityMode::Strict,
-        )?;
+        if sync {
+            self.buffer_pool.sync_cached_and_direct_file(
+                &self.file_key, file, self.durability == DurabilityMode::Strict,
+            )?;
+        }
         self.dirty_meta.store(false, Ordering::Release);
         self.dirty.store(false, Ordering::Release);
         Ok(())
@@ -10766,7 +10811,11 @@ impl IndexFile {
 
     fn is_empty(&self) -> Result<bool, QueryError> {
         if let Some(spatial) = &self.spatial {
-            return spatial.is_empty();
+            return if self.online_build_log.is_some() {
+                Ok(false)
+            } else {
+                spatial.is_empty()
+            };
         }
         if self.online_build_log.is_some() {
             // LOAD DATA must use its incremental writer, never replace the

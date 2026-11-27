@@ -35,6 +35,30 @@ pub(in crate::engine::executor) struct RecursiveStep<'a> {
 }
 
 impl<'a> RecursiveStep<'a> {
+    /// Batch polling only for bounded native projections and a simple bound
+    /// comparison. Functions, extra filters and large rows keep per-row polls.
+    pub(in crate::engine::executor) fn can_batch_cancel_checks(&self) -> bool {
+        use super::super::plan::CteRowPredicate;
+        self.filters.iter().all(Option::is_none)
+            && matches!(
+                self.scan_predicate.as_ref(),
+                None | Some(CteRowPredicate::Const(_))
+                    | Some(CteRowPredicate::Cmp {
+                        value: Value::Int(_) | Value::UInt(_) | Value::Null,
+                        ..
+                    })
+            )
+            && self.projection.iter().enumerate().all(|(index, item)| {
+                matches!(item, VecResultProjection::Column(_))
+                    || self.integer_kernels.get(index).is_some_and(Option::is_some)
+            })
+            && self.projection.len().saturating_mul(
+                (crate::engine::cancel::SCALAR_ROW_CANCEL_MASK + 1)
+                    * std::mem::size_of::<Value>()
+                    * 2,
+            ) <= crate::engine::executor::vec::evaluated_batch::byte_target()
+    }
+
     /// A direct reference to the same recursive field already belongs to the
     /// anchor's assignment domain. Rechecking it cannot change the value.
     pub(in crate::engine::executor) fn identity_assignments(&self) -> Vec<bool> {
@@ -277,5 +301,56 @@ impl<'a> RecursiveStep<'a> {
             });
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod polling_tests {
+    use super::*;
+    #[test]
+    fn recursive_batch_polling_requires_bounded_projection_and_predicate() {
+        use crate::engine::expr_program::{InputColumn, InputSchema};
+        let input = InputSchema::new(vec![InputColumn {
+            table: "t".into(),
+            alias: None,
+            name: "n".into(),
+            column_type: ColumnType::LongLong,
+            unsigned: false,
+            collation_id: None,
+        }]);
+        let expr = crate::parser::parse_expr_fragment("n+1").unwrap();
+        let program = Arc::new(ExprCompiler::compile(&expr, &input).unwrap());
+        let mut step = RecursiveStep {
+            nodes: Vec::new(),
+            scan_predicate: None,
+            filters: Vec::new(),
+            indices: vec![0],
+            projection: vec![VecResultProjection::Expr(program.clone())],
+            integer_kernels: vec![program.bind_integer_binary()],
+            _kernel_charge: mem_budget::ScopedCharge::new(0),
+            columns: vec![crate::types::Column {
+                name: "n".into(),
+                column_type: ColumnType::LongLong,
+                source: Default::default(),
+            }],
+            recording: false,
+        };
+        assert!(step.can_batch_cancel_checks());
+        step.filters.push(Some(program.clone()));
+        assert!(!step.can_batch_cancel_checks());
+        step.filters.clear();
+        step.integer_kernels[0] = None;
+        assert!(!step.can_batch_cancel_checks());
+        step.integer_kernels[0] = program.bind_integer_binary();
+        step.scan_predicate = Some(super::super::super::plan::CteRowPredicate::Cmp {
+            col: 0,
+            op: crate::parser::BinaryOp::Lt,
+            value: Value::String("100".into()),
+            flipped: false,
+            provenance: Default::default(),
+        });
+        assert!(!step.can_batch_cancel_checks());
+        step.scan_predicate = Some(super::super::super::plan::CteRowPredicate::Const(true));
+        assert!(step.can_batch_cancel_checks());
     }
 }

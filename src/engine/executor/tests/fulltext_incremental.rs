@@ -23,7 +23,7 @@ fn current(e: &StorageQueryEngine) -> TxnView {
 
 // The heap is an independent oracle used only by tests. Every tokenizer and
 // corpus is checked, including rows excluded from all partial postings.
-fn assert_corpora(e: &StorageQueryEngine, name: &str, txn: TxnView) {
+pub(super) fn assert_corpora(e: &StorageQueryEngine, name: &str, txn: TxnView) {
     let db = e.db_for_tests();
     let table = db.table(name).unwrap();
     let heap = db.scan_rows(name, txn).unwrap();
@@ -698,6 +698,23 @@ fn fulltext_incremental_failed_build_identity_reuse_reinitializes_corpus() {
                 crate::storage::data_dictionary::DD_FULLTEXT_COUNTERS,
             )
             .unwrap();
+            // Even an unpublished build's orphan corpus must be retired
+            // without requiring a public FULLTEXT descriptor at DROP time.
+            assert!(!db
+                .prefix_index_entries_visible(
+                    &counters,
+                    &counters.indexes[0],
+                    crate::storage::IndexKey::from(vec![crate::storage::KeyPart::UInt(id)]),
+                    current(&e),
+                )
+                .unwrap()
+                .is_empty());
+            for _ in 0..16 {
+                if db.catalog_retirement_count_for_test() == 0 {
+                    break;
+                }
+                db.maintain_catalog_retirements_until(|| false).unwrap();
+            }
             assert!(db
                 .prefix_index_entries_visible(
                     &counters,
@@ -716,6 +733,7 @@ fn fulltext_incremental_failed_build_identity_reuse_reinitializes_corpus() {
         assert_corpora(&e, "test.ft_inc", current(&e));
     }
 }
+
 #[test]
 fn fulltext_incremental_exchange_transfers_counters_with_catalog_publication() {
     let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
@@ -879,6 +897,12 @@ fn fulltext_incremental_ddl_retires_counters_without_breaking_old_snapshots() {
     ];
     assert!(count(old_prefix.clone()) > 0);
     e.execute("DROP INDEX fp ON ft_inc").unwrap();
+    for _ in 0..16 {
+        if count(old_prefix.clone()) == 0 {
+            break;
+        }
+        db.maintain_catalog_retirements_until(|| false).unwrap();
+    }
     assert_eq!(count(old_prefix), 0);
     let frozen = db
         .fulltext_corpus_statistics(old, &old_table, old_index, &["quartz".into()], None)
@@ -888,20 +912,61 @@ fn fulltext_incremental_ddl_retires_counters_without_breaking_old_snapshots() {
     e.execute("CREATE FULLTEXT INDEX fn ON ft_inc(body) WHERE active=1")
         .unwrap();
     let before_copy = db.table("test.ft_inc").unwrap();
+    let copy_snapshot = db.begin_read_only_txn().unwrap();
+    let copy_statistics = db
+        .fulltext_corpus_statistics(
+            copy_snapshot,
+            &before_copy,
+            &before_copy.indexes[1],
+            &["quartz".into()],
+            None,
+        )
+        .unwrap();
     e.execute("OPTIMIZE TABLE ft_inc").unwrap();
     assert_corpora(&e, "test.ft_inc", current(&e));
     let after_copy = db.table("test.ft_inc").unwrap();
     if before_copy.active_generation != after_copy.active_generation {
+        for _ in 0..16 {
+            if count(vec![before_copy.id, before_copy.active_generation]) == 0 {
+                break;
+            }
+            db.maintain_catalog_retirements_until(|| false).unwrap();
+        }
         assert_eq!(
             count(vec![before_copy.id, before_copy.active_generation]),
             0
         );
     }
+    let frozen = db
+        .fulltext_corpus_statistics(
+            copy_snapshot,
+            &before_copy,
+            &before_copy.indexes[1],
+            &["quartz".into()],
+            None,
+        )
+        .unwrap();
+    assert_eq!(frozen.documents, copy_statistics.documents);
+    assert_eq!(frozen.total_tokens, copy_statistics.total_tokens);
+    assert_eq!(frozen.frequencies, copy_statistics.frequencies);
+    db.rollback_txn(copy_snapshot.txn_id).unwrap();
     e.execute("TRUNCATE TABLE ft_inc").unwrap();
+    for _ in 0..16 {
+        if count(vec![after_copy.id, after_copy.active_generation]) == 0 {
+            break;
+        }
+        db.maintain_catalog_retirements_until(|| false).unwrap();
+    }
     assert_eq!(count(vec![after_copy.id, after_copy.active_generation]), 0);
     e.execute("INSERT INTO ft_inc VALUES(3,'quartz',1)")
         .unwrap();
     e.execute("DROP TABLE ft_inc").unwrap();
+    for _ in 0..16 {
+        if count(vec![old_table.id]) == 0 {
+            break;
+        }
+        db.maintain_catalog_retirements_until(|| false).unwrap();
+    }
     assert_eq!(count(vec![old_table.id]), 0);
 }
 

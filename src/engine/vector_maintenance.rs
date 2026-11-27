@@ -104,6 +104,46 @@ mod tests {
     use super::*;
 
     #[test]
+    fn online_graph_publication_inherits_actual_worker_policy() {
+        crate::util::env::with_vars(&[("MYDB_VECTOR_STORAGE", Some("memory"))], || {
+            let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+            let engine = crate::engine::StorageQueryEngine::open_with_storage_config_without_background_workers(
+                dir.path(), crate::storage::StorageConfig::from_env(),
+            ).unwrap();
+            let db = engine.db_handle().clone();
+            let worker = ActiveWorker::enter(db.clone());
+            engine
+                .execute("CREATE TABLE t(id INT PRIMARY KEY,v VECTOR(2) NOT NULL)")
+                .unwrap();
+            engine
+                .execute("INSERT INTO t VALUES(1,'[1,1]'),(2,'[2,2]')")
+                .unwrap();
+            engine
+                .execute("CREATE INDEX ix ON t(v) USING HNSW LOCK=NONE")
+                .unwrap();
+            let table = db.table("test.t").unwrap();
+            let index = table
+                .indexes
+                .iter()
+                .find(|index| index.name == "ix")
+                .unwrap();
+            let graph = db.vector_graph_get_or_build(&table, index).unwrap();
+            let crate::engine::vector::VectorGraph::Memory(memory) = graph.as_ref() else {
+                panic!("resident graph required");
+            };
+            assert!(
+                memory.background_quant_for_test(),
+                "new graphs must inherit an already registered worker"
+            );
+            drop(worker);
+            assert!(
+                !memory.background_quant_for_test(),
+                "worker removal must revoke background-only refresh"
+            );
+        });
+    }
+
+    #[test]
     fn quant_refresh_capability_tracks_actual_worker_lifetime() {
         let dir = tempfile::tempdir().unwrap();
         let db = Arc::new(Database::open(dir.path()).unwrap());

@@ -1200,7 +1200,8 @@ pub struct Database {
     #[cfg(test)]
     vector_persist_failure: AtomicU64,
     vector_pending_wal: parking_lot::Mutex<BTreeMap<u64, u64>>,
-    vector_copy_publications: parking_lot::Mutex<HashSet<u64>>,
+    /// Private COPY / ADD INDEX tails remain pinned through catalog publication.
+    vector_ddl_publications: parking_lot::Mutex<HashSet<u64>>,
     replica_vector_state: parking_lot::Mutex<ReplicaVectorState>,
     replica_vector_signal: parking_lot::Condvar,
     vector_retired_graphs: parking_lot::Mutex<HashMap<PathBuf, std::sync::Weak<VectorGraph>>>,
@@ -1304,7 +1305,11 @@ pub struct Database {
     /// Physical-replica apply holds the read side for one complete WAL frame;
     /// restartpoint holds the write side while syncing files and pruning WAL.
     replica_apply_checkpoint: RwLock<()>,
+    /// Complete physical-frame frontier used by ACKs, restartpoints and resume.
     replica_applied_lsn_atomic: AtomicU64,
+    /// Successful logical prefix inside a frame that may need to be retried.
+    /// Never publish this as a source WAL resume position.
+    replica_applied_logical_lsn_atomic: AtomicU64,
     replica_restartpoint_tracker: Mutex<ReplicaRestartpointTracker>,
     /// Lock-free mirror of `CheckpointState::last_checkpoint_lsn`.
     /// Updated under the `checkpoint` mutex whenever a real checkpoint
@@ -1479,6 +1484,7 @@ pub struct Database {
     #[cfg(test)]
     recyclebin_test_free_pct: AtomicU64,
     ddl_retirement_cleanup: parking_lot::Mutex<Option<(IndexKey, RowId)>>,
+    ddl_retirement_waker: parking_lot::Mutex<Option<CatalogRetirementWaker>>,
     partition_cleanup_background: AtomicBool,
     /// XID ownership spans ACTIVE, IDLE, PREPARED and completion I/O.
     xa_reservations: parking_lot::Mutex<HashMap<crate::xa::Xid, u64>>,
@@ -1581,6 +1587,8 @@ pub struct Database {
     /// Only statistics maintenance takes these locks; DML never waits here.
     /// Weak entries let idle/dropped tables release their maintenance state.
     analyze_locks: parking_lot::Mutex<HashMap<String, std::sync::Weak<parking_lot::Mutex<()>>>>,
+    /// COPY/checkpoint state; ordinary DML does not consult this registry.
+    copy_publication_wal: parking_lot::Mutex<BTreeMap<u64, u64>>,
     #[cfg(test)]
     analyze_batch_test_hook: Mutex<Option<Arc<DdlBackfillTestHook>>>,
     #[cfg(test)]
@@ -1594,6 +1602,10 @@ pub struct Database {
     #[cfg(test)]
     online_copy_publish_test_hook: Mutex<Option<Arc<DdlBackfillTestHook>>>,
     #[cfg(test)]
+    fulltext_copy_statistics_test_hook: Mutex<Option<Arc<DdlBackfillTestHook>>>,
+    #[cfg(test)]
+    retirement_cleanup_test_hook: Mutex<Option<Arc<DdlBackfillTestHook>>>,
+    #[cfg(test)]
     online_index_long_lived_wait_test_hook: Mutex<Option<Arc<DdlBackfillTestHook>>>,
     #[cfg(test)]
     vector_copy_committed_test_hook: Mutex<Option<Arc<DdlBackfillTestHook>>>,
@@ -1601,6 +1613,10 @@ pub struct Database {
     vector_apply_test_hook: Mutex<Option<Arc<DdlBackfillTestHook>>>,
     #[cfg(test)]
     online_index_validation_test_hook: Mutex<Option<Arc<DdlBackfillTestHook>>>,
+    #[cfg(test)]
+    copy_file_stage_test_hook: Mutex<Option<(u8, Arc<DdlBackfillTestHook>)>>,
+    #[cfg(test)]
+    copy_sync_failure: AtomicBool,
 }
 
 #[cfg(not(test))]
@@ -2648,6 +2664,13 @@ impl ShardedTableLocks {
         let mut tables = self.table_shard(table_id).lock();
         let state = tables.entry(table_id).or_default();
         state.minimum_schema_version = state.minimum_schema_version.max(version);
+    }
+
+    fn is_retired(&self, table_id: u64) -> bool {
+        self.table_shard(table_id)
+            .lock()
+            .get(&table_id)
+            .is_some_and(|state| state.minimum_schema_version == u64::MAX)
     }
 
     /// DDL guard: is any txn (other than `exclude`) holding a lock on `table_id`?
@@ -4675,11 +4698,14 @@ include!("core/database/rls.rs");
 include!("core/database/txn_ops.rs");
 include!("core/database/vector_index_paths.rs");
 include!("core/database/ddl.rs");
+include!("core/database/online_drop_column.rs");
 include!("core/database/online_index.rs");
+include!("core/database/online_vector.rs");
 include!("core/database/online_constraints.rs");
 include!("core/database/constraint_index_merge.rs");
 include!("core/database/constraint_baseline.rs");
 include!("core/database/online_copy.rs");
+include!("core/database/copy_file_publication.rs");
 include!("core/database/partition_reorg.rs");
 include!("core/database/ctas_recovery.rs");
 include!("core/database/drop_table_recovery.rs");

@@ -3,6 +3,7 @@
 use super::*;
 use crate::engine::executor::mem_budget::{ControlledMemoryCategory, ControlledMemoryCharge};
 use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
 
 pub(crate) struct RecordLease<'a> {
     record: Cow<'a, WalRecord>,
@@ -121,6 +122,184 @@ pub(crate) trait WalRecordSource {
         }
     }
 }
+/// Resolve decided COPY bindings before file partitioning. A private base and
+/// its complete tail become one ordered final-file history; no recovery worker
+/// can race a file copy against another worker's private redo. Losers retain
+/// their original paths for ordinary UNDO. Mapping state is O(published files).
+pub(crate) struct PublishedReplay<'a, S: WalRecordSource + ?Sized> {
+    source: &'a S,
+    bindings: HashMap<String, (u64, String)>,
+    index_bindings: Vec<(u64, String)>,
+    completed: HashSet<u64>,
+    _charge: ControlledMemoryCharge,
+}
+impl<'a, S: WalRecordSource + ?Sized> PublishedReplay<'a, S> {
+    pub(crate) fn new(source: &'a S, committed: impl Fn(u64) -> bool) -> Result<Self, QueryError> {
+        let mut result = Self {
+            source,
+            bindings: HashMap::new(),
+            index_bindings: Vec::new(),
+            completed: HashSet::new(),
+            _charge: ControlledMemoryCharge::try_new(ControlledMemoryCategory::StorageScratch, 0)?,
+        };
+        for i in 0..source.len() {
+            let header = source.header(i)?;
+            if header.record_type == WalRecordType::FilePublishComplete {
+                let record = source.record(i)?;
+                if let WalPayload::FilePublishComplete { txn_id } = record.payload {
+                    if record.txn_id != 0 || txn_id == 0 {
+                        return Err(corrupt_directory());
+                    }
+                    result._charge.try_grow(48)?;
+                    result.completed.insert(txn_id);
+                }
+                continue;
+            }
+            if header.record_type == WalRecordType::DdlCommit && committed(header.txn_id) {
+                if let WalPayload::DdlCommit { retired_paths, .. } = &source.record(i)?.payload {
+                    result
+                        .index_bindings
+                        .retain(|(_, target)| !retired_paths.contains(target));
+                }
+                continue;
+            }
+            if header.record_type != WalRecordType::FilePublish {
+                continue;
+            }
+            let record = source.record(i)?;
+            let WalPayload::FilePublish { source, target } = &record.payload else {
+                unreachable!()
+            };
+            validate_file_publication(source, target)?;
+            if record.txn_id == 0 {
+                return Err(corrupt_directory());
+            }
+            if !committed(record.txn_id) {
+                continue;
+            }
+            if source.ends_with(".idx") {
+                result._charge.try_grow(64 + target.len())?;
+                result.index_bindings.push((record.txn_id, target.clone()));
+                continue;
+            }
+            if result.bindings.contains_key(source) {
+                return Err(corrupt_directory());
+            }
+            result._charge.try_grow(256 + source.len() + target.len())?;
+            result
+                .bindings
+                .insert(source.clone(), (record.lsn, target.clone()));
+        }
+        Ok(result)
+    }
+    pub(crate) fn indexes_requiring_rebuild(
+        &self,
+        independent_layout: bool,
+    ) -> impl Iterator<Item = &str> {
+        self.index_bindings
+            .iter()
+            .filter(move |(txn, _)| independent_layout || !self.completed.contains(txn))
+            .map(|(_, path)| path.as_str())
+    }
+    fn target(&self, index: usize, path: &str) -> Result<Option<&str>, QueryError> {
+        Ok(match self.bindings.get(path) {
+            Some((lsn, target)) if self.source.header(index)?.lsn < *lsn => Some(target),
+            _ => None,
+        })
+    }
+}
+impl<S: WalRecordSource + ?Sized> WalRecordSource for PublishedReplay<'_, S> {
+    fn len(&self) -> usize {
+        self.source.len()
+    }
+    fn header(&self, index: usize) -> Result<WalRecordHeader, QueryError> {
+        self.source.header(index)
+    }
+    fn record(&self, index: usize) -> Result<RecordLease<'_>, QueryError> {
+        let mut record = self.source.record(index)?;
+        if let Some(path) = payload_redo_path(&record.payload) {
+            if let Some(target) = self.target(index, path)? {
+                let payload = &mut record.record.to_mut().payload;
+                let path = match payload {
+                    WalPayload::VectorIndexManifest { path, .. }
+                    | WalPayload::VectorIndexImage { path, .. }
+                    | WalPayload::FileClr { path, .. }
+                    | WalPayload::FileCreate { path, .. }
+                    | WalPayload::FileDelete { path, .. }
+                    | WalPayload::FileExtend { path, .. }
+                    | WalPayload::PageUpdate { path, .. }
+                    | WalPayload::PageDelta { path, .. }
+                    | WalPayload::PageUpdateCompressed { path, .. }
+                    | WalPayload::FullPageImage { path, .. }
+                    | WalPayload::FullPageImageCompressed { path, .. }
+                    | WalPayload::HeapInsert { path, .. }
+                    | WalPayload::HeapInsertBatch { path, .. }
+                    | WalPayload::HeapUpdate { path, .. }
+                    | WalPayload::HeapUpdateLogical { path, .. }
+                    | WalPayload::HeapDelete { path, .. }
+                    | WalPayload::SlotReclaim { path, .. }
+                    | WalPayload::SpatialIndexUndo { path, .. }
+                    | WalPayload::SpatialPageBatch { path, .. }
+                    | WalPayload::IndexBatch { path, .. }
+                    | WalPayload::Clr { path, .. } => path,
+                    _ => unreachable!(),
+                };
+                *path = target.to_owned();
+            }
+        }
+        Ok(record)
+    }
+    fn redo_path(&self, index: usize) -> Result<Option<Cow<'_, str>>, QueryError> {
+        let Some(path) = self.source.redo_path(index)? else {
+            return Ok(None);
+        };
+        Ok(Some(match self.target(index, &path)? {
+            Some(target) => Cow::Borrowed(target),
+            None => path,
+        }))
+    }
+    fn index_operations(&self, index: usize) -> Result<usize, QueryError> {
+        self.source.index_operations(index)
+    }
+}
+
+/// COPY can bind only a fresh generation of the same object class/index.
+/// Canonical numeric object paths exclude system files, traversal and aliases.
+pub(crate) fn validate_file_publication(source: &str, target: &str) -> Result<(), QueryError> {
+    let from = source.split('/').collect::<Vec<_>>();
+    let to = target.split('/').collect::<Vec<_>>();
+    let valid = from.len() == to.len()
+        && matches!(from.len(), 4 | 5)
+        && from[0] == "objects"
+        && to[0] == "objects"
+        && from[1] == to[1]
+        && matches!(from[1], "tables" | "indexes")
+        && from[2].parse::<u64>().is_ok_and(|id| id != 0)
+        && to[2].parse::<u64>().is_ok_and(|id| id != 0)
+        && from[2] != to[2]
+        && from[3..] == to[3..]
+        && from.iter().all(|part| !matches!(*part, "" | "." | ".."));
+    let valid = valid
+        && match from.as_slice() {
+            [_, "tables", _, file] => file.rsplit_once('.').is_some_and(|(generation, ext)| {
+                generation.parse::<u64>().is_ok_and(|n| n > 1) && matches!(ext, "heap" | "lob")
+            }),
+            [_, "indexes", _, generation, file] => {
+                generation.parse::<u64>().is_ok_and(|n| n > 1)
+                    && file.rsplit_once('.').is_some_and(|(id, ext)| {
+                        id.parse::<u64>().is_ok_and(|n| n > 0)
+                            && matches!(ext, "idx" | "rtree" | "hvec" | "hnsw")
+                    })
+            }
+            _ => false,
+        };
+    if valid {
+        Ok(())
+    } else {
+        Err(corrupt_directory())
+    }
+}
+
 impl WalRecordSource for [WalRecord] {
     fn len(&self) -> usize {
         <[WalRecord]>::len(self)

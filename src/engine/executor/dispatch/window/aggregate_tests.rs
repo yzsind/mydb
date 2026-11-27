@@ -23,6 +23,7 @@ fn evaluate(name: &str, values: &[Value], frame: WindowFrame, ordered: bool) -> 
             },
             frame: Some(frame.clone()),
             inherits: None,
+            direct_reference: false,
         }),
     };
     let columns = [

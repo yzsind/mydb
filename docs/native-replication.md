@@ -13,6 +13,8 @@ The local WAL tail cannot be inferred as applied within the process. After an ap
 
 Use a disposable directory tree and two terminals. The SQL ports are 14837/14838;
 reserve native listener ports 13316/13317 for the current and future master.
+Each node on the same host needs a distinct native listener port, including a replica that may later be promoted. Keep each node's MYDB_REPL_PORT stable across restarts; listener settings come from process configuration, not the persisted master endpoint. A promotion bind failure leaves the replica role unchanged and does not release an explicitly frozen old master. After confirming that the old master remains authoritative, use RESUME MASTER WRITES there to restore service.
+
 Choose unused ports. Build `cargo build --locked --bin mydb`, then set the same
 protected environment in both terminals (do not use a real production token):
 
@@ -127,6 +129,8 @@ If persisted replica progress is missing on startup, a consistent re-seed is req
 
 Every file must strictly match its manifest path, contiguous offsets, declared length, EOF, and SHA-256. The replica writes into a staging tree on the same filesystem and replaces the data through a persistent install journal after `fsync` completes; a network interruption, verification failure, or insufficient disk never installs an incomplete backup. Data and replication progress commit together: a crash before the install-complete marker is persisted rolls back to the old directory, while a crash afterwards keeps the new directory and continues cleaning up the old one. Role/TLS/node-local configuration is never overridden from the master.
 
+Seeding stops immediately on a duplicate node UUID, authentication failure, or protocol/format rejection. Correct the node identity, token, or source configuration and restart.
+
 When the master is temporarily unreachable, bootstrap retries up to the configured attempt limit with exponential backoff (the initial interval is set by `MYDB_REPL_RECONNECT_MS`, clamped to 100 ms–30 s, at most 30 s afterwards). It does not listen for SQL until seeding completes. The backup concurrency permit covers the entire transfer, and the backup freeze is independent of STOP/RESUME MASTER WRITES.
 
 ## Status and Administration
@@ -223,7 +227,7 @@ Physical replicas report `read_only=ON` and `super_read_only=ON`, reflecting the
 effective write policy. These variables cannot disable physical-replica write
 protection; promotion changes the role and removes that role-imposed policy.
 
-`MYDB_REPL_BOOTSTRAP_MAX_ATTEMPTS` defaults to 10 failed seed attempts. Exhaustion exits with the last error and preserves files for repair and restart; set it to 0 for indefinite retries. Each backup frame read and write (including flush) has a 60-second timeout. Transfer chunks honor the smaller of the configured source chunk size and the replica's advertised limit. The receive staging directory is inside the data directory, on the same filesystem as installed objects; failed attempts remove partial staging before checking available space or reconnecting. A live seed slot retains WAL through transfers longer than `MYDB_REPL_SLOT_TIMEOUT_MS`, subject to the configured WAL byte cap. The seed lease ends at the first streaming ACK, rather than when bytes enter TCP buffers; after disconnect it allows at least 60 seconds for installation/recovery before the slot can expire. Snapshot file descriptors are opened one at a time during transfer; abandoned private snapshots are removed on startup under the data-directory lock.
+`MYDB_REPL_BOOTSTRAP_MAX_ATTEMPTS` defaults to 10 failed seed attempts. Exhaustion exits with the last error and preserves files for repair and restart; set it to 0 for indefinite retries of transient failures. Each backup frame read and write (including flush) has a 60-second timeout. Transfer chunks honor the smaller of the configured source chunk size and the replica's advertised limit. The receive staging directory is inside the data directory, on the same filesystem as installed objects; failed attempts remove partial staging before checking available space or reconnecting. A live seed slot retains WAL through transfers longer than `MYDB_REPL_SLOT_TIMEOUT_MS`, subject to the configured WAL byte cap. The seed lease ends at the first streaming ACK, rather than when bytes enter TCP buffers; after disconnect it allows at least 60 seconds for installation/recovery before the slot can expire. Snapshot file descriptors are opened one at a time during transfer; abandoned private snapshots are removed on startup under the data-directory lock.
 
 The handshake advertises the source heartbeat interval. The replica's idle watchdog uses six times the larger peer interval (at least five seconds). Configuration/format handshake rejections stop the receiver with a visible status instead of retrying indefinitely. Five repeated online apply failures without progress also stop the receiver; repair the cause and run `START MYDB REPLICATION`. Transient overlap-read I/O errors do not mark healthy WAL as a poison frame.
 

@@ -364,6 +364,8 @@ pub struct PlanSemantics {
     pub collation_connection: Arc<str>,
     /// Affects DECIMAL division and AVG result precision/scale.
     pub div_precision_increment: u8,
+    pub(crate) prepared_numeric_parameter_types:
+        Option<Arc<crate::engine::api::PreparedNumericParameters>>,
     /// Selects VARCHAR versus BLOB for GROUP_CONCAT and fixes its maximum
     /// advertised length.  Reusing a plan across different values would make
     /// prepared metadata stale even when the physical plan is unchanged.
@@ -384,6 +386,7 @@ impl Default for PlanSemantics {
             character_set_connection: Arc::from(crate::charset::DEFAULT_CHARSET),
             collation_connection: Arc::from(crate::charset::DEFAULT_COLLATION),
             div_precision_increment: 4,
+            prepared_numeric_parameter_types: None,
             group_concat_max_len: 1024,
         }
     }
@@ -400,12 +403,16 @@ pub(crate) struct PreparedPlanSemantics {
     sql_select_limit: u64,
     use_invisible_indexes: bool,
     group_concat_max_len: u64,
+    div_precision_increment: u8,
+    prepared_numeric_parameter_types: Option<Arc<crate::engine::api::PreparedNumericParameters>>,
 }
 
 impl PreparedPlanSemantics {
     pub(crate) fn capture(db: &Database, session: &SessionContext) -> Self {
         Self {
             execution_parallelism: session.sysvars.mydb_parallel_degree,
+            div_precision_increment: session.expression_div_precision_increment(),
+            prepared_numeric_parameter_types: session.prepared_numeric_parameter_types.clone(),
             identity: crate::engine::rls::session_signature(db, session),
             optimizer_switch: Arc::from(session.sysvars.optimizer_switch.as_str()),
             sql_select_limit: session.sysvars.sql_select_limit,
@@ -416,6 +423,8 @@ impl PreparedPlanSemantics {
 
     pub(crate) fn matches_session(&self, db: &Database, session: &SessionContext) -> bool {
         self.execution_parallelism == session.sysvars.mydb_parallel_degree
+            && self.div_precision_increment == session.expression_div_precision_increment()
+            && self.prepared_numeric_parameter_types == session.prepared_numeric_parameter_types
             && self.identity.matches_session(db, session)
             && self.optimizer_switch.as_ref() == session.sysvars.optimizer_switch
             && self.sql_select_limit == session.sysvars.sql_select_limit
@@ -920,6 +929,21 @@ pub fn record_plan_object_dep(object_key: Arc<str>, schema_version: u64, object_
 /// `QueryHint` is installed).
 fn reset_plan_object_deps() {
     PLAN_OBJECT_DEPS.with(|cell| cell.borrow_mut().clear());
+}
+
+/// Bind a nested template without leaking its view dependencies into its caller.
+pub(crate) fn with_isolated_plan_object_deps<R>(
+    f: impl FnOnce() -> R,
+) -> (R, SmallVec<[ObjectDep; 2]>) {
+    struct Restore(SmallVec<[ObjectDep; 2]>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            PLAN_OBJECT_DEPS.with(|cell| *cell.borrow_mut() = std::mem::take(&mut self.0));
+        }
+    }
+    let _restore = Restore(PLAN_OBJECT_DEPS.with(|cell| std::mem::take(&mut *cell.borrow_mut())));
+    let result = f();
+    (result, current_plan_object_deps())
 }
 
 /// Snapshot the view dependencies accumulated for the current statement.

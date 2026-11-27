@@ -110,35 +110,46 @@ fn coerce_ignorable_insert_nulls(
     rows: &mut [Vec<Value>],
     ignore: bool,
 ) -> Result<(), QueryError> {
-    if insert_strict_mode() && !ignore {
+    if insert_strict_mode() || ignore {
         return Ok(());
     }
     let table = db.table(table_name)?;
     let target_columns = insert_column_indexes(&table, supplied_columns)?;
     for row in rows {
         for (value_idx, &column_idx) in target_columns.iter().enumerate() {
-            let column = &table.columns[column_idx];
-            if column.nullable
-                || column.generated_expr.is_some()
-                || column.auto_increment
-                || !matches!(row.get(value_idx), Some(Value::Null))
-            {
-                continue;
+            if let Some(value) = row.get_mut(value_idx) {
+                coerce_insert_null(db, &table.columns[column_idx], value, ignore)?;
             }
-            let Some(default) = implicit_default_for_type(&column.data_type) else {
-                return Err(crate::error::messages::bad_null(&column.name));
-            };
-            crate::engine::api::push_statement_warning(
-                crate::error::ConditionLevel::Warning,
-                crate::error::catalog::ER_BAD_NULL_ERROR,
-                format!("Column '{}' cannot be null", column.name),
-            );
-            if ignore {
-                db.dml_stats().record_ignore_warning();
-            }
-            row[value_idx] = default;
         }
     }
+    Ok(())
+}
+
+fn coerce_insert_null(
+    db: &Database,
+    column: &crate::storage::ColumnSchema,
+    value: &mut Value,
+    ignore: bool,
+) -> Result<(), QueryError> {
+    if column.nullable
+        || column.generated_expr.is_some()
+        || column.auto_increment
+        || !matches!(value, Value::Null)
+    {
+        return Ok(());
+    }
+    let Some(default) = implicit_default_for_type(&column.data_type) else {
+        return Err(crate::error::messages::bad_null(&column.name));
+    };
+    crate::engine::api::push_statement_warning(
+        crate::error::ConditionLevel::Warning,
+        crate::error::catalog::ER_BAD_NULL_ERROR,
+        format!("Column '{}' cannot be null", column.name),
+    );
+    if ignore {
+        db.dml_stats().record_ignore_warning();
+    }
+    *value = default;
     Ok(())
 }
 
@@ -390,7 +401,7 @@ pub(super) fn execute_insert(
             }
             let mut rows = eval_insert_value_rows(db, &stmt.table, stmt.columns.as_deref(), rows)?;
             coerce_legacy_timestamp_nulls(db, &stmt.table, stmt.columns.as_deref(), &mut rows)?;
-            if rows.len() > 1 || stmt.ignore {
+            if rows.len() > 1 && !stmt.ignore {
                 coerce_ignorable_insert_nulls(
                     db,
                     &stmt.table,
@@ -462,7 +473,7 @@ pub(super) fn execute_insert_borrowed(
                 expr_rows,
             )?;
             coerce_legacy_timestamp_nulls(db, &stmt.table, stmt.columns.as_deref(), &mut rows)?;
-            if rows.len() > 1 || stmt.ignore {
+            if rows.len() > 1 && !stmt.ignore {
                 coerce_ignorable_insert_nulls(
                     db,
                     &stmt.table,
@@ -1969,6 +1980,7 @@ where
     let expr_rows = expr_rows.into_iter();
     let mut rows = Vec::with_capacity(expr_rows.size_hint().0);
     for (row_index, row) in expr_rows.enumerate() {
+        let _diagnostic_row = crate::engine::api::DiagnosticInputRow::enter(row_index + 1);
         crate::engine::cancel::check_cancelled()?;
         let expressions = row.as_ref();
         if expressions.len() != column_indexes.len() {
@@ -2722,7 +2734,8 @@ fn execute_insert_rows_with_ids<const TRIGGERS: bool>(
     let probe_first = replace && replace_probe_first();
     let needs_image = TRIGGERS || returning_clause.is_some();
     let row_defaults = row_default_plans(&table, &column_indexes)?;
-    'source: for row in source_rows {
+    'source: for (row_index, row) in source_rows.into_iter().enumerate() {
+        let _diagnostic_row = crate::engine::api::DiagnosticInputRow::enter(row_index + 1);
         crate::engine::cancel::check_cancelled()?;
         let expected = if rows_prepared {
             table.columns.len()
@@ -2755,6 +2768,11 @@ fn execute_insert_rows_with_ids<const TRIGGERS: bool>(
             materialize_row_defaults(db, &table, &mut values, &row_defaults)?;
             values
         };
+        if ignore {
+            for &index in &column_indexes {
+                coerce_insert_null(db, &table.columns[index], &mut values[index], true)?;
+            }
+        }
         if TRIGGERS {
             let hook = hooks.as_mut().expect("trigger context");
             let defer_missing = has_before && hook.session.is_strict_sql_mode() && !ignore;

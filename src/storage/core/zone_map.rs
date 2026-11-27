@@ -12947,8 +12947,9 @@ mod zone_map_tests {
         let path = db.zone_map_file_path(table.id);
         db.set_recyclebin_variable("mydb_recyclebin", 0).unwrap();
         db.drop_table("test.t").unwrap();
+        db.maintain_catalog_retirements_until(|| false).unwrap();
         db.checkpoint().unwrap();
-        assert!(!path.exists(), "DROP must retire paged sidecar");
+        assert!(!path.exists(), "retirement must remove the paged sidecar");
     }
 
     #[test]

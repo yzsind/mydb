@@ -44,6 +44,7 @@ impl Database {
     ) -> Result<crate::repl::replica::progress::StatisticsSnapshot, QueryError> {
         use crate::repl::replica::progress::StatisticsSnapshot;
         if lsn != self.replica_applied_lsn_atomic.load(Ordering::Acquire)
+            || self.replica_applied_logical_lsn_atomic.load(Ordering::Acquire) > lsn
             || lsn > self.log.lock().durable_lsn()
         {
             return Err(error(

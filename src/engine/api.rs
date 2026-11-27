@@ -226,6 +226,7 @@ pub(crate) fn shared_statement_warning_should_publish(
 }
 
 thread_local! {
+    static DIAGNOSTIC_INPUT_ROW: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static STATEMENT_WARNINGS: std::cell::RefCell<SqlWarnings> = const { std::cell::RefCell::new(SqlWarnings::new()) };
     /// Query workers cannot publish diagnostics into the connection thread's
     /// TLS directly.  The immutable execution context installs this shared
@@ -517,12 +518,38 @@ pub(crate) fn stmt_frozen_utc_now_micros(compute: impl FnOnce() -> i64) -> i64 {
     })
 }
 
+pub(crate) struct DiagnosticInputRow(usize);
+
+impl DiagnosticInputRow {
+    pub(crate) fn enter(row: usize) -> Self {
+        Self(DIAGNOSTIC_INPUT_ROW.with(|current| current.replace(row)))
+    }
+}
+
+impl Drop for DiagnosticInputRow {
+    fn drop(&mut self) {
+        DIAGNOSTIC_INPUT_ROW.with(|current| current.set(self.0));
+    }
+}
+
+fn diagnostic_input_message(message: String) -> String {
+    let row = DIAGNOSTIC_INPUT_ROW.with(|row| row.get());
+    if row != 0 {
+        if let Some((prefix, previous)) = message.rsplit_once(" at row ") {
+            if !previous.is_empty() && previous.bytes().all(|b| b.is_ascii_digit()) {
+                return format!("{prefix} at row {row}");
+            }
+        }
+    }
+    message
+}
+
 pub(crate) fn push_statement_warning(
     level: crate::error::ConditionLevel,
     spec: crate::error::ErrorSpec,
     message: impl Into<String>,
 ) {
-    let message = message.into();
+    let message = diagnostic_input_message(message.into());
     if !crate::engine::expr::expression_warning_should_publish(spec.code().get(), &message) {
         return;
     }
@@ -533,7 +560,23 @@ pub(crate) fn push_statement_condition(
     level: crate::error::ConditionLevel,
     error: &crate::types::QueryError,
 ) {
-    push_sql_warning(SqlWarning::from_error(level, error));
+    let row = DIAGNOSTIC_INPUT_ROW.with(|row| row.get());
+    let rewrite_row = row != 0
+        && error.spec().is_some()
+        && error
+            .message()
+            .rsplit_once(" at row ")
+            .is_some_and(|(_, previous)| {
+                !previous.is_empty() && previous.bytes().all(|byte| byte.is_ascii_digit())
+            });
+    if rewrite_row {
+        push_sql_warning(SqlWarning::from_error(
+            level,
+            &error.clone().with_input_row_number(row),
+        ));
+    } else {
+        push_sql_warning(SqlWarning::from_error(level, error));
+    }
 }
 
 /// Literal diagnostics have the same routing and suppression rules as owned
@@ -2015,6 +2058,25 @@ pub trait QueryEngine: Send + Sync + 'static {
         None
     }
 
+    /// Bind numeric expression precision once per prepared handle. Live
+    /// @@session reads remain separate from this expression binding.
+    fn prepare_numeric_context(
+        &self,
+        _session: &SessionContext,
+        _statement: Option<&Statement>,
+    ) -> Result<Option<PreparedNumericContext>, QueryError> {
+        Ok(None)
+    }
+
+    fn refresh_prepared_numeric_context(
+        &self,
+        _session: &SessionContext,
+        _statement: Option<&Statement>,
+        context: &mut Option<PreparedNumericContext>,
+    ) -> Result<Option<u8>, QueryError> {
+        Ok(context.as_ref().map(|context| context.precision))
+    }
+
     fn execute_prepared_statement(
         &self,
         _session: &mut SessionContext,
@@ -2444,6 +2506,9 @@ pub struct SessionContext {
     pub x509_issuer: Option<String>,
     pub user_variables: super::user_variables::UserVariables,
     pub(crate) expression_registry: Option<std::sync::Weak<super::SessionRegistry>>,
+    /// Execution-local PREPARE binding; never replaces the live sysvar.
+    pub(crate) prepared_div_precision_increment: Option<u8>,
+    pub(crate) prepared_numeric_parameter_types: Option<Arc<PreparedNumericParameters>>,
     pub(crate) xml_parameter_binding: usize,
     pub(crate) xml_parameter_types: Option<Arc<Vec<crate::engine::expr::xml::ParameterType>>>,
     /// Cached performance_schema variable rows only need rebuilding after a
@@ -3070,8 +3135,50 @@ pub(crate) struct SessionTempTable {
     pub(crate) on_commit: TempTableOnCommit,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum PreparedNumericType {
+    Signed,
+    Unsigned,
+    Decimal,
+    Double,
+    String,
+}
+
+/// Governed descriptor storage shared by prepared handles, cache keys and
+/// deferred execution snapshots. Ownership of the bytes retains their charge.
+#[derive(Debug)]
+pub(crate) struct PreparedNumericParameters {
+    pub(crate) types: Box<[Option<PreparedNumericType>]>,
+    pub(crate) _memory_charge: crate::engine::executor::mem_budget::ControlledMemoryCharge,
+}
+impl PartialEq for PreparedNumericParameters {
+    fn eq(&self, other: &Self) -> bool {
+        self.types == other.types
+    }
+}
+impl Eq for PreparedNumericParameters {}
+impl std::hash::Hash for PreparedNumericParameters {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::hash::Hash::hash(&self.types, state);
+    }
+}
+
+/// Numeric domains bound by PREPARE, refreshed only by dependent DDL.
+#[derive(Debug, Clone)]
+pub struct PreparedNumericContext {
+    pub(crate) parameters: Option<Arc<PreparedNumericParameters>>,
+    pub(crate) parameter_reprepared: bool,
+    pub(crate) precision: u8,
+    pub(crate) catalog_epoch: u64,
+    pub(crate) deps: Arc<[crate::engine::cache::PlanDep]>,
+    pub(crate) objects: Arc<[crate::engine::cache::ObjectDep]>,
+    pub(crate) bindings: Arc<[(Arc<str>, Option<String>)]>,
+    pub(crate) _memory_charge: Arc<crate::engine::executor::mem_budget::ControlledMemoryCharge>,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct SessionSqlPreparedStatement {
+    pub(crate) numeric_context: Option<PreparedNumericContext>,
     pub(crate) xml_parameter_types:
         Option<Arc<parking_lot::Mutex<Vec<crate::engine::expr::xml::ParameterType>>>>,
     pub(crate) pfs: crate::engine::session_registry::PreparedStatementSnapshot,
@@ -3352,6 +3459,26 @@ impl Default for SessionContext {
 }
 
 impl SessionContext {
+    #[inline]
+    pub(crate) fn expression_div_precision_increment(&self) -> u8 {
+        self.prepared_div_precision_increment
+            .unwrap_or(self.sysvars.div_precision_increment.min(30) as u8)
+    }
+
+    pub(crate) fn update_sql_prepared_numeric_context(
+        &mut self,
+        name: &str,
+        context: Option<PreparedNumericContext>,
+    ) {
+        if let Some(entry) = self
+            .sql_prepared_statements
+            .statements
+            .get_mut(&name.to_ascii_lowercase())
+        {
+            entry.numeric_context = context;
+        }
+    }
+
     pub(crate) fn without_sysvar_inheritance() -> Self {
         let sql_mode = crate::engine::sysvar::builtin::query::global_sql_mode();
         let temporal_sql_mode_bits =
@@ -3390,6 +3517,8 @@ impl SessionContext {
             x509_issuer: None,
             user_variables: super::user_variables::UserVariables::default(),
             expression_registry: None,
+            prepared_div_precision_increment: None,
+            prepared_numeric_parameter_types: None,
             xml_parameter_binding: 0,
             xml_parameter_types: None,
             pfs_variables_dirty: true,

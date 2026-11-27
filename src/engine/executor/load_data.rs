@@ -73,7 +73,13 @@ fn coerce_deferred_load_rows(
         // Keep error classification, clamping and warnings in the shared
         // storage coercer. Complete conversion before triggers or partition
         // routing inspect the row, including generated-column dependencies.
-        for row in rows {
+        let first = LOAD_DIAGNOSTIC_ROW
+            .with(|row| row.get())
+            .saturating_sub(rows.len() as u64)
+            .saturating_add(1);
+        for (offset, row) in rows.iter_mut().enumerate() {
+            let _diagnostic_row =
+                crate::engine::api::DiagnosticInputRow::enter(first as usize + offset);
             db.coerce_row_for_load(table, row)?;
         }
     }
@@ -6311,6 +6317,15 @@ fn round_load_decimal_text(text: &str, scale: u8) -> Option<String> {
 #[cold]
 fn warn_load_empty_number(kind: &str, column: &str) -> Result<(), QueryError> {
     let row = LOAD_DIAGNOSTIC_ROW.with(|row| row.get().max(1));
+    if kind == "integer" && LOAD_DECODE_POLICY.with(|policy| policy.get().0) {
+        // Defer this conversion along with other malformed integer cells so
+        // the row coercer publishes every warning in source-row order.
+        return Err(
+            crate::error::catalog::ER_TRUNCATED_WRONG_VALUE_FOR_FIELD.error(format!(
+                "Incorrect {kind} value: '' for column '{column}' at row {row}"
+            )),
+        );
+    }
     publish_load_conversion_condition(
         crate::error::catalog::ER_TRUNCATED_WRONG_VALUE_FOR_FIELD,
         format!("Incorrect {kind} value: '' for column '{column}' at row {row}"),

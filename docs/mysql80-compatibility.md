@@ -134,13 +134,13 @@ results or affected-row counts with MySQL:
 - **INSTANT DROP and LOB space**: dropping a column preserves old row layouts and their LOB data without rewriting the heap. OPTIMIZE TABLE or a physical COPY rebuild removes the dropped values and reclaims their LOB space; the instantaneous drop itself does not promise immediate disk reclamation.
 - **Metadata differences**: SHOW FULL TABLES has seven columns, as documented in [SHOW TABLES](statement/metadata/show-tables.md). UPDATE_TIME tracks committed local INSERT/UPDATE/DELETE operations; uncommitted changes and rollback do not publish timestamps. This runtime statistic may be NULL after restart or TRUNCATE. User-view CREATE_TIME is persisted at creation and does not change merely because the server restarts.
 - **Expression defaults during ALTER**: column-dependent defaults are evaluated for existing rows during COPY, including partitioned tables and concurrent-write replay. RENAME COLUMN and CHANGE COLUMN rewrite dependent DEFAULT expressions along with generated expressions. A DEFAULT expression that references an AUTO_INCREMENT column is rejected with error 3768.
-- **Adding AUTO_INCREMENT columns**: a compound ALTER can add the column and its key together, assigning values to existing rows and preserving the session increment/offset. This requires COPY with writes blocked; explicit `LOCK=NONE` is rejected.
+- **Adding AUTO_INCREMENT columns**: a compound ALTER can add the column and its key together, assigning values to existing rows and preserving the session increment/offset. Supported COPY plans allow concurrent writes, including `LOCK=NONE`, on Strict, Relaxed and Memory storage. Existing-row assignments survive replay, and publication advances the allocator highwater. Initial numbering follows the physical scan order.
 - **CHECK constraints**: ✅ all actions
 - **Foreign keys (FK)**: ✅ all four referential actions, including cascades
 - **Online CHECK / FK ALTER**: ➕ constraint-only ALTERs allow concurrent reads and writes by default, including CHECK add/enable/disable, FK add and DROP+ADD replacement, and atomic publication of multiple constraints. Preparation and publication use short write barriers; `LOCK=SHARED` allows reads and blocks writes, `LOCK=EXCLUSIVE` retains exclusive semantics. Enabling a not-yet-enabled CHECK, disabling, and dropping constraints do not scan existing data; weak lock requests in mixed column/index/partition actions fail explicitly.
   See [ALTER TABLE](statement/ddl/alter-table.md) for supported syntax and boundaries.
 - **`ALTER TABLE ALGORITHM={INSTANT|INPLACE|COPY|DEFAULT}`**: ✅
-  ➕ Column type changes within the supported range are online by default and also accept `COPY, LOCK=NONE`; strict mode covers LOBs, partitioning, and vector indexes under on-disk storage — see [Online Column Type Change](online-column-type-change.md).
+  ➕ Column type changes within the supported range are online by default and also accept `COPY, LOCK=NONE`; supported plans cover strict/non-strict conversion, Memory storage, LOBs, partitioning, existing vector indexes, nonpartitioned FULLTEXT and SPATIAL indexes — see [Online Column Type Change](online-column-type-change.md).
   Algorithms are validated against the actual work: adding generated columns or columns with enforced CHECKs requires COPY, and dropping a column whose index rebuilds cascade requires INPLACE; encoding-compatible constraint tightening only scans for validation under strict mode. Composite actions that cannot yet be published atomically return 1846 before modification. See [ALTER TABLE](statement/ddl/alter-table.md) for supported combinations.
 - **Partial indexes**: ➕ `WHERE` predicates on CREATE INDEX, inline CREATE TABLE keys and ALTER TABLE ADD INDEX, including UNIQUE BTREE, FULLTEXT, SPATIAL, HNSW and IVF. The optimizer requires a conservative implication proof; primary keys and foreign-key backing indexes must remain complete. See [partial indexes](partial-indexes.md).
 - **Online BTREE `ADD/CREATE INDEX` and `ADD PRIMARY KEY`**: ✅ Ordinary, unique, and primary key indexes allow concurrent DML during the Building phase by default, retaining sorted/bulk-load plus incremental catch-up; preparation and publication use read-compatible write barriers.
@@ -150,6 +150,8 @@ results or affected-row counts with MySQL:
   when NULL/duplicate keys cause creation to fail, already committed business data is retained. mydb keeps the heap and does not rebuild a clustered table,
   and never converts NULL to a default value regardless of SQL mode. Old snapshots hide new indexes that do not yet cover themselves, uniqueness,
   and NOT NULL optimizer facts, and keep reading old data; other DDL boundaries such as physical generation switches may still return 1412.
+- **Online FULLTEXT / SPATIAL creation**: ➕ standalone CREATE INDEX and index-only ALTERs allow concurrent DML by default and with `LOCK=NONE`, including atomic BTREE/FULLTEXT/SPATIAL additions. FULLTEXT builds its corpus baseline outside the write barrier; old snapshots use the heap when postings do not cover their view. SPATIAL builds partition-local R-trees. Explicit SHARED/EXCLUSIVE lock contracts are retained.
+- **Online vector index creation**: ➕ HNSW and IVF CREATE INDEX and index-only ALTERs allow concurrent writes by default and with `LOCK=NONE`, including partition-local, typed, quantized and partial indexes. ANN graphs remain private until the committed tail and row registries are complete. Initial graph images are logged outside writer exclusion; candidate tails and Public catalog metadata share one commit decision. Construction or capture-budget failure aborts the DDL while retaining committed business data. `LOCK=SHARED` blocks writers and allows readers; `LOCK=EXCLUSIVE` retains exclusive access. Vector columns still require a declared dimension and NOT NULL.
 - **DDL read concurrency**: ➕ ADD COLUMN without heap rewrite, encoding-compatible MODIFY, same-name
   CHANGE, and NOT NULL changes that only scan for validation under strict mode can run in parallel with existing ordinary reads and not-yet-consumed
   streaming cursors; FIRST/AFTER within the supported range and column changes are published atomically.
@@ -684,6 +686,26 @@ pages for supported arguments, return types, and limitations.
 
 The LIKE ESCAPE may be a literal, placeholder, or scalar expression; single-character
 validation happens at execution time and charset/collation semantics are preserved.
+Regular expressions use a linear-time engine. Backreferences, lookaround,
+`\Q...\E`, `\Z`, `\h`, `\H`, and `\V` are not
+supported and return explicit errors. Legacy `[[:<:]]` / `[[:>:]]` boundary
+classes are rejected rather than interpreted as ordinary characters. `\v` matches ICU's seven vertical whitespace characters; using that class as a range endpoint
+is rejected explicitly. Patterns
+are limited to 8192 bytes and compilation/search memory is governed.
+
+Stored-routine LIMIT clauses currently accept literals and prepared parameters;
+local variable LIMIT bounds return an explicit unsupported-feature error.
+Stored functions may share a name with a built-in; use a schema-qualified name
+to select the stored function, while an unqualified call selects the built-in.
+`lc_time_names` currently supports en_US, de_DE, fr_FR, es_ES, it_IT, pt_BR,
+zh_CN, ja_JP and ko_KR; other locales return an explicit error.
+ALLOW_INVALID_DATES permits storing invalid date components. Calendar arithmetic
+on a nonexistent date returns NULL with a conversion warning, rather than
+normalizing it into another month or propagating an invalid calendar result.
+
+Typed CTE column declarations are rejected; use CAST in the anchor query to
+control the recursive result type and width.
+
 `REGEXP NULL` returns NULL. `NAME_CONST` accepts only the literal forms MySQL
 allows; complex expressions return 1210.
 

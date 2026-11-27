@@ -107,6 +107,26 @@ pub(crate) fn parse_time_duration(text: &str) -> Result<TimeParts, TimeParseErro
             first
         };
         (hour.min(839) as u32, minute, second)
+    } else if main.bytes().any(|b| b.is_ascii_whitespace()) {
+        let mut fields = main.split_whitespace();
+        let days = fields
+            .next()
+            .ok_or(TimeParseError::Syntax)?
+            .parse::<u64>()
+            .map_err(|_| TimeParseError::Syntax)?;
+        let hours = fields
+            .next()
+            .ok_or(TimeParseError::Syntax)?
+            .parse::<u64>()
+            .map_err(|_| TimeParseError::Syntax)?;
+        if fields.next().is_some() {
+            return Err(TimeParseError::Syntax);
+        }
+        let hours = days
+            .checked_mul(24)
+            .and_then(|days| days.checked_add(hours))
+            .ok_or(TimeParseError::Syntax)?;
+        (hours.min(839) as u32, 0, 0)
     } else {
         let number = main.parse::<u64>().map_err(|_| TimeParseError::Syntax)?;
         (
@@ -174,7 +194,7 @@ pub fn parse_delimited_datetime_components(s: &str) -> Option<DateTimeParts> {
             return None;
         }
         let year = parse_field(year_text)?;
-        let year = if year_text.len() <= 2 {
+        let year = if year_text.len() == 2 {
             if year < YY_PART_YEAR as u32 {
                 2000 + year
             } else {
@@ -412,6 +432,39 @@ pub fn parse_compact_datetime(s: &str) -> Option<DateTimeParts> {
     // digits. Allow a little slack for leading zeros.
     if int_part.len() > 15 {
         return None;
+    }
+    if matches!(int_part.len(), 8 | 14) {
+        let year = int_part[..4].parse().ok()?;
+        let month = int_part[4..6].parse().ok()?;
+        let day = int_part[6..8].parse().ok()?;
+        let (hour, minute, second) = if int_part.len() == 14 {
+            (
+                int_part[8..10].parse().ok()?,
+                int_part[10..12].parse().ok()?,
+                int_part[12..14].parse().ok()?,
+            )
+        } else {
+            (0, 0, 0)
+        };
+        if year > 9999
+            || !(1..=12).contains(&month)
+            || !(1..=31).contains(&day)
+            || hour > 23
+            || minute > 59
+            || second > 59
+        {
+            return None;
+        }
+        return Some(DateTimeParts {
+            year,
+            month,
+            day,
+            hour,
+            minute,
+            second,
+            micros,
+            is_datetime: int_part.len() == 14,
+        });
     }
     let nr: i64 = int_part.parse().ok()?;
     number_to_datetime(nr, micros)

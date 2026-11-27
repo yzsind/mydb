@@ -248,6 +248,14 @@ fn compile_mysql_regex(
         return Err(crate::error::catalog::ER_REGEXP_INTERNAL_ERROR
             .error("regular expression exceeded the implementation resource limit"));
     }
+    if crate::engine::mysql_regex::has_legacy_word_boundary(pattern) {
+        return Err(crate::error::catalog::ER_REGEXP_ILLEGAL_ARGUMENT
+            .error("The regular expression contains an unsupported legacy word-boundary class"));
+    }
+    if crate::engine::mysql_regex::has_unsupported_vertical_range(pattern) {
+        return Err(crate::error::catalog::ER_REGEXP_RULE_SYNTAX.error(
+            "A vertical-space class cannot be used as a range endpoint; use a character-class union"));
+    }
     let insensitive = match_type
         .chars()
         .filter(|c| matches!(c, 'i' | 'c'))
@@ -294,6 +302,10 @@ fn compile_mysql_regex(
             || message.contains("repetition count") && message.contains("overflow")
         {
             crate::error::catalog::ER_REGEX_NUMBER_TOO_BIG
+        } else if message.contains("incomplete escape sequence") {
+            crate::error::catalog::ER_REGEXP_BAD_ESCAPE_SEQUENCE
+        } else if message.contains("duplicate capture group name") {
+            crate::error::catalog::ER_REGEXP_INVALID_CAPTURE_GROUP_NAME
         } else if message.contains("unclosed character class") {
             crate::error::catalog::ER_REGEXP_MISSING_CLOSE_BRACKET
         } else if message.contains("unclosed group") || message.contains("unopened group") {

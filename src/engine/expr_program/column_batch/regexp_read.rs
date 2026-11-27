@@ -331,10 +331,7 @@ impl<'a> RegexpRead<'a> {
                         }
                     };
                     let found = if matches!(self.kind, Kind::Substr) {
-                        regex
-                            .find_iter(text)
-                            .filter(|m| m.start() >= start)
-                            .nth(self.occurrence - 1)
+                        regex.find_iter(&text[start..]).nth(self.occurrence - 1)
                     } else if self.occurrence == 1 {
                         regex.find(&text[start..])
                     } else {

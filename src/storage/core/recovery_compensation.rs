@@ -8,7 +8,9 @@ fn apply_file_compensation(
             invalidate_recovery_page_io(data_dir, path);
             match fs::remove_file(data_dir.join(path)) {
                 Ok(()) => {}
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                // No namespace mutation occurred. In restore workspaces the
+                // skipped physical index's parent may never have existed.
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
                 Err(err) => return Err(io_err(err)),
             }
             note_recovery_write(data_dir, data_dir.join(path))?;

@@ -11,6 +11,7 @@ pub(super) struct AlterExecutionPlan {
     pub(super) constraints: bool,
     pub(super) metadata_atomic: bool,
     pub(super) read_compatible_metadata: bool,
+    pub(super) online_drop_column: bool,
 }
 
 /// One immutable catalog replacement, with no row-layout or resource-lifetime
@@ -71,9 +72,9 @@ pub(super) fn plan_persistent_alter(
             .all(|a| matches!(a, AlterAction::AddIndex(_)))
         && stmt.partition_actions.is_empty()
         && stmt.algorithm != AlterAlgorithm::Copy;
-    let btree_indexes = indexes
+    let online_indexes = indexes
         && stmt.actions.iter().all(
-            |a| matches!(a, AlterAction::AddIndex(i) if i.index_type.eq_ignore_ascii_case("BTREE")),
+            |a| matches!(a, AlterAction::AddIndex(i) if Database::online_index_type_supported(&i.index_type)),
         );
     // A later action can bind a column introduced by an earlier action. Such
     // actions cannot be classified against the live source descriptor. The
@@ -172,10 +173,10 @@ pub(super) fn plan_persistent_alter(
                 | AlterAction::SetColumnComment { .. }
         )
     });
-    if indexes && !btree_indexes && stmt.actions.len() > 1 {
+    if indexes && !online_indexes && stmt.actions.len() > 1 {
         return Err(error(
             crate::error::catalog::ER_ALTER_OPERATION_NOT_SUPPORTED_REASON,
-            "atomic multi-index ALTER currently requires BTREE indexes",
+            "atomic multi-index ALTER requires BTREE, FULLTEXT or SPATIAL indexes",
         ));
     }
     let compound = stmt.actions.len() + stmt.partition_actions.len() > 1;
@@ -195,6 +196,11 @@ pub(super) fn plan_persistent_alter(
         required = AlterAlgorithm::Copy;
     }
     let physical_copy = required == AlterAlgorithm::Copy || stmt.algorithm == AlterAlgorithm::Copy;
+    let online_drop_column = !physical_copy
+        && stmt.partition_actions.is_empty()
+        && stmt.lock != AlterLock::Exclusive
+        && matches!(stmt.actions.as_slice(), [AlterAction::DropColumn(name)]
+            if db.online_drop_column_supported(&table, name)?);
     let online_copy = physical_copy
         && stmt.partition_actions.is_empty()
         && stmt.lock != AlterLock::Exclusive
@@ -214,9 +220,10 @@ pub(super) fn plan_persistent_alter(
     if stmt.lock == AlterLock::None
         && scan
         && !constraints
-        && !btree_indexes
+        && !online_indexes
         && !online_copy
         && !partition_online
+        && !online_drop_column
     {
         return Err(error(crate::error::catalog::ER_ALTER_OPERATION_NOT_SUPPORTED_REASON,
             "LOCK=NONE is not supported by this ALTER execution plan; use LOCK=SHARED where supported, otherwise LOCK=EXCLUSIVE"));
@@ -225,8 +232,9 @@ pub(super) fn plan_persistent_alter(
         && !partition_shared_build
         && scan
         && !constraints
-        && !btree_indexes
+        && !online_indexes
         && !online_copy
+        && !online_drop_column
         && !(validation_scan && metadata_atomic && read_compatible_column_action(stmt).is_some())
     {
         return Err(error(
@@ -248,11 +256,11 @@ pub(super) fn plan_persistent_alter(
         && stmt.lock != AlterLock::Exclusive;
     let mdl = if read_compatible_metadata {
         MdlLockType::SharedNoWrite
-    } else if partition_shared_build && stmt.lock != AlterLock::Exclusive {
+    } else if online_drop_column || (partition_shared_build && stmt.lock != AlterLock::Exclusive) {
         // A separate transaction-duration SNW ticket is acquired by the
-        // partition executor; retain SU to serialize competing DDL.
+        // executor; retain SU to serialize competing DDL.
         MdlLockType::SharedUpgradable
-    } else if constraints || btree_indexes || online_copy {
+    } else if constraints || online_indexes || online_copy {
         match stmt.lock {
             AlterLock::Exclusive => MdlLockType::Exclusive,
             AlterLock::Shared => MdlLockType::SharedNoWrite,
@@ -277,6 +285,7 @@ pub(super) fn plan_persistent_alter(
         constraints,
         metadata_atomic,
         read_compatible_metadata,
+        online_drop_column,
     })
 }
 
@@ -299,7 +308,7 @@ pub(super) fn alter_table_statement_mdl(
         // ticket. Starting with SNW would let two LOCK=SHARED DDLs race.
         AlterLock::Shared => MdlLockType::SharedUpgradable,
         AlterLock::Default if stmt.actions.iter().any(|action|
-            matches!(action, AlterAction::AddIndex(i) if !i.index_type.eq_ignore_ascii_case("BTREE"))) => MdlLockType::SharedNoWrite,
+            matches!(action, AlterAction::AddIndex(i) if !Database::online_index_type_supported(&i.index_type))) => MdlLockType::SharedNoWrite,
         AlterLock::Default | AlterLock::None => MdlLockType::SharedUpgradable,
     })
 }

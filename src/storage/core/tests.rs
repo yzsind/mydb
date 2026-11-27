@@ -2,6 +2,7 @@ use super::*;
 
 include!("storage_handle_memo_tests.rs");
 include!("audit_five_storage_tests.rs");
+include!("replication_switchover_tests.rs");
 
 #[test]
 fn snapshot_slots_preserve_other_readers_across_threads_and_reuse() {
@@ -5510,6 +5511,8 @@ fn drop_table_file_delete_wal_does_not_copy_table_bytes() {
 
     db.drop_table("test.t").unwrap();
 
+    assert!(db.table("test.t").is_err());
+    db.maintain_catalog_retirements_until(|| false).unwrap();
     let scan = LogManager::scan(dir.path()).unwrap();
     let file_deletes = scan
         .records
@@ -32087,7 +32090,16 @@ fn audit1122_partial_batch_preserves_the_successful_logical_watermark() {
     };
     for _ in 0..2 {
         assert!(db.apply_wal_record(&record).is_err());
-        assert_eq!(db.replica_applied_lsn(), 100_002);
+        assert_eq!(
+            db.replica_applied_lsn(),
+            0,
+            "resume must remain before the incomplete frame"
+        );
+        assert_eq!(
+            db.replica_applied_logical_lsn_atomic
+                .load(Ordering::Acquire),
+            100_002
+        );
         assert!(db.is_txn_active(900_002));
     }
 }

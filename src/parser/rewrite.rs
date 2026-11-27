@@ -892,9 +892,9 @@ pub(super) fn strip_create_index_visibility(
     (std::borrow::Cow::Borrowed(sql), None)
 }
 
-/// ALTER/DROP CHECK are outside sqlparser's MySQL AST. Split structurally before
-/// parsing its siblings so ALGORITHM/LOCK and compound actions are preserved.
-fn parse_alter_check_actions(sql: &str) -> Result<Option<Statement>, ParseError> {
+/// Parse manual ALTER actions structurally so charset conversions and CHECK
+/// operations preserve sibling actions, quoting, comments, ALGORITHM and LOCK.
+fn parse_manual_alter_actions(sql: &str) -> Result<Option<Statement>, ParseError> {
     use crate::sql_lex::{SqlTokenCursor, SqlTokenKind, StructuralCursor};
     let mode = crate::sql_lex::SqlLexMode::from_parser_bits(current_parser_sql_mode_bits());
     let tokens = |text: &str| {
@@ -935,7 +935,7 @@ fn parse_alter_check_actions(sql: &str) -> Result<Option<Statement>, ParseError>
         .map(|range| &tail[range])
         .collect::<Vec<_>>();
     let mut parts = Vec::new();
-    let mut has_check = false;
+    let mut has_manual = false;
     for clause in &clauses {
         let words = tokens(clause)?;
         let is_check = words.len() >= 2
@@ -946,10 +946,13 @@ fn parse_alter_check_actions(sql: &str) -> Result<Option<Statement>, ParseError>
                     && words[1].1.eq_ignore_ascii_case("CONSTRAINT"))
                 || (words[0].1.eq_ignore_ascii_case("ALTER")
                     && words[1].1.eq_ignore_ascii_case("INDEX")));
-        has_check |= is_check;
-        parts.push((words, is_check));
+        let is_convert = words.first().is_some_and(|word| {
+            word.0.kind == SqlTokenKind::Word && word.1.eq_ignore_ascii_case("CONVERT")
+        });
+        has_manual |= is_check || is_convert;
+        parts.push((words, is_check, is_convert));
     }
-    if !has_check {
+    if !has_manual {
         return Ok(None);
     }
     let mut result = AlterTable {
@@ -968,8 +971,58 @@ fn parse_alter_check_actions(sql: &str) -> Result<Option<Statement>, ParseError>
         unreachable!()
     };
     result.table = identity.table;
-    for (clause, (words, is_check)) in clauses.iter().zip(parts) {
-        if is_check && words[1].1.eq_ignore_ascii_case("INDEX") {
+    let mut seen_algorithm = false;
+    let mut seen_lock = false;
+    for (clause, (words, is_check, is_convert)) in clauses.iter().zip(parts) {
+        if is_convert {
+            let keyword = |position: usize, value: &str| {
+                words.get(position).is_some_and(|word| {
+                    word.0.kind == SqlTokenKind::Word && word.1.eq_ignore_ascii_case(value)
+                })
+            };
+            let charset_position =
+                if keyword(1, "TO") && keyword(2, "CHARACTER") && keyword(3, "SET") {
+                    4
+                } else if keyword(1, "TO") && keyword(2, "CHARSET") {
+                    3
+                } else {
+                    return Err(parse_error_full_span(
+                        sql,
+                        "CONVERT expects TO CHARACTER SET or TO CHARSET",
+                    ));
+                };
+            let identifier = |position: usize| {
+                words
+                    .get(position)
+                    .filter(|word| {
+                        matches!(
+                            word.0.kind,
+                            SqlTokenKind::Word | SqlTokenKind::QuotedIdentifier
+                        )
+                    })
+                    .map(|word| word.1.clone())
+            };
+            let charset = identifier(charset_position).ok_or_else(|| {
+                parse_error_full_span(sql, "CONVERT TO CHARACTER SET expects a charset name")
+            })?;
+            let collation = if words.len() == charset_position + 1 {
+                None
+            } else if words.len() == charset_position + 3
+                && keyword(charset_position + 1, "COLLATE")
+            {
+                Some(identifier(charset_position + 2).ok_or_else(|| {
+                    parse_error_full_span(sql, "COLLATE expects a collation name")
+                })?)
+            } else {
+                return Err(parse_error_full_span(
+                    sql,
+                    "unexpected token after CONVERT TO CHARACTER SET",
+                ));
+            };
+            result
+                .actions
+                .push(AlterAction::ConvertToCharset { charset, collation });
+        } else if is_check && words[1].1.eq_ignore_ascii_case("INDEX") {
             if words.len() != 4
                 || !(words[3].1.eq_ignore_ascii_case("VISIBLE")
                     || words[3].1.eq_ignore_ascii_case("INVISIBLE"))
@@ -1054,12 +1107,20 @@ fn parse_alter_check_actions(sql: &str) -> Result<Option<Statement>, ParseError>
                 .first()
                 .is_some_and(|t| t.1.eq_ignore_ascii_case("ALGORITHM"))
             {
+                if seen_algorithm {
+                    return Err(parse_error_full_span(sql, "duplicate ALGORITHM clause"));
+                }
+                seen_algorithm = true;
                 result.algorithm = other.algorithm;
             }
             if words
                 .first()
                 .is_some_and(|t| t.1.eq_ignore_ascii_case("LOCK"))
             {
+                if seen_lock {
+                    return Err(parse_error_full_span(sql, "duplicate LOCK clause"));
+                }
+                seen_lock = true;
                 result.lock = other.lock;
             }
         }
@@ -1074,7 +1135,7 @@ pub(super) fn parse_manual_alter_table_check_statement(
     if !first_keyword_is(sql, b"ALTER") {
         return Ok(None);
     }
-    if let Some(statement) = parse_alter_check_actions(sql)? {
+    if let Some(statement) = parse_manual_alter_actions(sql)? {
         return Ok(Some(statement));
     }
     let trimmed = sql.trim().trim_end_matches(';').trim();
@@ -1223,61 +1284,6 @@ fn parse_manual_alter_table_options(
             kind: format!("ALTER TABLE {tail}"),
             sql: sql.to_string(),
         }));
-    }
-    if upper.starts_with("CONVERT TO CHARACTER SET") || upper.starts_with("CONVERT TO CHARSET") {
-        let words: Vec<&str> = tail.split_whitespace().collect();
-        // CONVERT TO CHARACTER SET <cs> [COLLATE <coll>]
-        //            or CHARSET <cs> [COLLATE <coll>]
-        let cs_idx = if words
-            .get(2)
-            .is_some_and(|w| w.eq_ignore_ascii_case("CHARACTER"))
-        {
-            4
-        } else {
-            3
-        };
-        let Some(charset) = words.get(cs_idx) else {
-            return Err(parse_error_full_span(
-                sql,
-                "CONVERT TO CHARACTER SET expects a charset name",
-            ));
-        };
-        let collation = match words.get(cs_idx + 1) {
-            None => None,
-            Some(word) if word.eq_ignore_ascii_case("COLLATE") => match words.get(cs_idx + 2) {
-                Some(coll) => Some(coll.trim_matches('`').to_string()),
-                None => {
-                    return Err(parse_error_full_span(
-                        sql,
-                        "COLLATE expects a collation name",
-                    ))
-                }
-            },
-            Some(_) => {
-                return Err(parse_error_full_span(
-                    sql,
-                    "unexpected token after CONVERT TO CHARACTER SET",
-                ))
-            }
-        };
-        if words.len() > cs_idx + if collation.is_some() { 3 } else { 1 } {
-            return Err(parse_error_full_span(
-                sql,
-                "unexpected token after CONVERT TO CHARACTER SET",
-            ));
-        }
-        return Ok(Some(Statement::AlterTable(AlterTable {
-            table: table.to_string(),
-            query_hints: Vec::new(),
-            hint_warnings: Vec::new(),
-            actions: vec![AlterAction::ConvertToCharset {
-                charset: charset.trim_matches('`').to_string(),
-                collation,
-            }],
-            partition_actions: Vec::new(),
-            algorithm: AlterAlgorithm::Default,
-            lock: AlterLock::Default,
-        })));
     }
     // InnoDB-aligned accepted no-ops. DISABLE/ENABLE KEYS is MyISAM-era
     // (InnoDB answers Note 1031). FORCE instead uses the physical rebuild

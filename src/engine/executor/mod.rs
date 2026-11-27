@@ -94,6 +94,7 @@ mod multi_table;
 pub(crate) mod partition_clause;
 pub(crate) mod partition_router;
 mod prepared_dml;
+mod prepared_numeric;
 pub(super) mod qualification;
 mod returning;
 pub(crate) mod routines;
@@ -2065,7 +2066,8 @@ pub(super) fn plan_semantics(
         character_set_client: Arc::from(session.character_set_client.as_str()),
         character_set_connection: Arc::from(session.character_set_connection.as_str()),
         collation_connection: Arc::from(session.collation_connection.as_str()),
-        div_precision_increment: session.sysvars.div_precision_increment.min(30) as u8,
+        div_precision_increment: session.expression_div_precision_increment(),
+        prepared_numeric_parameter_types: session.prepared_numeric_parameter_types.clone(),
         group_concat_max_len: session.group_concat_max_len,
     }
 }
@@ -3964,6 +3966,29 @@ impl QueryEngine for StorageQueryEngine {
 
     fn shutdown(&self) -> Result<(), QueryError> {
         StorageQueryEngine::shutdown(self)
+    }
+
+    fn prepare_numeric_context(
+        &self,
+        session: &SessionContext,
+        statement: Option<&Statement>,
+    ) -> Result<Option<crate::engine::api::PreparedNumericContext>, QueryError> {
+        match statement {
+            Some(statement) => prepared_numeric::bind(&self.db, session, statement),
+            None => Ok(None),
+        }
+    }
+
+    fn refresh_prepared_numeric_context(
+        &self,
+        session: &SessionContext,
+        statement: Option<&Statement>,
+        context: &mut Option<crate::engine::api::PreparedNumericContext>,
+    ) -> Result<Option<u8>, QueryError> {
+        match statement {
+            Some(statement) => prepared_numeric::refresh(&self.db, session, statement, context),
+            None => Ok(None),
+        }
     }
 
     fn prepare_statement_template(
@@ -6350,15 +6375,26 @@ impl StorageQueryEngine {
         // type-affecting session state as EXECUTE. Previously this path ran
         // outside both TLS scopes, so GROUP_CONCAT always advertised the
         // default 1024 cap and div/collation inference could use defaults.
+        let numeric = prepared_numeric::bind(&self.db, session, &statement)?;
+        let saved_precision = session.prepared_div_precision_increment;
+        let saved_types = session.prepared_numeric_parameter_types.take();
+        session.prepared_div_precision_increment =
+            numeric.as_ref().map(|context| context.precision);
+        session.prepared_numeric_parameter_types = numeric
+            .as_ref()
+            .and_then(|context| context.parameters.clone());
         let group_concat_max_len = session.group_concat_max_len;
-        crate::engine::executor::select::aggregate::with_group_concat_max_len(
+        let columns = crate::engine::executor::select::aggregate::with_group_concat_max_len(
             group_concat_max_len,
             || {
                 crate::engine::expr::with_session_expr_info(session, || {
                     describe_statement_columns(&self.db, session, &statement)
                 })
             },
-        )
+        );
+        session.prepared_div_precision_increment = saved_precision;
+        session.prepared_numeric_parameter_types = saved_types;
+        columns
     }
 
     fn execute_with_log_metadata(
