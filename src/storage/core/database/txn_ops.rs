@@ -746,6 +746,9 @@ impl Database {
         let _zone_map_role_transition = self.zone_map_gate.write();
         let role_changed = self.physical_replica_mode() != enabled;
         if role_changed {
+            // Neither role may inherit row locations maintained by the other
+            // write path. Replica DD reads bypass this process-local cache.
+            self.catalog.clear_dd_object_rows()?;
             self.sequences.role_epoch.fetch_add(1, Ordering::AcqRel);
         }
         if enabled && role_changed {

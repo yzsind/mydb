@@ -871,6 +871,7 @@ impl Database {
             checkpoint_running: Mutex::new(()),
             replica_apply_checkpoint: RwLock::new(()),
             replica_applied_lsn_atomic: AtomicU64::new(replica_applied_seed),
+            replica_applied_logical_lsn_atomic: AtomicU64::new(replica_applied_seed),
             replica_restartpoint_tracker: Mutex::new(ReplicaRestartpointTracker::new(
                 replica_needs_full_sync,
             )),

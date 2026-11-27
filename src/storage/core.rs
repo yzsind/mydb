@@ -1305,7 +1305,11 @@ pub struct Database {
     /// Physical-replica apply holds the read side for one complete WAL frame;
     /// restartpoint holds the write side while syncing files and pruning WAL.
     replica_apply_checkpoint: RwLock<()>,
+    /// Complete physical-frame frontier used by ACKs, restartpoints and resume.
     replica_applied_lsn_atomic: AtomicU64,
+    /// Successful logical prefix inside a frame that may need to be retried.
+    /// Never publish this as a source WAL resume position.
+    replica_applied_logical_lsn_atomic: AtomicU64,
     replica_restartpoint_tracker: Mutex<ReplicaRestartpointTracker>,
     /// Lock-free mirror of `CheckpointState::last_checkpoint_lsn`.
     /// Updated under the `checkpoint` mutex whenever a real checkpoint

@@ -312,9 +312,12 @@ impl Database {
                         )
                     })?;
                 let mut logical_prev_lsn = record.prev_txn_lsn;
+                let applied_prefix = self.replica_applied_logical_lsn_atomic
+                    .load(Ordering::Acquire)
+                    .max(self.replica_applied_lsn_atomic.load(Ordering::Acquire));
                 for (idx, payload) in records.iter().enumerate() {
                     let logical_lsn = first_logical_lsn + idx as u64;
-                    if logical_lsn <= self.replica_applied_lsn_atomic.load(Ordering::Acquire) {
+                    if logical_lsn <= applied_prefix {
                         logical_prev_lsn = logical_lsn;
                         continue;
                     }
@@ -328,7 +331,7 @@ impl Database {
                         },
                         heap_redo,
                     )?;
-                    self.replica_applied_lsn_atomic.fetch_max(logical_lsn, Ordering::Release);
+                    self.replica_applied_logical_lsn_atomic.fetch_max(logical_lsn, Ordering::Release);
                     logical_prev_lsn = logical_lsn;
                 }
             }
@@ -1825,21 +1828,21 @@ impl Database {
         txn_id: u64,
         ops: &[WalIndexOp],
     ) -> Result<(), QueryError> {
+        let entries = ops
+            .iter()
+            .map(|op| {
+                Ok(IndexBatchEntry {
+                    kind: op.kind,
+                    key: decode_wal_index_key(&op.key)?,
+                    row_id: wal_row_id_to_row_id(op.row_id),
+                })
+            })
+            .collect::<Result<Vec<_>, QueryError>>()?;
         // Fast path: catalog already knows this (table_id, index_name).
         // Apply via the live IndexFile so concurrent SELECTs see the
         // changes immediately.
         if let Some((table_id, index_name)) = self.parse_index_table_and_name(path) {
             self.note_replicated_hnsw(txn_id, table_id, &index_name);
-            let entries = ops
-                .iter()
-                .map(|op| {
-                    Ok(IndexBatchEntry {
-                        kind: op.kind,
-                        key: decode_wal_index_key(&op.key)?,
-                        row_id: wal_row_id_to_row_id(op.row_id),
-                    })
-                })
-                .collect::<Result<Vec<_>, QueryError>>()?;
             // Removing a source key before COMMIT must not hide its old
             // committed version from local snapshots. Use the same governed
             // repair registry as ordinary DML, before changing the B-tree.
@@ -1911,25 +1914,23 @@ impl Database {
         }
         // Slow path: catalog hasn't been reloaded yet (e.g. a CREATE
         // INDEX whose DD row commit is still pending). Reuse the
-        // recovery helper which writes raw bytes to disk; invalidate
-        // the buffer pool for that file so any subsequent live read
-        // refreshes from disk.
+        // recovery opener, but share the live pool so admission can evict its
+        // optional pages when the global raw-page budget is full. A private
+        // empty pool cannot reclaim allocations owned by this database.
+        // Memory-only pools cannot persist recovery pages, so retain the
+        // recovery-owned writeback pool for that durability mode.
         let log = std::sync::Arc::clone(&self.log);
-        let mut recovery_indexes: std::collections::HashMap<String, IndexFile> =
-            std::collections::HashMap::new();
-        redo_index_batch(
-            &self.data_dir,
-            log,
-            &mut recovery_indexes,
-            path,
-            lsn,
-            txn_id,
-            ops,
-        )?;
+        let _routing = btree_logical_wal::LsnScope::new(Some(lsn));
+        let index = if self.config.durability == DurabilityMode::Memory {
+            IndexFile::open_for_recovery(self.data_dir.join(path), log, lsn)?
+        } else {
+            IndexFile::open_for_recovery_with_buffer_pool(
+                self.data_dir.join(path), log, lsn, self.buffer_pool.clone(),
+            )?
+        };
+        index.apply_replicated_batch(txn_id, entries, lsn)?;
         let _routing = btree_logical_wal::LsnScope::new(None);
-        for index in recovery_indexes.values_mut() {
-            index.flush()?;
-        }
+        index.flush()?;
         self.invalidate_buffer_pool_path(path)?;
         Ok(())
     }

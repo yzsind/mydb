@@ -366,6 +366,13 @@ impl CatalogManager {
         }
     }
 
+    fn clear_dd_object_rows(&self) -> Result<(), QueryError> {
+        self.dd_rows_by_object.write().map_err(|_| {
+            error(crate::error::catalog::ER_GET_ERRNO, "catalog row locator cache lock poisoned")
+        })?.clear();
+        Ok(())
+    }
+
     fn register_table(&self, key: &str, table: &TableSchema) {
         if !table.foreign_keys.is_empty() {
             self.has_foreign_keys.store(true, Ordering::Release);
@@ -2325,7 +2332,9 @@ impl Database {
         table: &TableSchema,
         selector: &CatalogRowSelector,
     ) -> Result<Vec<RowId>, QueryError> {
-        if selector.whole_object() {
+        // Physical WAL replaces dictionary rows without running CatalogTxn's
+        // local locator publication. Resolve through the replicated indexes.
+        if !self.physical_replica_mode() && selector.whole_object() {
             if let Some(object_id) = selector.object_id() {
                 if let Some(row_ids) = self.catalog.dd_object_rows(table.id, object_id) {
                     return Ok(row_ids);

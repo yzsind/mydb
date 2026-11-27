@@ -3187,7 +3187,6 @@ impl IndexFile {
         log: Arc<crate::wal::LogMutex>,
         rec_lsn: u64,
     ) -> Result<Self, QueryError> {
-        Self::check_rebuild_marker(&path)?;
         // Each replay partition has one owner and already supplies file-level
         // parallelism. Use synchronous eviction without speculative readers:
         // background workers can retain this private pool after IndexFile drops,
@@ -3201,6 +3200,16 @@ impl IndexFile {
             0,
         );
         buffer_pool.shutdown_flusher();
+        Self::open_for_recovery_with_buffer_pool(path, log, rec_lsn, buffer_pool)
+    }
+
+    fn open_for_recovery_with_buffer_pool(
+        path: PathBuf,
+        log: Arc<crate::wal::LogMutex>,
+        rec_lsn: u64,
+        buffer_pool: Arc<BufferPool>,
+    ) -> Result<Self, QueryError> {
+        Self::check_rebuild_marker(&path)?;
         let mut file = crate::storage::image_io::open_data_file(&path).map_err(io_err)?;
         let len = file.metadata().map_err(io_err)?.len();
         if len > 0 && len < PAGE_SIZE as u64 {
