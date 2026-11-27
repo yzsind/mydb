@@ -452,7 +452,10 @@ fn retired_index_cleanup_survives_failure_reopen_and_same_name_recreation() {
         engine.execute("INSERT INTO t VALUES(1,10),(2,20)").unwrap();
         engine.database().fail_next_ddl_cleanup_for_test();
         engine.execute("DROP INDEX vi ON t").unwrap();
-        engine.database().maintain_catalog_retirements_until(|| false).unwrap();
+        engine
+            .database()
+            .maintain_catalog_retirements_until(|| false)
+            .unwrap();
         let pending = engine.database().catalog_retirement_count_for_test();
         assert_eq!(pending, 1);
         engine.execute("CREATE INDEX vi ON t(v)").unwrap();

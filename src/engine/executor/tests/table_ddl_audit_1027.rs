@@ -260,7 +260,10 @@ fn ddl_1027_drop_removes_empty_object_directories() {
     engine.execute("INSERT INTO t VALUES(1)").unwrap();
     let id = engine.database().table("test.t").unwrap().id;
     engine.execute("DROP TABLE t").unwrap();
-    engine.database().maintain_catalog_retirements_until(|| false).unwrap();
+    engine
+        .database()
+        .maintain_catalog_retirements_until(|| false)
+        .unwrap();
     assert!(!dir
         .path()
         .join("objects/tables")
@@ -298,7 +301,10 @@ fn ddl_1027_copy_and_drop_remove_empty_shadow_directories() {
             .is_err());
         assert_eq!(objects(), vec![id]);
         engine.execute("DROP TABLE t").unwrap();
-        engine.database().maintain_catalog_retirements_until(|| false).unwrap();
+        engine
+            .database()
+            .maintain_catalog_retirements_until(|| false)
+            .unwrap();
         assert!(objects().is_empty());
         assert!(std::fs::read_dir(dir.path().join("objects/indexes"))
             .unwrap()

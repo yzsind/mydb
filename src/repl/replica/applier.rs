@@ -852,7 +852,6 @@ mod tests {
         }
     }
 
-
     #[test]
     fn release_audit_overlap_io_is_retryable() {
         let err = error(crate::error::catalog::ER_GET_ERRNO, "injected ENOSPC");

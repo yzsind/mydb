@@ -697,7 +697,10 @@ fn partitioned_spatial_add_builds_leaf_indexes_and_preserves_copy() {
     ] {
         engine.execute(sql).unwrap();
         let schema = engine.db_handle().table("test.pg").unwrap();
-        assert!(schema.indexes.iter().any(|i| i.name == "s" && i.is_spatial()));
+        assert!(schema
+            .indexes
+            .iter()
+            .any(|i| i.name == "s" && i.is_spatial()));
         assert!(schema.column_index("extra").is_err());
         assert_eq!(rows(&engine,"SELECT id FROM pg WHERE MBRContains(ST_GeomFromText('POLYGON((0 0,3 0,3 3,0 3,0 0))'),g) ORDER BY id"),vec![vec![Value::Int(1)],vec![Value::Int(2)]]);
         engine.execute("DROP INDEX s ON pg").unwrap();

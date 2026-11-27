@@ -1221,7 +1221,10 @@ fn hnsw_drop_index_removes_snapshot_file() {
     assert_eq!(find_hnsw_files(dir.path()).len(), 1);
     // DROP revokes the graph immediately; retirement removes its physical files.
     engine.execute("DROP INDEX idx_emb ON items").unwrap();
-    engine.database().maintain_catalog_retirements_until(|| false).unwrap();
+    engine
+        .database()
+        .maintain_catalog_retirements_until(|| false)
+        .unwrap();
     assert!(
         find_hnsw_files(dir.path()).is_empty(),
         "retirement must remove the dropped .hnsw snapshot"
@@ -1262,7 +1265,10 @@ fn hnsw_drop_table_removes_snapshot_file() {
     engine.checkpoint().unwrap();
     assert_eq!(find_hnsw_files(dir.path()).len(), 1);
     engine.execute("DROP TABLE items").unwrap();
-    engine.database().maintain_catalog_retirements_until(|| false).unwrap();
+    engine
+        .database()
+        .maintain_catalog_retirements_until(|| false)
+        .unwrap();
     assert!(
         find_hnsw_files(dir.path()).is_empty(),
         "retirement cleanup must remove every .hnsw snapshot for the dropped table"
@@ -3182,7 +3188,10 @@ fn paged_hnsw_drop_index_removes_hvec() {
     engine.execute("DROP INDEX idx_emb ON items").unwrap();
     assert!(!explain_mentions_vector_index(&engine, knn));
     assert_eq!(id_list(&engine, knn), vec![3]);
-    engine.database().maintain_catalog_retirements_until(|| false).unwrap();
+    engine
+        .database()
+        .maintain_catalog_retirements_until(|| false)
+        .unwrap();
     assert!(
         find_hvec_files(dir.path()).is_empty(),
         "retirement must delete the dropped paged .hvec file"

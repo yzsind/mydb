@@ -32090,8 +32090,16 @@ fn audit1122_partial_batch_preserves_the_successful_logical_watermark() {
     };
     for _ in 0..2 {
         assert!(db.apply_wal_record(&record).is_err());
-        assert_eq!(db.replica_applied_lsn(), 0, "resume must remain before the incomplete frame");
-        assert_eq!(db.replica_applied_logical_lsn_atomic.load(Ordering::Acquire), 100_002);
+        assert_eq!(
+            db.replica_applied_lsn(),
+            0,
+            "resume must remain before the incomplete frame"
+        );
+        assert_eq!(
+            db.replica_applied_logical_lsn_atomic
+                .load(Ordering::Acquire),
+            100_002
+        );
         assert!(db.is_txn_active(900_002));
     }
 }
