@@ -3,6 +3,7 @@ pub(crate) mod admission;
 pub(crate) mod catalog_faults;
 mod config;
 pub(crate) mod crypto;
+pub(crate) mod embedding;
 pub(crate) mod metadata;
 pub(crate) mod runtime;
 pub(crate) mod sql;
@@ -165,6 +166,7 @@ pub(crate) struct Limits {
     pub requests_per_minute: Option<u64>,
     pub tokens_per_minute: Option<u64>,
     pub max_input_bytes: Option<usize>,
+    pub max_image_bytes: Option<usize>,
     pub max_input_tokens: Option<usize>,
     pub max_output_tokens: Option<u64>,
     pub max_batch_items: Option<usize>,

@@ -8415,7 +8415,11 @@ where
                 Err(err) => return Some(Err(err)),
             }
         };
+        // EXPLAIN can publish refreshed statistics while planning. Holding a
+        // catalog read permit through it would deadlock its write admission;
+        // planning and ANALYZE also belong on a blocking worker.
         if !http
+            && !matches!(statement, Statement::Explain { .. })
             && statement_is_lock_safe_read(&statement)
             && !statement_has_computed_ordering(&statement)
             && context_allows_inline_lock_safe_read(&self.context)
@@ -11376,6 +11380,10 @@ fn bind_sql_params(
     }
     Ok(out)
 }
+
+#[cfg(test)]
+#[path = "session/prepared_explain_tests.rs"]
+mod prepared_explain_tests;
 
 #[cfg(test)]
 mod tests {

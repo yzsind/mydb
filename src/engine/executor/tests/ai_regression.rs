@@ -2,7 +2,7 @@ use super::*;
 use crate::error::catalog::*;
 use std::sync::{atomic::AtomicUsize, Condvar};
 
-fn reply(status: u16, body: impl AsRef<[u8]>, headers: &[(&str, String)]) -> Vec<u8> {
+pub(super) fn reply(status: u16, body: impl AsRef<[u8]>, headers: &[(&str, String)]) -> Vec<u8> {
     let body = body.as_ref();
     let mut bytes = format!("HTTP/1.1 {status} test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n", body.len()).into_bytes();
     for (name, value) in headers {
@@ -15,14 +15,14 @@ fn reply(status: u16, body: impl AsRef<[u8]>, headers: &[(&str, String)]) -> Vec
 fn answer(text: &str) -> Vec<u8> {
     reply(200, json!({"model":"mock","done":true,"done_reason":"stop","message":{"role":"assistant","content":text}}).to_string(), &[])
 }
-fn json_result(response: QueryResponse) -> Json {
+pub(super) fn json_result(response: QueryResponse) -> Json {
     let rows = materialize(response);
     let Value::Json(bytes) = &rows.rows[0][0] else {
         panic!("expected JSON result")
     };
     crate::engine::json::to_serde(bytes).unwrap()
 }
-fn assert_error(
+pub(super) fn assert_error(
     engine: &StorageQueryEngine,
     session: &mut SessionContext,
     sql: &str,
@@ -38,7 +38,7 @@ fn assert_error(
         expected.symbol()
     );
 }
-fn assert_idle() {
+pub(super) fn assert_idle() {
     let until = std::time::Instant::now() + Duration::from_secs(2);
     while crate::engine::ai::admission::memory_used() != 0
         || crate::engine::ai::runtime::status()

@@ -48,11 +48,11 @@
     "multi-threaded replica apply"
   ],
   "evidence": {
-    "review_scope": "Source and documentation contract review; 212 classic-protocol and prepared-numeric regressions passed locally, including prepared-context refresh/restoration and semantic error propagation. This fingerprint is a review trigger, not proof all combinations are supported.",
+    "review_scope": "Source and documentation contract review; focused classic-protocol, prepared-numeric and prepared EXPLAIN regressions. This fingerprint is a review trigger, not proof all combinations are supported. Prepared numeric-context refresh/restoration, semantic error propagation, and EXPLAIN catalog admission/statistics publication were reviewed; capability and command compatibility classifications are unchanged.",
     "source_sha256": {
       "src/mysql/protocol.rs": "4319edb06cee12e06302ff88890b9e5441e5d20cfc283724b31fbc9597073467",
       "src/mysql/server.rs": "80499aca67183a4f19e3f04dd5394fefec0dc7167fa703ba359e08a53aee107b",
-      "src/mysql/session.rs": "abe5a535787e4e6f3de92f4a145d25f686beb17c1c90eeeaf9508f8880dc5509",
+      "src/mysql/session.rs": "47ef1504639cf4192c39c284748c4de25d8f178f3b98a47079836e1f4abab1a9",
       "src/binlog.rs": "bae185c6e1673051e888b91919355df32b3827dc7cfb6111f79984ac75e1eadd",
       "src/mysql/peer_monitor.rs": "2664258b1e0b97bdd36da7735f24a32826af97f9ffbbd63987d8152fd1e104f6"
     },
@@ -73,7 +73,8 @@
       "src/engine/executor/tests/binlog_admin_metadata.rs",
       "src/engine/executor/tests/release_audit_1123.rs",
       "src/engine/executor/tests/github_release_audit.rs",
-      "src/engine/executor/tests/prepared_numeric.rs"
+      "src/engine/executor/tests/prepared_numeric.rs",
+      "src/mysql/session/prepared_explain_tests.rs"
     ],
     "update_policy": "Review changed capability/command behavior, run relevant regressions, then refresh source hashes and reviewed_at together."
   }

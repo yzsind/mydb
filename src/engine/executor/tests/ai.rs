@@ -1191,3 +1191,6 @@ fn five_audit_ai_sibling_budget_rejected_before_dispatch() {
         },
     );
 }
+
+#[path = "ai_image.rs"]
+mod image;

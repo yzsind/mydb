@@ -1,8 +1,9 @@
 # LLM and Embedding Calls
 
-mydb calls text-generation and text-embedding services through SQL. It supports
-Ollama, OpenAI Responses, OpenAI Chat Completions-compatible deployments, and
-OpenAI Embeddings-compatible deployments. Model weights and inference processes
+mydb calls text-generation and text/image embedding services through SQL. It supports
+Ollama, OpenAI Responses, OpenAI Chat Completions-compatible deployments,
+OpenAI Embeddings-compatible deployments, DashScope multimodal embeddings, and
+vLLM Chat Embeddings deployments. Model weights and inference processes
 remain outside the database.
 
 `AI_GENERATE` returns text. `AI_EMBED` returns a native FLOAT32 `VECTOR`. Direct results use the native
@@ -138,6 +139,87 @@ Capability declarations must match the actual model and deployment. They do
 not make an unsupported provider parameter work. Ollama requests use
 `stream=false`; embedding requests also use `truncate=false`.
 
+## Image embeddings
+
+Image inputs use the OceanBase-style `type` option while retaining mydb model
+configuration, fixed dimensions, and native VECTOR results:
+
+```sql
+CREATE AI CONNECTION image_cloud WITH CONFIG '{
+  "protocol":"dashscope_multimodal_embeddings",
+  "base_url":"https://dashscope.aliyuncs.com/api/v1",
+  "auth":{"type":"bearer","secret":"cloud_key"}
+}';
+CREATE AI MODEL test.image_embed USING image_cloud WITH CONFIG '{
+  "kind":"embedding",
+  "remote_model":"qwen3-vl-embedding",
+  "model_revision":"qwen3-vl-deployment-v1",
+  "capabilities":{"image":true},
+  "embedding":{"dimensions":2560,"request_dimensions":true,"normalize":"none"},
+  "limits":{"max_batch_items":5,"max_image_bytes":5242880}
+}';
+
+SELECT VECTOR_DIM(AI_EMBED(
+  'test.image_embed', 'https://example.com/cat.jpg', '{"type":"image"}'
+));
+SELECT AI_EMBED('test.image_embed', FROM_BASE64(@image_base64),
+               JSON_OBJECT('type','image'));
+SELECT AI_EMBED_DETAIL('test.image_embed', JSON_ARRAY(@image_url1,@image_url2),
+                      '{"type":"image"}');
+```
+
+Create `cloud_key` using the TLS prepared-statement procedure below. Region,
+model availability, image formats and batch limits must match the provider.
+`model_revision` identifies your deployment; it does not pin a cloud model revision.
+
+`type` accepts `text` (the default) or `image`; image capability is disabled
+unless declared on an embedding model using an image-capable adapter. Without
+`type=image`, a URL remains ordinary text. The third argument remains an options
+object; integer dimension arguments and a fourth parameter are unsupported.
+
+Image strings must be HTTP/HTTPS URLs of at most 2048 UTF-8 bytes without URL
+credentials or whitespace. The model service fetches the image: mydb does not
+download it or apply its local egress policy to the provider's image fetch.
+Local paths, other schemes and caller-supplied Base64/Data URI strings are rejected.
+Use a binary column, binary bound parameter or `FROM_BASE64` for image bytes.
+Choose MEDIUMBLOB/LONGBLOB when images exceed the SQL BLOB column size limit.
+JPEG, PNG, WebP, BMP and TIFF signatures are recognized and encoded as a Data URI;
+image decoding and content validation occur at the model service.
+`max_image_bytes` defaults to 5 MiB and cannot exceed 5 MiB. Remote URL image
+sizes are checked by the provider, not by mydb. Text byte limits are unchanged.
+
+`AI_EMBED_DETAIL` accepts a homogeneous URL array with `type=image`; binary
+batches use row calls over BLOB columns. Results preserve order and duplicate
+occurrences. DashScope uses independent vectors with fusion disabled. Both new
+adapters default to one batch item; configure `max_batch_items` to match the
+service. Automatic row batches split using a conservative encoded-size bound
+that includes merged model defaults and call options, with an 8 MiB request
+ceiling and normal AI memory budgets.
+
+For vLLM, configure `protocol=vllm_embeddings`, a base URL ending in `/v1`, and
+a pooling model with the appropriate server-side chat template. Each input is
+sent as one `/embeddings` request containing a `messages` array; multi-item DETAIL
+calls use bounded independent requests and merge results in input order. No model
+name selects a special prompt or adapter behavior. Aggregated DETAIL results sum
+attempts and reported token usage, return NULL for provider request ID and
+queue/upstream timing, and expose no partial vectors on failure. Overall timing
+covers the batch. Existing timeout, retry and cancellation policies apply.
+
+Generate vectors outside transactions and save them through ordinary DML:
+
+```sql
+SET @query_image = AI_EMBED('test.image_embed', @image_url, '{"type":"image"}');
+CREATE TABLE images(id INT PRIMARY KEY, embedding VECTOR(2560) NOT NULL);
+INSERT INTO images VALUES (1, @query_image);
+CREATE INDEX images_hnsw ON images(embedding) USING HNSW WITH (metric=cosine);
+SELECT id, COSINE_DISTANCE(embedding,@query_image) AS distance
+FROM images ORDER BY distance LIMIT 3;
+```
+
+For ingesting a collection, call `AI_EMBED` in a final SELECT over URL/BLOB
+columns, then insert returned vectors using bound parameters. Existing restrictions
+on DML, predicates and transactions containing external calls remain in effect.
+
 ## Encrypted API keys
 
 API keys are persisted as encrypted database metadata. Each Secret payload
@@ -262,8 +344,8 @@ it cannot be selected from a data row.
 
 A SQL string is a prompt, including one that happens to contain JSON text.
 A JSON array is a text message history for generation, or an explicit batch of
-strings for `AI_EMBED_DETAIL`. Messages accept `system`, `user`, and `assistant`
-roles and text content. At least one user message is required. Numeric, binary,
+text strings for `AI_EMBED_DETAIL` (image URLs with `type=image`). Messages accept
+`system`, `user`, and `assistant` roles and text content. At least one user message is required. Numeric, binary,
 date, geometry, and vector inputs need an explicit text conversion when used
 as prompts. SQL NULL inputs make no HTTP request; a non-NULL model is still
 resolved and authorized. Omitted or SQL NULL options mean an empty object;

@@ -16,8 +16,8 @@ limits, and provider contracts.
 | --- | --- | --- |
 | AI_GENERATE | Prompt text or native JSON message array | UTF-8 generated text |
 | AI_GENERATE_DETAIL | Same generation input | JSON envelope including text/output_json, usage and status |
-| AI_EMBED | One nonempty text | Native FLOAT32 VECTOR |
-| AI_EMBED_DETAIL | One text or native JSON array of texts | Ordered JSON data array with embedding metadata |
+| AI_EMBED | One nonempty text or explicit image URL/binary input | Native FLOAT32 VECTOR |
+| AI_EMBED_DETAIL | Text/image input or native JSON array of texts/image URLs | Ordered JSON data array with embedding metadata |
 
 Configure the models and AI_USE grants in the [setup guide](../../ai.md) first.
 These pages do not contact a provider during PREPARE/ordinary EXPLAIN; actual SELECT
