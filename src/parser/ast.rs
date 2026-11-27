@@ -6,6 +6,7 @@ use super::*;
 #[serde(deny_unknown_fields)]
 pub enum Statement {
     RecycleBin(crate::recyclebin::Command),
+    Graph(Box<crate::graph::Command>),
     ApiKey(crate::engine::access_keys::Command),
     Ai(crate::engine::ai::sql::AiStatement),
     RowSecurity(rls::RlsStatement),

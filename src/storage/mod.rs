@@ -54,6 +54,7 @@ pub(crate) use core::default_buffer_pool_bytes;
 pub(crate) use core::enum_set_numeric_assignment;
 pub(crate) use core::index_build_extended_perf_snapshot;
 pub(crate) use core::is_lock_wait_pending_error;
+pub(crate) use txn::{lock_waits_nonblocking, lock_would_block_error};
 pub(crate) use core::quantize_time_text_micros;
 #[cfg(test)]
 pub(crate) use core::set_update_delta_enabled_for_test;

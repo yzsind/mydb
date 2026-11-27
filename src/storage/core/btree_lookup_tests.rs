@@ -422,6 +422,53 @@ fn small_batch_lookup_spanning_prefixes_duplicates_and_empty_tree() {
 }
 
 #[test]
+fn covering_prefixes_keep_duplicate_runs_across_separator_fences() {
+    let key_for = |n| {
+        IndexKey::from(vec![
+            KeyPart::UInt(1),
+            KeyPart::UInt((n / 6000) as u64 * 2),
+            KeyPart::UInt((n % 1200) as u64),
+            KeyPart::UInt(n as u64),
+        ])
+    };
+    let (_dir, mut index) = index_fixture((0..18_000).map(key_for).collect());
+    let keys: Vec<_> = (0..=6)
+        .map(|anchor| IndexKey::from(vec![KeyPart::UInt(1), KeyPart::UInt(anchor)]))
+        .collect();
+
+    for delete in [false, true] {
+        if delete {
+            for n in (0..18_000).step_by(7) {
+                index
+                    .delete(
+                        key_for(n),
+                        RowId {
+                            page_id: (n / 32) as u32,
+                            slot_id: (n % 32) as u16,
+                        },
+                    )
+                    .unwrap();
+            }
+        }
+        let mut expected: Vec<_> = keys
+            .iter()
+            .flat_map(|key| index.prefix_entries(key, false).unwrap())
+            .collect();
+        let (mut actual, _) = index
+            .lookup_prefix_entries_many_prefetched(&keys, 18_000)
+            .unwrap()
+            .unwrap();
+        expected.sort_unstable();
+        actual.sort_unstable();
+        assert_eq!(actual, expected);
+        assert!(index
+            .lookup_prefix_entries_many_prefetched(&keys, 12)
+            .unwrap()
+            .is_none());
+    }
+}
+
+#[test]
 fn small_batch_lookup_routes_through_multiple_internal_levels() {
     let make = |n| IndexKey::from(vec![KeyPart::String(format!("{n:08}-{}", "x".repeat(200)))]);
     let (_dir, index) = index_fixture((0..20_000).map(make).collect());

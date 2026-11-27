@@ -10,6 +10,9 @@ pub(super) fn execute_mdl_protected_statement(
     routine_tables: &std::collections::BTreeMap<(String, String), bool>,
 ) -> Result<QueryResponse, QueryError> {
     ensure_xa_statement_allowed(session, &statement)?;
+    if let Statement::Graph(command) = &statement {
+        crate::engine::executor::graph::validate_session(session, command)?;
+    }
     let mdl_guard = {
         let _opening = crate::engine::cancel::enter_process_stage(
             crate::engine::session_registry::ProcessState::OpeningTables,
@@ -498,6 +501,9 @@ fn mdl_requests_for_statement(
     statement: &Statement,
     uses: &[StatementTableUse],
 ) -> Vec<MdlRequest> {
+    if let Statement::Graph(command) = statement {
+        return crate::engine::executor::graph::mdl_requests(session, command);
+    }
     let mut expanded_uses = uses.to_vec();
     add_dml_view_table_uses(db, session, statement, &mut expanded_uses);
     let mut by_table = std::collections::BTreeMap::<String, MdlLockType>::new();

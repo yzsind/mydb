@@ -2835,6 +2835,9 @@ pub(crate) fn object_visible_to_session(
     schema: &str,
     table: Option<&str>,
 ) -> bool {
+    if table.is_some_and(crate::graph::is_storage_table) {
+        return false;
+    }
     if schema.eq_ignore_ascii_case(crate::recyclebin::DATABASE) {
         return session.internal_system_session
             || db
@@ -3052,7 +3055,7 @@ impl Visibility {
     }
 
     fn table_visible(&self, schema: &str, table: &str) -> bool {
-        self.allow(schema, Some(table))
+        !crate::graph::is_storage_table(table) && self.allow(schema, Some(table))
     }
 
     fn routine_visible(&self, routine: &RoutineSchema) -> bool {

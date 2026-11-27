@@ -609,6 +609,9 @@ fn parse_statement_source(
     let head_is = |keyword: &[u8]| {
         head.is_some_and(|head| head.len() == keyword.len() && head.eq_ignore_ascii_case(keyword))
     };
+    if let Some(result) = crate::graph::parse(sql, head) {
+        return result.map(|command| Statement::Graph(Box::new(command)));
+    }
     if head_is(b"CANCEL") {
         let mut cursor = crate::sql_lex::SqlTokenCursor::new(sql, lex_mode, MYSQL_VERSION_ID);
         if cursor

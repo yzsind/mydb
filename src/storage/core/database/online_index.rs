@@ -933,7 +933,7 @@ impl Database {
             if !replayed && !missing {
                 continue;
             }
-            let table = self.table(&header.qualified_name())?;
+            let table = self.table_descriptor(&header.qualified_name())?;
             let Some(primary) = table
                 .indexes
                 .iter()

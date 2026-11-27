@@ -264,6 +264,14 @@ impl Database {
             .filter(|table| normalize_name(&table.database) == key)
             .map(|table| table.qualified_name())
             .collect::<Vec<_>>();
+        if table_names.iter().any(|name| {
+            let (_, table) = split_table_name(DEFAULT_DATABASE, name);
+            crate::graph::is_storage_table(&table)
+        }) {
+            return Err(crate::error::catalog::ER_WRONG_ARGUMENTS.error(
+                "Drop property graphs explicitly before DROP DATABASE",
+            ));
+        }
         let tables = table_names
             .iter()
             .map(|name| self.table(name))
@@ -467,6 +475,25 @@ impl Database {
     }
 
     pub fn table(&self, name: &str) -> Result<Arc<TableSchema>, QueryError> {
+        if name.contains("__")
+            && crate::graph::is_storage_table(&split_table_name(DEFAULT_DATABASE, name).1)
+        {
+            return Err(crate::error::catalog::ER_NO_SUCH_TABLE.error("Unknown table"));
+        }
+        self.table_descriptor(name)
+    }
+
+    pub(crate) fn graph_descriptor(&self, name: &str) -> Result<Arc<TableSchema>, QueryError> {
+        self.table_descriptor(name).and_then(|table| {
+            if table.table_type == crate::graph::STORAGE_TYPE {
+                Ok(table)
+            } else {
+                Err(crate::error::catalog::ER_NO_SUCH_TABLE.error("Unknown property graph"))
+            }
+        })
+    }
+
+    fn table_descriptor(&self, name: &str) -> Result<Arc<TableSchema>, QueryError> {
         let key = normalize_table_key(DEFAULT_DATABASE, name);
         if let Some(table) = self
             .temp_tables

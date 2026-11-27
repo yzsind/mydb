@@ -5177,6 +5177,11 @@ impl HeapFile {
             .load_ordered_probe_pages(&self.file_key, page_ids)
     }
 
+    pub(crate) fn load_ordered_covering_pages(&self, page_ids: &[u64]) -> Result<(), QueryError> {
+        self.buffer_pool
+            .load_ordered_covering_pages(&self.file_key, page_ids)
+    }
+
     pub(crate) fn demote_ordered_probe_pages(&self, page_ids: &[u64]) -> Result<(), QueryError> {
         self.buffer_pool
             .demote_ordered_probe_pages(&self.file_key, page_ids)

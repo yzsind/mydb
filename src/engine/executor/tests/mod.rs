@@ -371,6 +371,7 @@ mod functional_index;
 mod generate_series;
 mod geometry_type;
 mod github_issue_fixes;
+mod graph;
 mod group_by_alias;
 mod group_by_hidden_column;
 mod group_by_ordinal;

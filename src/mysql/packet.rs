@@ -831,6 +831,37 @@ where
         Some(sequence_id.wrapping_add(1))
     }
 
+    /// Stage a block of single-column BIGINT binary rows within the same
+    /// frame and buffer limits as individually staged packets.
+    pub(crate) fn try_buffer_binary_bigints(
+        &mut self,
+        mut sequence_id: u8,
+        rows: impl ExactSizeIterator<Item = Option<i64>>,
+    ) -> Option<u8> {
+        let start = self.buffer.len();
+        let required = start.checked_add(rows.len().checked_mul(14)?)?;
+        if required >= self.flush_threshold
+            || required > self.buffer_cap
+            || required > self.buffer.capacity()
+        {
+            return None;
+        }
+        for row in rows {
+            if let Some(value) = row {
+                let mut frame = [10, 0, 0, sequence_id, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+                frame[6..].copy_from_slice(&value.to_le_bytes());
+                self.buffer.extend_from_slice(&frame);
+            } else {
+                self.buffer.extend_from_slice(&[2, 0, 0, sequence_id, 0, 4]);
+            }
+            sequence_id = sequence_id.wrapping_add(1);
+        }
+        self.pending_status_bytes = self
+            .pending_status_bytes
+            .saturating_add((self.buffer.len() - start) as u64);
+        Some(sequence_id)
+    }
+
     /// Like `write_packet` but returns the next sequence id (advanced by
     /// the number of frames written). Row loops use this so a row that
     /// spans multiple frames keeps the sequence counter in step.
@@ -1920,6 +1951,33 @@ mod tests {
         assert!(fast > 0);
         batch.finish().await.unwrap();
         assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn binary_bigint_batch_matches_scalar_frames_and_wraps_sequence() {
+        let values = [Some(i64::MIN), None, Some(i64::MAX)];
+        let mut batched = Vec::new();
+        let mut writer = PacketBatchWriter::new(&mut batched);
+        assert_eq!(
+            writer.try_buffer_binary_bigints(254, values.into_iter()),
+            Some(1),
+        );
+        writer.finish().await.unwrap();
+
+        let mut scalar = Vec::new();
+        let mut writer = PacketBatchWriter::new(&mut scalar);
+        let mut sequence = 254;
+        for value in values {
+            let mut payload = vec![0, 0];
+            if let Some(value) = value {
+                payload.extend_from_slice(&value.to_le_bytes());
+            } else {
+                payload[1] = 4;
+            }
+            sequence = writer.write_packet_seq(sequence, &payload).await.unwrap();
+        }
+        writer.finish().await.unwrap();
+        assert_eq!(batched, scalar);
     }
 
     #[tokio::test]

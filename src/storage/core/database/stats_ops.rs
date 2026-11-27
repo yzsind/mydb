@@ -1210,6 +1210,7 @@ impl Database {
                 .iter()
                 .filter_map(|(key, table)| {
                     if table.system
+                        || table.table_type == crate::graph::STORAGE_TYPE
                         || table.database == crate::recyclebin::DATABASE
                         || crate::storage::naming::is_system_database(&table.database)
                     {

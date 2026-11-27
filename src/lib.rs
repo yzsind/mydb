@@ -27,6 +27,7 @@ pub mod engine;
 pub mod error;
 #[cfg(feature = "fuzzing")]
 pub mod fuzzing;
+pub mod graph;
 mod gtid;
 pub mod mcp;
 pub mod mysql;

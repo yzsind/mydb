@@ -888,7 +888,8 @@ fn enforce_stored_function_table_restrictions(
 fn statement_uses_query_memory(statement: &Statement) -> bool {
     matches!(
         statement,
-        Statement::Select(_)
+        Statement::Graph(_)
+            | Statement::Select(_)
             | Statement::SetOperation(_)
             | Statement::WithCte(_)
             | Statement::Explain { .. }
@@ -3737,6 +3738,7 @@ fn auth_statement_privileges(
         Statement::RowSecurity(_) => Vec::new(),
         Statement::ApiKey(_) => Vec::new(),
         Statement::Ai(_) => Vec::new(),
+        Statement::Graph(command) => super::graph::privileges(session, command),
         Statement::AlterSystemReloadHttpConfig | Statement::ShowHttpStatus => {
             vec![global(Privilege::Dynamic("HTTP_ADMIN".into()))]
         }
@@ -4552,7 +4554,10 @@ pub(super) fn authorize_prepared_statement_with_epoch(
     // Global SQL privileges never grant ownership of another session's table.
     // Apply this before root/internal-user privilege shortcuts and bound recipes.
     for required in required_privileges {
-        if let PrivilegeScope::Table { database, .. } = &required.scope {
+        if let PrivilegeScope::Table { database, table } = &required.scope {
+            if crate::graph::is_storage_table(table) {
+                return Err(crate::error::catalog::ER_NO_SUCH_TABLE.error(format!("Table '{database}.{table}' does not exist")));
+            }
             if database.eq_ignore_ascii_case("__mydb_temp")
                 && !required_privilege_targets_session_temp(session, required)
             {
@@ -8128,6 +8133,7 @@ pub(super) fn execute_qualified_statement(
             crate::engine::access_keys::execute(db, session, command)
         }
         Statement::Ai(command) => ai::admin(db, session, command, registry),
+        Statement::Graph(command) => super::graph::execute(db, session, *command),
         Statement::Begin {
             read_only,
             consistent_snapshot,
@@ -8466,6 +8472,9 @@ pub(super) fn execute_qualified_statement(
                     crate::error::catalog::ER_BAD_DB_ERROR,
                     format!("unknown database '{name}'"),
                 ));
+            }
+            if session.current_database != db_name {
+                session.current_graph = None;
             }
             session.current_database = db_name.clone();
             session.mark_pfs_variables_dirty();

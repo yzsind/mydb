@@ -2453,6 +2453,15 @@ struct LeafKeyRange {
     end: usize,
 }
 
+struct CoveringPrefixRange {
+    // Lower bound of the next subtree. A stale separator after deletion
+    // can make this conservative, but can never hide a prefix match.
+    upper: Option<Arc<IndexKey>>,
+    leaf_id: u64,
+    start: usize,
+    end: usize,
+}
+
 /// Outcome of `IndexFile::try_insert_leaf_in_place`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InPlaceInsert {
@@ -8249,6 +8258,212 @@ impl IndexFile {
             }
         }
         Ok(entries)
+    }
+
+    /// Read disjoint, sorted prefixes with a bounded covering result. Route
+    /// and prefetch sibling probes together, including across internal pages.
+    /// The caller still owns snapshot visibility and repair validation.
+    #[cfg(test)]
+    pub(crate) fn lookup_prefix_entries_many_prefetched(
+        &self,
+        keys: &[IndexKey],
+        max_entries: usize,
+    ) -> Result<Option<(Vec<(IndexKey, RowId)>, u64)>, QueryError> {
+        self.lookup_prefix_entries_many_mapped(keys, max_entries, |key, row| (key, row))
+    }
+
+    pub(crate) fn lookup_prefix_entries_many_mapped<T>(
+        &self,
+        keys: &[IndexKey],
+        max_entries: usize,
+        map: impl Fn(IndexKey, RowId) -> T,
+    ) -> Result<Option<(Vec<T>, u64)>, QueryError> {
+        let _structure = self.structure_lock.read_recursive();
+        self.ensure_healthy()?;
+        let mut entries = Vec::new();
+        let mut page_bound = 0;
+        let mut continuations = Vec::new();
+        let complete = self.visit_covering_prefix_leaves(keys, |range, buf| {
+            page_bound = page_bound.max(parse_leaf_payload_header(buf)?.page_max_trx_id);
+            let result = lookup_leaf_entries_many_page_bytes(
+                buf,
+                &keys[range.start..range.end],
+                range.start,
+                false,
+                &mut None,
+                &|_, key, row| map(key, row),
+            )?;
+            entries.extend(result.entries);
+            if entries.len() > max_entries {
+                return Ok(false);
+            }
+            if let Some(first_leaf) = result.next_leaf {
+                for offset in result.continue_key_offsets {
+                    let offset = range.start + offset;
+                    if range.upper.as_deref().is_some_and(|upper| {
+                        compare_index_entry_to_lookup_key(upper, &keys[offset], false)
+                            == std::cmp::Ordering::Greater
+                    }) {
+                        continue;
+                    }
+                    continuations.push((
+                        offset,
+                        first_leaf,
+                        IndexPageProgress::new(first_leaf),
+                    ));
+                }
+            }
+            Ok(true)
+        })?;
+        if !complete {
+            return Ok(None);
+        }
+        // Large neighborhoods can straddle leaves. Load the next page of
+        // every unfinished prefix together while preserving each prefix's
+        // leaf order and cycle detection.
+        let mut pages = Vec::new();
+        let mut next_round = Vec::new();
+        while !continuations.is_empty() {
+            crate::engine::cancel::check_cancelled()?;
+            if continuations.len() > 1 {
+                pages.extend(continuations.iter().map(|(_, leaf, _)| *leaf));
+                self.buffer_pool
+                    .load_ordered_covering_pages(&self.file_key, &pages)?;
+                pages.clear();
+            }
+            for (offset, leaf, mut chain) in continuations.drain(..) {
+                let pinned = self.buffer_pool.pin_page_ref(self.page_key_ref(leaf))?;
+                let result = pinned.with_index_raw_bytes(|buf| {
+                    lookup_leaf_entry_page_bytes(
+                        buf, &keys[offset], 0, false, &mut None, &|_, key, row| map(key, row),
+                    )
+                })?;
+                drop(pinned);
+                page_bound = page_bound.max(result.page_max_trx_id);
+                entries.extend(result.entries);
+                if entries.len() > max_entries {
+                    return Ok(None);
+                }
+                if let Some(next) = result.next_leaf.filter(|_| result.should_continue) {
+                    chain.advance(next)?;
+                    next_round.push((offset, next, chain));
+                }
+            }
+            std::mem::swap(&mut continuations, &mut next_round);
+        }
+        Ok(Some((entries, page_bound)))
+    }
+
+    fn visit_covering_prefix_leaves(
+        &self,
+        keys: &[IndexKey],
+        mut visit: impl FnMut(&CoveringPrefixRange, &[u8]) -> Result<bool, QueryError>,
+    ) -> Result<bool, QueryError> {
+        if keys.is_empty() {
+            return Ok(true);
+        }
+        if let [key] = keys {
+            let mut range = CoveringPrefixRange {
+                upper: None,
+                leaf_id: self.root_page.load(Ordering::Acquire),
+                start: 0,
+                end: 1,
+            };
+            let mut progress = IndexPageProgress::new(range.leaf_id);
+            loop {
+                crate::engine::cancel::check_cancelled()?;
+                let pinned = self.pin_tree_page_borrowed(range.leaf_id)?;
+                let mut descended = false;
+                let more = pinned.with_index_raw_bytes(|bytes| {
+                    let Some(page) = parse_raw_internal_route_page(bytes)? else {
+                        return visit(&range, bytes);
+                    };
+                    let (child, child_idx) =
+                        page.route_from(key, min_lookup_row_id(), 0, page.first_child)?;
+                    progress.advance(child)?;
+                    range.leaf_id = child;
+                    if child_idx < page.header.count {
+                        page.validate_separator_offset(child_idx)?;
+                        let mut cursor = page.header.read_slot_offset(child_idx);
+                        range.upper = Some(Arc::new(page.header.decode_key_at(&mut cursor)?));
+                    }
+                    descended = true;
+                    Ok(true)
+                })?;
+                if !descended {
+                    return Ok(more);
+                }
+            }
+        }
+        let mut level = vec![CoveringPrefixRange {
+            upper: None,
+            leaf_id: self.root_page.load(Ordering::Acquire),
+            start: 0,
+            end: keys.len(),
+        }];
+        let mut next: Vec<CoveringPrefixRange> = Vec::new();
+        let mut page_ids = smallvec::SmallVec::<[u64; 32]>::new();
+        while !level.is_empty() {
+            crate::engine::cancel::check_cancelled()?;
+            // Route and load a whole level together. The scheduler coalesces
+            // contiguous misses and uses bounded, reusable I/O workers.
+            if level.len() > 1 {
+                page_ids.extend(level.iter().map(|range| range.leaf_id));
+                self.buffer_pool
+                    .load_ordered_covering_pages(&self.file_key, &page_ids)?;
+                page_ids.clear();
+            }
+            for range in level.drain(..) {
+                crate::engine::cancel::check_cancelled()?;
+                let pinned = self
+                    .buffer_pool
+                    .pin_page_ref(self.page_key_ref(range.leaf_id))?;
+                let more = pinned.with_index_raw_bytes(|bytes| {
+                    let Some(page) = parse_raw_internal_route_page(bytes)? else {
+                        return visit(&range, bytes);
+                    };
+                    let mut search_floor = 0;
+                    let mut selected_child = page.first_child;
+                    let first_child = next.len();
+                    for offset in range.start..range.end {
+                        let (child, child_idx) = page.route_from(
+                            &keys[offset],
+                            min_lookup_row_id(),
+                            search_floor,
+                            selected_child,
+                        )?;
+                        search_floor = child_idx;
+                        selected_child = child;
+                        if next.len() > first_child {
+                            let last = next.last_mut().expect("child was appended");
+                            if last.leaf_id == child {
+                                last.end += 1;
+                                continue;
+                            }
+                        }
+                        let upper = if child_idx < page.header.count {
+                            page.validate_separator_offset(child_idx)?;
+                            let mut cursor = page.header.read_slot_offset(child_idx);
+                            Some(Arc::new(page.header.decode_key_at(&mut cursor)?))
+                        } else {
+                            range.upper.clone()
+                        };
+                        next.push(CoveringPrefixRange {
+                            upper,
+                            leaf_id: child,
+                            start: offset,
+                            end: offset + 1,
+                        });
+                    }
+                    Ok(true)
+                })?;
+                if !more {
+                    return Ok(false);
+                }
+            }
+            std::mem::swap(&mut level, &mut next);
+        }
+        Ok(true)
     }
 
     /// Anti/Semi short-circuit batched probe. For each input key,

@@ -3836,6 +3836,55 @@ fn materialize_external_for_sink<S: RowDecodeSink>(
     })?))
 }
 
+/// Borrow a single inline JSON column from a current row layout. The outer
+/// Option denotes that the caller must fall back for a short or external row.
+pub(crate) fn borrow_inline_json<'a>(
+    input: &'a [u8],
+    layout_id: u32,
+    plan: &RowDecodePlan,
+    has_external: bool,
+) -> Result<Option<Option<&'a [u8]>>, QueryError> {
+    let Some(fast) = plan.fast_for_layout(layout_id) else {
+        return Ok(None);
+    };
+    let [step] = fast.steps.as_slice() else {
+        return Ok(None);
+    };
+    if !fast.covers_full_projection || step.op_tag != OP_VAR_JSON {
+        return Ok(None);
+    }
+    let count = fast.stored_column_count;
+    let mut pos = 1;
+    if count >= 128 || input.first().copied() != Some(count as u8) {
+        pos = 0;
+        if read_varint(input, &mut pos)? as usize != count {
+            return Ok(None);
+        }
+    }
+    let section = row_value_section!(
+        input,
+        pos,
+        count,
+        fast.fixed_len,
+        fast.var_count,
+        has_external,
+    );
+    if step.nullable && column_is_null(input, section.null_bitmap_start, step.null_idx as usize) {
+        return Ok(Some(None));
+    }
+    let ordinal = step.src_loc as usize;
+    if has_external && external_bit(section.ext_bitmap, ordinal) {
+        return Ok(None);
+    }
+    let (offset, len) = read_dir_entry(input, section.dir_start, section.payload_start, ordinal)?;
+    Ok(Some(Some(checked_payload_slice(
+        input,
+        section.payload_start,
+        offset,
+        len,
+    )?)))
+}
+
 /// Sink-driven fast-path decoder. Returns `true` when the row was
 /// decoded through the fast steps (skipping the `Vec<Value>` intermediate
 /// entirely); returns `false` when the caller must fall back to the

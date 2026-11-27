@@ -1502,6 +1502,9 @@ impl Database {
         };
         self.ensure_table_id_highwater(self.current_next_table_id()?)?;
         let mut table = prepared.finish(id, &partition_storage_ids)?;
+        if crate::graph::is_storage_table(&table.name) {
+            table.table_type = crate::graph::STORAGE_TYPE.into();
+        }
         // Foreign keys are persistent-catalog concerns and therefore remain
         // outside the shared persistent/temporary schema builder.
         if !foreign_keys.is_empty() {
