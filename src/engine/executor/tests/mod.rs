@@ -356,6 +356,7 @@ mod d2_load_data_progress;
 mod d3_explain_dml;
 mod ddl;
 mod ddl_audit_1014;
+mod ddl_compound_online;
 mod ddl_copy_special;
 mod ddl_exchange_online;
 mod ddl_fulltext_online;

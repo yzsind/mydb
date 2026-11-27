@@ -15,6 +15,8 @@ static CONSTRAINT_BASELINE_BUILDS: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]
 thread_local! {
     static CONSTRAINT_LAST_INDEX_MERGE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static CONSTRAINT_PUBLICATION_CRASH: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+    static CONSTRAINT_PUBLICATION_ARMED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 struct ConstraintHoldTimer(Instant);
@@ -458,6 +460,32 @@ impl OnlineConstraintValidation {
 
 impl Database {
     #[cfg(test)]
+    pub(crate) fn set_constraint_publication_crash_for_test(&self, phase: u8) {
+        CONSTRAINT_PUBLICATION_CRASH.with(|point| point.set(phase));
+        CONSTRAINT_PUBLICATION_ARMED.with(|armed| armed.set(false));
+    }
+
+    #[cfg(test)]
+    fn crash_constraint_publication_for_test(
+        &self,
+        phase: u8,
+        txn: Option<u64>,
+    ) -> Result<(), QueryError> {
+        if !CONSTRAINT_PUBLICATION_ARMED.with(|armed| armed.get())
+            || CONSTRAINT_PUBLICATION_CRASH.with(|point| point.get()) != phase
+        {
+            return Ok(());
+        }
+        if let Some(txn) = txn {
+            self.flush_txn_wal_buffer(txn, None)?;
+        }
+        self.flush_dirty_data()?;
+        let lsn = self.log.lock().last_lsn();
+        LogManager::sync_durable_to(&self.log, lsn)?;
+        std::process::exit(86);
+    }
+
+    #[cfg(test)]
     pub(crate) fn with_constraint_validation_limit_for_test<T>(
         &self,
         limit: usize,
@@ -491,21 +519,140 @@ impl Database {
         ]
     }
 
-    /// Shared by statement MDL, capability checks and dispatch. Constraint-only
-    /// compound ALTERs publish one candidate; unrelated action mixes stay offline.
+    /// Actions with no physical resource or nontransactional counter effect.
+    /// These can share a private candidate with online constraint validation.
+    pub(crate) fn online_metadata_action_supported(action: &crate::parser::AlterAction) -> bool {
+        use crate::parser::AlterAction as A;
+        match action {
+            A::SetColumnComment { .. }
+            | A::SetColumnDefault { .. }
+            | A::SetColumnVisibility { .. }
+            | A::AlterIndexVisibility { .. }
+            | A::MoveColumn { .. }
+            | A::SetStorageProperties { .. } => true,
+            A::SetTableOptions { generic, .. } => !generic.iter().any(|(name, _)| {
+                name.eq_ignore_ascii_case("ZONE_MAP") || name.eq_ignore_ascii_case("ZONE_SIZE")
+            }),
+            _ => false,
+        }
+    }
+
+    /// Shared by statement MDL, capability checks and dispatch. Compound
+    /// metadata and constraint ALTERs publish a single private candidate.
     pub(crate) fn constraint_alter_supported(actions: &[crate::parser::AlterAction]) -> bool {
         use crate::parser::AlterAction as A;
         !actions.is_empty()
+            && (actions.len() > 1 || !Self::online_metadata_action_supported(&actions[0]))
             && actions.iter().all(|a| {
-                matches!(
-                    a,
-                    A::AddCheck(_)
-                        | A::AlterCheck { .. }
-                        | A::DropCheck { .. }
-                        | A::AddForeignKey(_)
-                        | A::DropForeignKey { .. }
-                )
+                Self::online_metadata_action_supported(a)
+                    || matches!(
+                        a,
+                        A::AddCheck(_)
+                            | A::AlterCheck { .. }
+                            | A::DropCheck { .. }
+                            | A::AddForeignKey(_)
+                            | A::DropForeignKey { .. }
+                    )
             })
+    }
+
+    fn apply_online_metadata_action(
+        table: &mut TableSchema,
+        action: &crate::parser::AlterAction,
+    ) -> Result<(), QueryError> {
+        use crate::parser::AlterAction as A;
+        match action {
+            A::SetColumnComment { column, comment } => {
+                let position = table.column_index(column)?;
+                crate::storage::schema::check_comment_len(
+                    crate::storage::schema::CommentTarget::Field,
+                    column,
+                    comment,
+                )?;
+                table.columns[position].comment = comment.clone();
+            }
+            A::SetColumnDefault { column, default } => {
+                let position = table.column_index(column)?;
+                set_column_default_in_candidate(table, position, column, default.clone(), true)?;
+            }
+            A::SetColumnVisibility { column, invisible } => {
+                let position = table.column_index(column)?;
+                table.columns[position].invisible = *invisible;
+                ensure_table_keeps_visible_column(table)?;
+            }
+            A::AlterIndexVisibility { name, visible } => {
+                let index = table
+                    .indexes
+                    .iter_mut()
+                    .find(|index| index.name.eq_ignore_ascii_case(name))
+                    .ok_or_else(|| {
+                        error(
+                            crate::error::catalog::ER_CANT_DROP_FIELD_OR_KEY,
+                            format!("index '{name}' does not exist"),
+                        )
+                    })?;
+                if index.primary && !visible {
+                    return Err(error(
+                        crate::error::catalog::ER_PK_INDEX_CANT_BE_INVISIBLE,
+                        "A primary key index cannot be invisible.",
+                    ));
+                }
+                index.visible = *visible;
+            }
+            A::MoveColumn { column, position } => {
+                move_column_in_candidate(table, column, position)?
+            }
+            A::SetStorageProperties { pctfree, pctused } => {
+                if let Some(value) = pctfree {
+                    table.pctfree = (*value).min(50);
+                }
+                if let Some(value) = pctused {
+                    table.pctused = (*value).min(50);
+                }
+            }
+            A::SetTableOptions {
+                default_charset,
+                default_collation,
+                comment,
+                generic,
+            } => {
+                if default_charset.is_some() || default_collation.is_some() {
+                    let (charset, collation) = resolve_table_charset_collation(
+                        default_charset.as_deref(),
+                        default_collation.as_deref(),
+                        &table.charset,
+                        &table.collation,
+                    )?;
+                    table.charset = charset;
+                    table.collation = collation;
+                }
+                if let Some(comment) = comment {
+                    crate::storage::schema::check_comment_len(
+                        crate::storage::schema::CommentTarget::Table,
+                        &table.name,
+                        comment,
+                    )?;
+                    table.comment = comment.clone();
+                }
+                let mut generic = generic.clone();
+                if let Some(position) = generic
+                    .iter()
+                    .position(|(name, _)| name.eq_ignore_ascii_case("ENGINE"))
+                {
+                    let engine = generic.remove(position).1;
+                    if !engine.is_empty() {
+                        table.engine = engine;
+                    }
+                }
+                crate::storage::schema::apply_generic_table_options(
+                    &mut table.mysql_table_options,
+                    generic,
+                );
+            }
+            _ => unreachable!("metadata capability checked"),
+        }
+        table.build_column_index();
+        Ok(())
     }
 
     pub(crate) fn constraint_alter_dependencies(
@@ -585,6 +732,10 @@ impl Database {
         let mut checks_to_validate = BTreeSet::new();
         let mut fks_to_validate = BTreeSet::new();
         for action in actions {
+            if Self::online_metadata_action_supported(action) {
+                Self::apply_online_metadata_action(&mut candidate, action)?;
+                continue;
+            }
             match action {
                 A::ModifyColumn(def) | A::ChangeColumn { new_def: def, .. } => {
                     let name = match action {
@@ -592,7 +743,8 @@ impl Database {
                         _ => &def.name,
                     };
                     let position = candidate.column_index(name)?;
-                    let mut column = column_def_to_schema_in_table(def.clone(), &candidate, Some(name))?;
+                    let mut column =
+                        column_def_to_schema_in_table(def.clone(), &candidate, Some(name))?;
                     preserve_primary_key_not_null(&candidate, position, &mut column);
                     apply_column_charset_for_alter(
                         &mut column,
@@ -741,6 +893,7 @@ impl Database {
             ensure_table_keeps_visible_column(&candidate)?;
         }
         candidate.build_column_index();
+        ensure_table_keeps_visible_column(&candidate)?;
         indexes.retain(|index| {
             candidate
                 .foreign_keys
@@ -916,8 +1069,30 @@ impl Database {
                 action,
                 crate::parser::AlterAction::ModifyColumn(_)
                     | crate::parser::AlterAction::ChangeColumn { .. }
+                    | crate::parser::AlterAction::SetColumnComment { .. }
+                    | crate::parser::AlterAction::SetColumnDefault { .. }
+                    | crate::parser::AlterAction::SetColumnVisibility { .. }
+                    | crate::parser::AlterAction::MoveColumn { .. }
             )
         });
+        let changes_foreign_keys = actions.iter().any(|action| {
+            matches!(
+                action,
+                crate::parser::AlterAction::AddForeignKey(_)
+                    | crate::parser::AlterAction::DropForeignKey { .. }
+                    | crate::parser::AlterAction::DropCheck {
+                        include_foreign_keys: true,
+                        ..
+                    }
+            )
+        });
+        let refresh_codec = publishes_columns
+            || actions.iter().any(|action| {
+                matches!(
+                    action,
+                    crate::parser::AlterAction::SetStorageProperties { .. }
+                )
+            });
         if table_ddl_schema_is_read_only(&source.database) {
             return Err(error(
                 crate::error::catalog::ER_DBACCESS_DENIED_ERROR,
@@ -1286,6 +1461,10 @@ impl Database {
                             Self::set_alter_copy_job_state(job, "CATCH_UP");
                         }
                     }
+                    #[cfg(test)]
+                    if let Some(hook) = self.online_index_replay_test_hook.lock().unwrap().clone() {
+                        hook.pause();
+                    }
                     let mut converged = false;
                     for _ in 0..64 {
                         crate::engine::cancel::check_cancelled()?;
@@ -1400,6 +1579,11 @@ impl Database {
             }
             // One catalog transaction publishes the constraints AND their trees.
             // Building intents survive a crash and are discarded by index recovery.
+            #[cfg(test)]
+            {
+                CONSTRAINT_PUBLICATION_ARMED.with(|armed| armed.set(true));
+                self.crash_constraint_publication_for_test(1, None)?;
+            }
             {
                 let mut catalog = self.catalog_write()?;
                 let schema_names = check_constraint_names_in_schema(
@@ -1436,7 +1620,21 @@ impl Database {
                 }
                 table.check_constraints = candidate.check_constraints;
                 table.foreign_keys = candidate.foreign_keys;
+                table.charset = candidate.charset;
+                table.collation = candidate.collation;
+                table.comment = candidate.comment;
+                table.engine = candidate.engine;
+                table.mysql_table_options = candidate.mysql_table_options;
+                table.pctfree = candidate.pctfree;
+                table.pctused = candidate.pctused;
                 for index in &mut table.indexes {
+                    if let Some(planned) = candidate
+                        .indexes
+                        .iter()
+                        .find(|planned| planned.index_id == index.index_id)
+                    {
+                        index.visible = planned.visible;
+                    }
                     if index_names.contains(&index.name) {
                         index.state = IndexState::Public;
                         index.readable_from_scn = self.next_scn_atomic.load(Ordering::Acquire);
@@ -1447,7 +1645,7 @@ impl Database {
                 table.build_column_index();
                 table.bump_schema_version();
                 for dependency in &tables {
-                    if publishes_columns && dependency.id != source.id {
+                    if publishes_columns && !changes_foreign_keys && dependency.id != source.id {
                         continue;
                     }
                     let table = Arc::make_mut(
@@ -1478,12 +1676,14 @@ impl Database {
             for table in &tables {
                 self.sync_online_index_descriptor(table.id)?;
             }
-            if publishes_columns {
+            if refresh_codec {
                 for id in source.storage_ids().into_iter().chain([source.id]) {
                     self.refresh_heap_codec(id)?;
                 }
             }
             self.commit_ddl_catalog_txn()?;
+            #[cfg(test)]
+            self.crash_constraint_publication_for_test(3, None)?;
             Ok(())
         })();
         for job in &jobs {

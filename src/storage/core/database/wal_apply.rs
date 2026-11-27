@@ -1507,15 +1507,16 @@ impl Database {
                                     self.primary_definition_highwater
                                         .fetch_max(commit_scn, Ordering::Release);
                                 }
-                                if table.primary_definition_scn != 0
-                                    || table.row_generation_txn_id == txn_id
-                                {
+                                // Every published definition can change write
+                                // semantics (CHECK/FK, defaults, nullability),
+                                // even when heap and primary identities stay
+                                // unchanged. Promotion must fence cached source
+                                // bindings just as local DDL publication does.
+                                self.table_locks_sharded
+                                    .set_schema_floor(table.id, table.schema_version);
+                                for id in table.storage_ids() {
                                     self.table_locks_sharded
-                                        .set_schema_floor(table.id, table.schema_version);
-                                    for id in table.storage_ids() {
-                                        self.table_locks_sharded
-                                            .set_schema_floor(id, table.schema_version);
-                                    }
+                                        .set_schema_floor(id, table.schema_version);
                                 }
                                 catalog.tables.insert(table.qualified_name(), table.clone());
                             }

@@ -892,8 +892,8 @@ pub(super) fn strip_create_index_visibility(
     (std::borrow::Cow::Borrowed(sql), None)
 }
 
-/// Parse manual ALTER actions structurally so charset conversions and CHECK
-/// operations preserve sibling actions, quoting, comments, ALGORITHM and LOCK.
+/// Parse manual ALTER actions structurally so conversions, checks and metadata
+/// options preserve sibling actions, quoting, comments, ALGORITHM and LOCK.
 fn parse_manual_alter_actions(sql: &str) -> Result<Option<Statement>, ParseError> {
     use crate::sql_lex::{SqlTokenCursor, SqlTokenKind, StructuralCursor};
     let mode = crate::sql_lex::SqlLexMode::from_parser_bits(current_parser_sql_mode_bits());
@@ -950,6 +950,22 @@ fn parse_manual_alter_actions(sql: &str) -> Result<Option<Statement>, ParseError
             word.0.kind == SqlTokenKind::Word && word.1.eq_ignore_ascii_case("CONVERT")
         });
         has_manual |= is_check || is_convert;
+        // Single-clause parsing below already owns these extensions. Split a
+        // compound statement so a metadata clause does not depend on a sibling
+        // ALTER INDEX/CHECK happening to activate the structural parser.
+        if clauses.len() > 1 {
+            let visibility = words.len() == 5
+                && words[0].1.eq_ignore_ascii_case("ALTER")
+                && words[1].1.eq_ignore_ascii_case("COLUMN")
+                && words[3].1.eq_ignore_ascii_case("SET")
+                && (words[4].1.eq_ignore_ascii_case("VISIBLE")
+                    || words[4].1.eq_ignore_ascii_case("INVISIBLE"));
+            has_manual |= visibility
+                || matches!(
+                    parse_manual_alter_table_options(sql, table_sql, clause)?,
+                    Some(Statement::AlterTable(_))
+                );
+        }
         parts.push((words, is_check, is_convert));
     }
     if !has_manual {

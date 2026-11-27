@@ -1181,6 +1181,8 @@ impl<'a> CatalogTxn<'a> {
             if stage_ddl_binlog {
                 crate::binlog::stage_current_ddl_transaction(txn.txn_id)?;
             }
+            #[cfg(test)]
+            self.db.crash_constraint_publication_for_test(2, Some(txn.txn_id))?;
             let committed = if self.defer_table_publication {
                 let mut token = self
                     .db

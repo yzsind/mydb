@@ -15,8 +15,8 @@ pub(super) struct AlterExecutionPlan {
 }
 
 /// One immutable catalog replacement, with no row-layout or resource-lifetime
-/// change. Compound ALTER still uses the stronger protocol until its in-memory
-/// candidate is published atomically as a whole, rather than action by action.
+/// change. Supported compound candidates use online constraint publication;
+/// other action sequences retain the stronger protocol.
 fn read_compatible_metadata(stmt: &AlterTable) -> bool {
     if !stmt.partition_actions.is_empty() || stmt.actions.len() != 1 {
         return false;
@@ -144,8 +144,8 @@ pub(super) fn plan_persistent_alter(
             db.alter_action_is_metadata_reversible(&table, a)
                 .unwrap_or(false)
         });
-    let column_validation = validation_scan
-        && metadata_atomic
+    let column_validation = (validation_scan || stmt.actions.len() > 1)
+        && required != AlterAlgorithm::Copy
         && stmt.algorithm != AlterAlgorithm::Copy
         && stmt.partition_actions.is_empty()
         && stmt.actions.iter().all(|action| match action {
@@ -153,8 +153,12 @@ pub(super) fn plan_persistent_alter(
             AlterAction::ChangeColumn { old_name, new_def } => {
                 old_name.eq_ignore_ascii_case(&new_def.name) && new_def.checks.is_empty()
             }
-            AlterAction::MoveColumn { .. } => true,
-            _ => false,
+            AlterAction::AddCheck(_)
+            | AlterAction::AlterCheck { .. }
+            | AlterAction::DropCheck { .. }
+            | AlterAction::AddForeignKey(_)
+            | AlterAction::DropForeignKey { .. } => true,
+            _ => Database::online_metadata_action_supported(action),
         });
     constraints |= column_validation;
     let fused_shape = stmt.actions.iter().all(|a| {
