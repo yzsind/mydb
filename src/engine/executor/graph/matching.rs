@@ -1,4 +1,6 @@
-use super::storage::{adjacency_batch_size, ElementRef, GraphStore, ADJACENCY_WINDOW_SIZE};
+use super::storage::{
+    adjacency_batch_size, ElementRef, GraphStore, Neighbor, ADJACENCY_WINDOW_SIZE,
+};
 use super::values::{self, eval, Bindings, Bound, Path};
 use super::*;
 use crate::graph::{Change, Element, Operator, PathMode, Pattern, Projection, Step};
@@ -525,6 +527,25 @@ fn match_clause<'p>(
     predicate: Option<&Expression>,
     optional: bool,
 ) -> Result<Vec<Bindings<'p>>, QueryError> {
+    if let [pattern] = patterns {
+        if !optional
+            && (rows.len() >= 16 || pattern.steps.len() > 1)
+            && pattern.mode == PathMode::Walk
+            && !pattern.shortest
+            && pattern.path.is_none()
+            && !pattern.steps.is_empty()
+            && pattern
+                .steps
+                .iter()
+                .any(|step| !step.edge.labels.is_empty() || !step.node.labels.is_empty())
+            && pattern
+                .steps
+                .iter()
+                .all(|step| !step.quantified && step.edge.variable.is_none())
+        {
+            return match_fixed_walk(store, atoms, rows, pattern, predicate);
+        }
+    }
     let mut out = Vec::new();
     for outer in rows {
         let mut found = vec![outer.clone()];
@@ -556,6 +577,175 @@ fn match_clause<'p>(
             reserve_binding(store, &fallback)?;
             out.push(fallback);
         }
+    }
+    Ok(out)
+}
+
+fn match_fixed_walk<'p>(
+    store: &mut GraphStore<'_>,
+    atoms: &[Expr],
+    rows: Vec<Bindings<'p>>,
+    pattern: &'p Pattern,
+    predicate: Option<&Expression>,
+) -> Result<Vec<Bindings<'p>>, QueryError> {
+    let mut frontier = Vec::new();
+    for row in rows {
+        let (starts, proof) = start_nodes(store, atoms, &row, &pattern.start, predicate)?;
+        for start in starts {
+            if let Some(row) =
+                match_element_with_proof(store, atoms, &row, &pattern.start, start, proof)?
+            {
+                reserve_binding(store, &row)?;
+                frontier.push((start.id, row.into_owned()));
+            }
+        }
+    }
+    for step in &pattern.steps {
+        frontier = expand_fixed_vertices(store, atoms, &frontier, step)?;
+        if frontier.is_empty() {
+            break;
+        }
+    }
+    let mut out = Vec::new();
+    for (_, row) in frontier {
+        if passes(store, atoms, &row, predicate)? {
+            out.push(row);
+        }
+    }
+    Ok(out)
+}
+
+fn expand_fixed_vertices<'p>(
+    store: &mut GraphStore<'_>,
+    atoms: &[Expr],
+    starts: &[(u64, Bindings<'p>)],
+    step: &'p Step,
+) -> Result<Vec<(u64, Bindings<'p>)>, QueryError> {
+    let edge_label = step.edge.labels.first();
+    let check_edge = step.edge.labels.len() > 1
+        || !step.edge.properties.is_empty()
+        || step.edge.predicate.is_some();
+    let node_label = step.node.labels.first();
+    let check_node = step.node.variable.is_some()
+        || step.node.labels.len() > 1
+        || !step.node.properties.is_empty()
+        || step.node.predicate.is_some();
+    let mut variables = SmallVec::new();
+    let mut fields = SmallVec::new();
+    if let Some(predicate) = &step.node.predicate {
+        collect_properties(predicate, &mut variables, &mut fields);
+    }
+    let preload_predicate = step
+        .node
+        .variable
+        .as_deref()
+        .is_some_and(|name| variables.contains(&name));
+    let field = match fields.as_slice() {
+        [field] => Some(*field),
+        _ => None,
+    };
+    let edge_proof = ElementProof {
+        label: edge_label.map(|_| 0),
+        property: None,
+    };
+    let node_proof = ElementProof {
+        label: node_label.map(|_| 0),
+        property: None,
+    };
+    let batch_size = adjacency_batch_size(store.txn);
+    let mut out = Vec::new();
+    for roots in starts.chunks(ADJACENCY_WINDOW_SIZE) {
+        let anchors: Vec<_> = roots.iter().map(|(id, _)| *id).collect();
+        let batches = store.adjacent_window(&anchors, step.direction, false, batch_size)?;
+        for (roots, batch) in roots.chunks(batch_size).zip(batches) {
+            if let Some(batch) = &batch {
+                store.account_adjacency_batch(batch)?;
+            }
+            let mut candidates = Vec::new();
+            let mut scratch = super::super::mem_budget::ScopedCharge::for_budget(
+                super::super::mem_budget::current_budget(),
+            );
+            for (id, row) in roots {
+                let single;
+                let neighbors = if let Some(batch) = &batch {
+                    batch.neighbors(*id)
+                } else {
+                    single = store.adjacent(*id, step.direction)?;
+                    single.as_slice()
+                };
+                scratch.add(std::mem::size_of::<(&Bindings<'_>, Neighbor)>() * neighbors.len())?;
+                candidates.extend(neighbors.iter().map(|neighbor| (row, *neighbor)));
+            }
+            for window in candidates.chunks(1024) {
+                let edges = edge_label
+                    .map(|label| {
+                        store.label_members(
+                            false,
+                            label,
+                            window.iter().map(|(_, edge)| edge.edge.id).collect(),
+                        )
+                    })
+                    .transpose()?;
+                let mut endpoints = Vec::new();
+                for &(row, edge) in window {
+                    if edges
+                        .as_ref()
+                        .is_some_and(|members| !members.contains(&edge.edge.id))
+                    {
+                        continue;
+                    }
+                    if check_edge
+                        && match_element_with_proof(
+                            store, atoms, row, &step.edge, edge.edge, edge_proof,
+                        )?
+                        .is_none()
+                    {
+                        continue;
+                    }
+                    endpoints.push((edge.node, row));
+                }
+                let nodes = node_label
+                    .map(|label| {
+                        store.label_members(
+                            true,
+                            label,
+                            endpoints.iter().map(|(id, _)| *id).collect(),
+                        )
+                    })
+                    .transpose()?;
+                endpoints
+                    .retain(|(id, _)| nodes.as_ref().is_none_or(|members| members.contains(id)));
+                if check_node && endpoints.len() >= 16 {
+                    store.preload_reached_nodes(endpoints.iter().map(|(id, _)| *id))?;
+                }
+                if preload_predicate && endpoints.len() >= 16 {
+                    let mut row_ids = Vec::with_capacity(endpoints.len());
+                    for &(id, _) in &endpoints {
+                        if let Some(node) = store.lookup_reached_node(id)? {
+                            row_ids.push(node.row);
+                        }
+                    }
+                    store.preload_projection(row_ids, field)?;
+                }
+                for (id, row) in endpoints {
+                    let matched = if check_node {
+                        let Some(node) = store.lookup_reached_node(id)? else {
+                            continue;
+                        };
+                        match_element_with_proof(store, atoms, row, &step.node, node, node_proof)?
+                    } else {
+                        Some(Cow::Borrowed(row))
+                    };
+                    if let Some(row) = matched {
+                        reserve_binding(store, &row)?;
+                        out.push((id, row.into_owned()));
+                    }
+                }
+            }
+        }
+    }
+    if preload_predicate {
+        store.clear_projection();
     }
     Ok(out)
 }

@@ -411,3 +411,56 @@ fn property_graph_batched_walk_keeps_multiplicity_and_snapshot_payloads() {
         Some(&vec![Value::Int(25), Value::String("fresh".into())])
     );
 }
+
+#[test]
+fn property_graph_fixed_walk_batches_labels_with_snapshot_visibility() {
+    let tmp = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let engine = open_strict_test_engine(tmp.path());
+    let reader = &mut SessionContext::default();
+    let writer = &mut SessionContext::default();
+    writer.connection_id = 2;
+    open_graph(&engine, reader);
+    query(&engine, writer, "SESSION SET GRAPH kg");
+    query(
+        &engine,
+        writer,
+        "CREATE UNIQUE GRAPH INDEX anchors ON kg NODE LABEL Anchor (key INT64)",
+    );
+    let keys = (0..24)
+        .map(|key| key.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    query(
+        &engine,
+        writer,
+        &format!(
+            "FOR k IN [{keys}] INSERT (a:Anchor {{key:k}}), (b:Leaf & Active {{key:k}}), \
+         (a)-[:Link & Keep]->(b), (a)~[:Link & Keep]~(b), (a)-[:Link]->(b)"
+        ),
+    );
+    let pattern = "(a:Anchor {key:k})-[:Link & Keep]-(b:Leaf & Active WHERE b.key >= 2)";
+    let projection = "RETURN CAST(b.key AS INT64) AS key ORDER BY key";
+    let batched = format!("FOR k IN [{keys},{keys}] MATCH {pattern} {projection}");
+    let reference = format!("FOR k IN [{keys},{keys}] MATCH p = WALK {pattern} {projection}");
+    let expected = rows(&engine, reader, &reference);
+    assert_eq!(expected.len(), 88);
+    query(
+        &engine,
+        reader,
+        "SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ",
+    );
+    query(&engine, reader, "START TRANSACTION READ ONLY");
+    assert_eq!(rows(&engine, reader, &batched), expected);
+
+    let remove = "MATCH (:Anchor)-[e:Keep]-(:Leaf) REMOVE e:Keep";
+    query(&engine, writer, "BEGIN");
+    query(&engine, writer, remove);
+    assert!(rows(&engine, writer, &batched).is_empty());
+    query(&engine, writer, "ROLLBACK");
+    assert_eq!(rows(&engine, writer, &batched), expected);
+
+    query(&engine, writer, remove);
+    assert_eq!(rows(&engine, reader, &batched), expected);
+    query(&engine, reader, "COMMIT");
+    assert!(rows(&engine, reader, &batched).is_empty());
+}

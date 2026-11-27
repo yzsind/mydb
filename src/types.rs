@@ -523,7 +523,46 @@ impl PartialEq for Value {
     }
 }
 
+/// Borrowed access to a stored JSON value without text serialization.
+#[derive(Clone, Copy)]
+pub struct JsonRef<'a>(crate::engine::json::JsonbRef<'a>);
+
+impl<'a> JsonRef<'a> {
+    pub fn get(self, key: &str) -> Option<Self> {
+        self.0.get(key).map(Self)
+    }
+
+    pub fn as_i64(self) -> Option<i64> {
+        self.0.as_i64()
+    }
+
+    pub fn as_str(self) -> Option<&'a str> {
+        self.0.as_str()
+    }
+
+    pub fn is_null(self) -> bool {
+        self.0.is_null()
+    }
+
+    pub fn object_len(self) -> Option<usize> {
+        self.0.is_object().then(|| self.0.container_len()).flatten()
+    }
+
+    pub fn to_serde(self) -> Result<serde_json::Value, QueryError> {
+        self.0.to_serde()
+    }
+}
+
 impl Value {
+    pub fn as_json(&self) -> Result<Option<JsonRef<'_>>, QueryError> {
+        match self {
+            Self::Json(bytes) => crate::engine::json::JsonbRef::new(bytes)
+                .map(JsonRef)
+                .map(Some),
+            _ => Ok(None),
+        }
+    }
+
     /// Row-change equality preserves floating-point payloads. SQL numeric
     /// equality merges signed zeros, but a stored replacement must retain
     /// the requested IEEE representation.

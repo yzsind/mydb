@@ -2,7 +2,7 @@ use super::super::mem_budget::{ControlledMemoryCategory, ControlledMemoryCharge}
 use super::*;
 use crate::graph::{Direction, IndexType, PropertyIndex};
 use crate::storage::{KeyPart, StoredRow};
-use crate::util::fast_hash::{ah_hash_map, AhHashMap};
+use crate::util::fast_hash::{ah_hash_map, ah_hash_set, AhHashMap, AhHashSet};
 use serde_json::{Map, Value as Json};
 use smallvec::{smallvec, SmallVec};
 
@@ -1161,10 +1161,7 @@ impl<'a> GraphStore<'a> {
         mut ids: Vec<RowId>,
         field: Option<&str>,
     ) -> Result<(), QueryError> {
-        self.projection_payloads.clear();
-        self.projected_values.clear();
-        self.projection_charge
-            .release_bytes(self.projection_charge.charged());
+        self.clear_projection();
         let cache_limit = self.projection_charge.remaining().min(2 * 1024 * 1024);
         let min_batch = if field.is_some() { 2 } else { 8 };
         if ids.len() < min_batch || cache_limit == 0 {
@@ -1201,6 +1198,13 @@ impl<'a> GraphStore<'a> {
             }
         }
         Ok(())
+    }
+
+    pub fn clear_projection(&mut self) {
+        self.projection_payloads.clear();
+        self.projected_values.clear();
+        self.projection_charge
+            .release_bytes(self.projection_charge.charged());
     }
 
     fn preload_projected_field(
@@ -1337,20 +1341,23 @@ impl<'a> GraphStore<'a> {
 
     pub fn has_label(&self, entry: ElementRef, label: &str) -> Result<bool, QueryError> {
         let role = if entry.node() { NODE_LABEL } else { EDGE_LABEL };
-        let key = token(label)?;
+        self.has_label_id(role, entry.id, &token(label)?)
+    }
+
+    fn has_label_id(&self, role: u64, id: u64, key: &[u8]) -> Result<bool, QueryError> {
         let full = IndexKey(smallvec![
             KeyPart::UInt(role),
             KeyPart::UInt(0),
-            KeyPart::Bytes(key.clone()),
-            KeyPart::UInt(entry.id)
+            KeyPart::Bytes(key.to_vec()),
+            KeyPart::UInt(id)
         ]);
-        for id in self
+        for row in self
             .db
             .lookup_index_visible(&self.table, self.index("g_key"), full, self.txn)?
         {
-            if let Some(row) = self.read_at(id, self.txn)? {
+            if let Some(row) = self.read_at(row, self.txn)? {
                 if uint(&row.values[ROLE])? == role
-                    && uint(&row.values[TIE])? == entry.id
+                    && uint(&row.values[TIE])? == id
                     && bytes(&row.values[TOKEN])? == key
                 {
                     return Ok(true);
@@ -1358,6 +1365,74 @@ impl<'a> GraphStore<'a> {
             }
         }
         Ok(false)
+    }
+
+    pub fn label_members(
+        &self,
+        node: bool,
+        label: &str,
+        mut ids: Vec<u64>,
+    ) -> Result<AhHashSet<u64>, QueryError> {
+        if ids.is_empty() {
+            return Ok(ah_hash_set());
+        }
+        let role = if node { NODE_LABEL } else { EDGE_LABEL };
+        let label = token(label)?;
+        ids.sort_unstable();
+        ids.dedup();
+        let mut members = ah_hash_set();
+        for window in ids.chunks(1024) {
+            crate::engine::cancel::check_cancelled()?;
+            if window.len() >= 16 && !self.txn.historical {
+                let keys: Vec<_> = window
+                    .iter()
+                    .map(|&id| {
+                        IndexKey(smallvec![
+                            KeyPart::UInt(role),
+                            KeyPart::UInt(0),
+                            KeyPart::Bytes(label.clone()),
+                            KeyPart::UInt(id),
+                        ])
+                    })
+                    .collect();
+                let entries = self.db.lookup_prefixes_prefetched_mapped(
+                    &self.table,
+                    self.index("g_key"),
+                    &keys,
+                    self.txn,
+                    window.len(),
+                    |key, row| match key.0.last() {
+                        Some(KeyPart::UInt(id)) => Some((*id, row)),
+                        _ => None,
+                    },
+                )?;
+                if let Some((entries, bound)) = entries {
+                    let invalid_key = || invalid("Invalid graph label index key");
+                    // A label membership is inserted or deleted as a whole.
+                    // Its key never changes in place, so only visibility is needed.
+                    let visible = self.index_visibility_mask(
+                        "g_key",
+                        bound,
+                        entries
+                            .iter()
+                            .map(|entry| entry.map(|(_, row)| row).ok_or_else(invalid_key)),
+                    )?;
+                    for (slot, entry) in entries.into_iter().enumerate() {
+                        let (id, _) = entry.ok_or_else(invalid_key)?;
+                        if visible.as_ref().is_none_or(|mask| mask[slot]) {
+                            members.insert(id);
+                        }
+                    }
+                    continue;
+                }
+            }
+            for &id in window {
+                if self.has_label_id(role, id, &label)? {
+                    members.insert(id);
+                }
+            }
+        }
+        Ok(members)
     }
 
     fn labels_for(

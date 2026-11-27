@@ -1,0 +1,150 @@
+{
+  "IS1": [
+    "firstName",
+    "lastName",
+    "birthday",
+    "locationIp",
+    "browserUsed",
+    "cityId",
+    "gender",
+    "creationDate"
+  ],
+  "IS2": [
+    "messageId",
+    "messageContent",
+    "messageCreationDate",
+    "originalPostId",
+    "originalPostAuthorId",
+    "originalPostAuthorFirstName",
+    "originalPostAuthorLastName"
+  ],
+  "IS3": [
+    "personId",
+    "firstName",
+    "lastName",
+    "friendshipCreationDate"
+  ],
+  "IC1": [
+    "friendId",
+    "friendLastName",
+    "distanceFromPerson",
+    "friendBirthday",
+    "friendCreationDate",
+    "friendGender",
+    "friendBrowserUsed",
+    "friendLocationIp",
+    "friendEmails",
+    "friendLanguages",
+    "friendCityName",
+    "friendUniversities",
+    "friendCompanies"
+  ],
+  "IC14": [
+    "personIdsInPath",
+    "pathWeight"
+  ],
+  "IC2": [
+    "personId",
+    "personFirstName",
+    "personLastName",
+    "messageId",
+    "messageContent",
+    "messageCreationDate"
+  ],
+  "IC4": [
+    "tagName",
+    "postCount"
+  ],
+  "IC8": [
+    "personId",
+    "personFirstName",
+    "personLastName",
+    "commentCreationDate",
+    "commentId",
+    "commentContent"
+  ],
+  "IC9": [
+    "personId",
+    "personFirstName",
+    "personLastName",
+    "messageId",
+    "messageContent",
+    "messageCreationDate"
+  ],
+  "IC10": [
+    "personId",
+    "personFirstName",
+    "personLastName",
+    "commonInterestScore",
+    "personGender",
+    "personCityName"
+  ],
+  "IC11": [
+    "personId",
+    "personFirstName",
+    "personLastName",
+    "organizationName",
+    "organizationWorkFromYear"
+  ],
+  "IC3": [
+    "personId",
+    "personFirstName",
+    "personLastName",
+    "xCount",
+    "yCount",
+    "count"
+  ],
+  "IC6": [
+    "tagName",
+    "postCount"
+  ],
+  "IC12": [
+    "personId",
+    "personFirstName",
+    "personLastName",
+    "tagNames",
+    "replyCount"
+  ],
+  "IC13": [
+    "shortestPathLength"
+  ],
+  "IC7": [
+    "personId",
+    "personFirstName",
+    "personLastName",
+    "likeCreationDate",
+    "messageId",
+    "messageContent",
+    "minutesLatency",
+    "isNew"
+  ],
+  "IS4": [
+    "messageContent",
+    "messageCreationDate"
+  ],
+  "IS5": [
+    "personId",
+    "firstName",
+    "lastName"
+  ],
+  "IS6": [
+    "forumId",
+    "forumTitle",
+    "moderatorId",
+    "moderatorFirstName",
+    "moderatorLastName"
+  ],
+  "IC5": [
+    "forumTitle",
+    "postCount"
+  ],
+  "IS7": [
+    "commentId",
+    "commentContent",
+    "commentCreationDate",
+    "replyAuthorId",
+    "replyAuthorFirstName",
+    "replyAuthorLastName",
+    "isReplyAuthorKnowsOriginalMessageAuthor"
+  ]
+}
