@@ -48,12 +48,12 @@
     "multi-threaded replica apply"
   ],
   "evidence": {
-    "review_scope": "Source and documentation contract review; focused classic-protocol, prepared-numeric and prepared EXPLAIN regressions. This fingerprint is a review trigger, not proof all combinations are supported. Prepared numeric-context refresh/restoration, semantic error propagation, and EXPLAIN catalog admission/statistics publication were reviewed. ENUM/SET TABLE_MAP wire types, preservation of internal row encoders, and reuse of numeric binlog file/position ordering for replica UNTIL checks were reviewed with focused regressions; capability and command compatibility classifications are unchanged.",
+    "review_scope": "Source and documentation contract review; focused classic-protocol, prepared-numeric and prepared EXPLAIN regressions. This fingerprint is a review trigger, not proof all combinations are supported. Prepared numeric-context refresh/restoration, semantic error propagation, and EXPLAIN catalog admission/statistics publication were reviewed. ENUM/SET TABLE_MAP wire types, preservation of internal row encoders, and reuse of numeric binlog file/position ordering for replica UNTIL checks were reviewed with focused regressions; capability and command compatibility classifications are unchanged. Per-dump heartbeat cursor semantics were reviewed against MySQL 8.0 and validated with NONE/CRC32 publication/rotation regressions, a raw dump check covering 1,000 writes and 200 rotations, and a real MySQL 8.0.46 replica across 28 tables, reconnects and 35 seconds of idle heartbeats; capability and command classifications are unchanged.",
     "source_sha256": {
       "src/mysql/protocol.rs": "4319edb06cee12e06302ff88890b9e5441e5d20cfc283724b31fbc9597073467",
       "src/mysql/server.rs": "80499aca67183a4f19e3f04dd5394fefec0dc7167fa703ba359e08a53aee107b",
-      "src/mysql/session.rs": "47ef1504639cf4192c39c284748c4de25d8f178f3b98a47079836e1f4abab1a9",
-      "src/binlog.rs": "bb08295cde1ea6d6c2c7ebc39334a81bd9edffffd01738367935a1d094d6a02d",
+      "src/mysql/session.rs": "e029d3af6be3df40094ae317bbb973ff7c470b2f12feb0af0fdc7d344dbc6d39",
+      "src/binlog.rs": "ce58542209b03e3d7aa70e4b9b18f7c447f88c4fafcd2dee29d5c8f07df480cf",
       "src/mysql/peer_monitor.rs": "2664258b1e0b97bdd36da7735f24a32826af97f9ffbbd63987d8152fd1e104f6"
     },
     "test_sources": [
