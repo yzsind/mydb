@@ -27,6 +27,9 @@ fn validate_expr(scope: &Scope<'_>, expr: &Expression) -> Result<(), String> {
         _ => Err(format!("Invalid type for GQL variable '{name}'")),
     };
     match expr {
+        Expression::Count(arg) => arg
+            .as_ref()
+            .map_or(Ok(()), |expr| validate_expr(scope, expr)),
         Expression::Atom(_) => Ok(()),
         Expression::Record(fields) => fields
             .iter()
@@ -158,6 +161,14 @@ pub(super) fn validate(program: &Program) -> Result<(), String> {
             if matches!(expression, Expression::Variable(name) if projection.items.iter().any(|(_, alias)| alias == name))
             {
                 continue;
+            }
+            if projection
+                .items
+                .iter()
+                .any(|(item, _)| matches!(item, Expression::Count(_)))
+                && !projection.items.iter().any(|(item, _)| item == expression)
+            {
+                return Err("Grouped ORDER BY requires a projected expression or alias".into());
             }
             validate_expr(&scope, expression)?;
         }

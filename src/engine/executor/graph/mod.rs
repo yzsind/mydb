@@ -96,6 +96,8 @@ fn target(session: &SessionContext, command: &Command) -> Option<(String, String
         Command::Create { graph, .. }
         | Command::Drop { graph, .. }
         | Command::CreateIndex { graph, .. }
+        | Command::CreateProjection { graph, .. }
+        | Command::DropProjection { graph, .. }
         | Command::DropIndex { graph, .. }
         | Command::SetGraph(graph) => {
             Some((session.current_database.clone(), internal_name(graph)))
@@ -141,9 +143,10 @@ pub(super) fn privileges(session: &SessionContext, command: &Command) -> Vec<Req
         Command::Drop { .. } => privileges.push(Privilege::Drop),
         Command::SetGraph(_) => privileges.push(Privilege::Select),
         Command::ResetGraph => (),
-        Command::CreateIndex { .. } | Command::DropIndex { .. } => {
-            privileges.push(Privilege::Index)
-        }
+        Command::CreateProjection { .. }
+        | Command::DropProjection { .. }
+        | Command::CreateIndex { .. }
+        | Command::DropIndex { .. } => privileges.push(Privilege::Index),
         Command::Program(program) => {
             for clause in &program.clauses {
                 let privilege = match clause {
@@ -190,9 +193,9 @@ fn program_columns(program: &Program) -> Vec<Column> {
                 Expression::Cast(_, Cast::String) | Expression::ElementId(_) => {
                     ColumnType::VarString
                 }
-                Expression::Cast(_, Cast::Int64) | Expression::PathLength(_) => {
-                    ColumnType::LongLong
-                }
+                Expression::Count(_)
+                | Expression::Cast(_, Cast::Int64)
+                | Expression::PathLength(_) => ColumnType::LongLong,
                 Expression::Cast(_, Cast::Float64) => ColumnType::Double,
                 Expression::Cast(_, Cast::Boolean)
                 | Expression::Binary(..)
@@ -324,6 +327,14 @@ pub(super) fn execute(
                     Command::Program(program) => {
                         let _activity = (!writes).then(GraphReadActivity::enter);
                         matching::execute(&mut store, program)
+                    }
+                    Command::CreateProjection { name, spec, .. } => {
+                        store.create_projection(&name, spec)?;
+                        Ok(QueryResponse::Ok)
+                    }
+                    Command::DropProjection { name, .. } => {
+                        store.drop_projection(&name)?;
+                        Ok(QueryResponse::Ok)
                     }
                     Command::CreateIndex { name, spec, .. } => {
                         store.create_index(&name, spec)?;

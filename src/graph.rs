@@ -28,6 +28,15 @@ pub enum Command {
     },
     SetGraph(String),
     ResetGraph,
+    CreateProjection {
+        graph: String,
+        name: String,
+        spec: ReadProjection,
+    },
+    DropProjection {
+        graph: String,
+        name: String,
+    },
     CreateIndex {
         graph: String,
         name: String,
@@ -38,6 +47,13 @@ pub enum Command {
         name: String,
     },
     Program(Program),
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ReadProjection {
+    pub node: bool,
+    pub label: String,
+    pub fields: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -144,6 +160,7 @@ pub enum Direction {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Expression {
+    Count(Option<Box<Expression>>),
     Atom(usize),
     Record(Vec<(String, Expression)>),
     Variable(String),
@@ -249,6 +266,8 @@ impl Command {
                 | Self::Drop { .. }
                 | Self::CreateIndex { .. }
                 | Self::DropIndex { .. }
+                | Self::CreateProjection { .. }
+                | Self::DropProjection { .. }
         )
     }
     pub(crate) fn writes(&self) -> bool {

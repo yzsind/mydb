@@ -148,6 +148,13 @@ pub(super) fn execute(
         })
         .transpose()?
         .unwrap_or(u64::MAX);
+    if projection
+        .items
+        .iter()
+        .any(|(expr, _)| matches!(expr, Expression::Count(_)))
+    {
+        return grouped_result(store, &program.atoms, &projection, columns, rows, limit);
+    }
     if projection.order.is_empty() && !projection.distinct {
         rows.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
     }
@@ -159,6 +166,23 @@ pub(super) fn execute(
         limit,
         wire_order: wire_order.is_some(),
     };
+    if !projection.distinct
+        && wire_order.is_none()
+        && !projection.order.is_empty()
+        && limit > 0
+        && limit < (rows.len() / 2) as u64
+    {
+        let winners = input.top_k(store, &rows, limit as usize)?;
+        let result = input
+            .project_slice(store, &winners)?
+            .into_iter()
+            .map(|(row, _)| row)
+            .collect();
+        return Ok(QueryResponse::ResultSet(ResultSet {
+            columns,
+            rows: result,
+        }));
+    }
     if let Some((0, ascending)) = wire_order {
         if !projection.distinct
             && matches!(columns.as_slice(), [c] if c.column_type == ColumnType::LongLong)
@@ -216,6 +240,124 @@ pub(super) fn execute(
     }))
 }
 
+fn grouped_result(
+    store: &mut GraphStore<'_>,
+    atoms: &[Expr],
+    projection: &Projection,
+    columns: Vec<Column>,
+    rows: Vec<Bindings<'_>>,
+    limit: u64,
+) -> Result<QueryResponse, QueryError> {
+    let mut groups = Vec::<Vec<Json>>::new();
+    let mut indices = crate::util::fast_hash::ah_hash_map();
+    let mut variables = SmallVec::new();
+    let mut fields = SmallVec::new();
+    let mut counts = Vec::new();
+    let mut keys = Vec::new();
+    for (slot, (expr, _)) in projection.items.iter().enumerate() {
+        if let Expression::Count(argument) = expr {
+            counts.push((slot, argument.as_deref()));
+            if let Some(arg) = argument {
+                collect_properties(arg, &mut variables, &mut fields);
+            }
+        } else {
+            keys.push((slot, expr));
+            collect_properties(expr, &mut variables, &mut fields);
+        }
+    }
+    let empty = vec![Json::from(0); columns.len()];
+    if keys.is_empty() {
+        groups.push(empty.clone());
+    }
+    for window in rows.chunks(512) {
+        crate::engine::cancel::check_cancelled()?;
+        preload_projection_batch(store, window, &variables, &fields)?;
+        for row in window {
+            let index = if keys.is_empty() {
+                0
+            } else {
+                let key = keys
+                    .iter()
+                    .map(|(_, expr)| eval(store, atoms, row, expr))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let normalized: Vec<_> = key.iter().map(values::distinct_value).collect();
+                let bytes = serde_json::to_vec(&normalized)
+                    .map_err(|_| invalid("Cannot encode graph grouping key"))?;
+                if let Some(index) = indices.get(&bytes) {
+                    *index
+                } else {
+                    store.charge(
+                        bytes.capacity()
+                            + 96
+                            + empty.len() * std::mem::size_of::<Json>()
+                            + key.iter().map(json_size).sum::<usize>(),
+                    )?;
+                    let index = groups.len();
+                    indices.insert(bytes, index);
+                    let mut values = empty.clone();
+                    for ((slot, _), value) in keys.iter().zip(key) {
+                        values[*slot] = value;
+                    }
+                    groups.push(values);
+                    index
+                }
+            };
+            let group = &mut groups[index];
+            for &(slot, arg) in &counts {
+                let present = match arg {
+                    None => true,
+                    Some(Expression::Variable(name)) => !matches!(
+                        values::binding(row, name)?,
+                        Bound::Null | Bound::Scalar(Json::Null)
+                    ),
+                    Some(expr) => !eval(store, atoms, row, expr)?.is_null(),
+                };
+                if present {
+                    group[slot] = Json::from(group[slot].as_i64().unwrap() + 1);
+                }
+            }
+        }
+    }
+    let order = projection
+        .order
+        .iter()
+        .map(|(expr, desc)| {
+            let alias = if let Expression::Variable(name) = expr {
+                projection.items.iter().position(|(_, a)| a == name)
+            } else {
+                None
+            };
+            alias
+                .or_else(|| projection.items.iter().position(|(item, _)| item == expr))
+                .map(|slot| (slot, *desc))
+                .ok_or_else(|| invalid("Invalid grouped ORDER BY"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if !order.is_empty() {
+        groups.sort_by(|a, b| {
+            for &(slot, desc) in &order {
+                let ordering = values::sort_cmp(&a[slot], &b[slot]);
+                if ordering != Ordering::Equal {
+                    return if desc { ordering.reverse() } else { ordering };
+                }
+            }
+            Ordering::Equal
+        });
+    }
+    groups.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+    let rows = groups
+        .into_iter()
+        .map(|group| {
+            group
+                .into_iter()
+                .zip(&columns)
+                .map(|(value, col)| values::wire(value, &col.column_type))
+                .collect()
+        })
+        .collect();
+    Ok(QueryResponse::ResultSet(ResultSet { columns, rows }))
+}
+
 fn result_integer_order(projection: &Projection, columns: &[Column]) -> Option<(usize, bool)> {
     let [(Expression::Variable(alias), descending)] = projection.order.as_slice() else {
         return None;
@@ -242,6 +384,100 @@ struct GraphProjection<'a> {
 }
 
 impl GraphProjection<'_> {
+    fn top_k<'p>(
+        &self,
+        store: &mut GraphStore<'_>,
+        rows: &[Bindings<'p>],
+        k: usize,
+    ) -> Result<Vec<Bindings<'p>>, QueryError> {
+        let order: Vec<_> = self
+            .projection
+            .order
+            .iter()
+            .map(|(expr, desc)| {
+                let source = match expr {
+                    Expression::Variable(name) => self
+                        .projection
+                        .items
+                        .iter()
+                        .find(|(_, alias)| alias == name)
+                        .map(|(value, _)| value)
+                        .unwrap_or(expr),
+                    _ => expr,
+                };
+                (source, *desc)
+            })
+            .collect();
+        let mut variables = SmallVec::new();
+        let mut fields = SmallVec::new();
+        for (expr, _) in &order {
+            collect_properties(expr, &mut variables, &mut fields);
+        }
+        let compare = |a: &(usize, Vec<Json>, usize), b: &(usize, Vec<Json>, usize)| {
+            for ((a, b), (_, desc)) in a.1.iter().zip(&b.1).zip(&order) {
+                let cmp = values::sort_cmp(a, b);
+                if cmp != Ordering::Equal {
+                    return if *desc { cmp.reverse() } else { cmp };
+                }
+            }
+            a.0.cmp(&b.0)
+        };
+        let mut scratch = super::super::mem_budget::ScopedCharge::for_budget(
+            super::super::mem_budget::current_budget(),
+        );
+        let capacity = k * 2;
+        scratch.add(capacity * std::mem::size_of::<(usize, Vec<Json>, usize)>())?;
+        let mut best = Vec::with_capacity(capacity);
+        let mut validated = vec![None; self.projection.items.len()];
+        for (batch, window) in rows.chunks(512).enumerate() {
+            crate::engine::cancel::check_cancelled()?;
+            preload_projection_batch(store, window, &variables, &fields)?;
+            for (slot, row) in window.iter().enumerate() {
+                // Preserve errors in expressions on rows discarded by LIMIT. A graph
+                // element property is a scalar, so converting it to text is total.
+                for (last, (expr, _)) in validated.iter_mut().zip(&self.projection.items) {
+                    let (source, total_cast) = match expr {
+                        Expression::Cast(inner, kind) => (inner.as_ref(), *kind == Cast::String),
+                        other => (other, true),
+                    };
+                    if let Expression::Property(name, _) = source {
+                        match row.get(name) {
+                            Some(Bound::Element(entry)) => {
+                                if total_cast || *last == Some(*entry) {
+                                    continue;
+                                }
+                                eval(store, self.atoms, row, expr)?;
+                                *last = Some(*entry);
+                                continue;
+                            }
+                            Some(Bound::Null) => continue,
+                            _ => (),
+                        }
+                    }
+                    eval(store, self.atoms, row, expr)?;
+                }
+                let keys = order
+                    .iter()
+                    .map(|(key, _)| eval(store, self.atoms, row, key))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let bytes = keys.iter().map(json_size).sum();
+                scratch.add(bytes)?;
+                best.push((batch * 512 + slot, keys, bytes));
+                if best.len() == capacity {
+                    best.select_nth_unstable_by(k, compare);
+                    let freed = best.drain(k..).map(|(_, _, bytes)| bytes).sum();
+                    scratch.release_bytes(freed);
+                }
+            }
+        }
+        best.sort_unstable_by(compare);
+        Ok(best
+            .into_iter()
+            .take(k)
+            .map(|(index, _, _)| rows[index].clone())
+            .collect())
+    }
+
     fn project<'p, R: Send>(
         &self,
         store: &mut GraphStore<'_>,
@@ -446,7 +682,9 @@ fn preload_projection_batch(
         .iter()
         .flat_map(|row| {
             variables.iter().filter_map(|name| match row.get(name) {
-                Some(Bound::Element(entry)) => Some(entry.row),
+                Some(Bound::Element(entry)) if !store.projection_has_all(entry.row, fields) => {
+                    Some(entry.row)
+                }
                 _ => None,
             })
         })
@@ -529,6 +767,11 @@ fn match_clause<'p>(
     optional: bool,
 ) -> Result<Vec<Bindings<'p>>, QueryError> {
     if let [pattern] = patterns {
+        if optional && rows.len() >= 16 && predicate.is_none() {
+            if let Some(result) = join_bound_walk(store, atoms, &rows, pattern)? {
+                return Ok(result);
+            }
+        }
         if !optional
             && (rows.len() >= 16
                 || pattern.steps.len() > 1
@@ -585,6 +828,108 @@ fn match_clause<'p>(
     Ok(out)
 }
 
+// Share a fixed traversal across outer rows bound to different endpoints.
+fn join_bound_walk<'p>(
+    store: &mut GraphStore<'_>,
+    atoms: &[Expr],
+    rows: &[Bindings<'p>],
+    pattern: &'p Pattern,
+) -> Result<Option<Vec<Bindings<'p>>>, QueryError> {
+    let Some(start) = pattern.start.variable.as_deref() else {
+        return Ok(None);
+    };
+    let Some(end) = pattern
+        .steps
+        .last()
+        .and_then(|s| s.node.variable.as_deref())
+    else {
+        return Ok(None);
+    };
+    let independent =
+        |element: &Element| element.properties.is_empty() && element.predicate.is_none();
+    if start == end
+        || pattern.shortest
+        || pattern.path.is_some()
+        || pattern.mode != PathMode::Walk
+        || !independent(&pattern.start)
+        || !pattern
+            .steps
+            .iter()
+            .all(|s| !s.quantified && independent(&s.edge) && independent(&s.node))
+    {
+        return Ok(None);
+    }
+    let locals: Vec<_> = pattern
+        .steps
+        .iter()
+        .flat_map(|s| [s.edge.variable.as_deref(), s.node.variable.as_deref()])
+        .flatten()
+        .filter(|v| *v != start && *v != end)
+        .collect();
+    let mut anchors = crate::util::fast_hash::ah_hash_set();
+    let mut seeds = Vec::new();
+    let mut requested = crate::util::fast_hash::ah_hash_set();
+    for row in rows {
+        let (Some(Bound::Element(a)), Some(Bound::Element(b))) = (row.get(start), row.get(end))
+        else {
+            return Ok(None);
+        };
+        if locals.iter().any(|v| row.contains_key(v)) {
+            return Ok(None);
+        }
+        requested.insert((a.id, b.id));
+        if anchors.insert(a.id) {
+            let mut seed = Bindings::new();
+            seed.insert(start, Bound::Element(*a));
+            seeds.push(seed);
+        }
+    }
+    if seeds.len() > rows.len() / 2 {
+        return Ok(None);
+    }
+    store.charge(requested.len() * 64 + seeds.len() * 128)?;
+    let mut matches = crate::util::fast_hash::ah_hash_map::<(u64, u64), Vec<Bindings<'p>>>();
+    for found in match_fixed_walk(store, atoms, seeds, pattern, None)? {
+        if let (Some(Bound::Element(a)), Some(Bound::Element(b))) =
+            (found.get(start), found.get(end))
+        {
+            let pair = (a.id, b.id);
+            if requested.contains(&pair) {
+                matches.entry(pair).or_default().push(found);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for row in rows {
+        let (Some(Bound::Element(a)), Some(Bound::Element(b))) = (row.get(start), row.get(end))
+        else {
+            unreachable!()
+        };
+        if let Some(found) = matches.get(&(a.id, b.id)) {
+            for inner in found {
+                let mut merged = row.clone();
+                for (name, value) in inner.iter() {
+                    if !merged.contains_key(name) {
+                        merged.insert(name, value.clone());
+                    }
+                }
+                reserve_binding(store, &merged)?;
+                out.push(merged);
+            }
+        } else {
+            let mut merged = row.clone();
+            for name in &locals {
+                if !merged.contains_key(name) {
+                    merged.insert(name, Bound::Null);
+                }
+            }
+            reserve_binding(store, &merged)?;
+            out.push(merged);
+        }
+    }
+    Ok(Some(out))
+}
+
 fn match_fixed_walk<'p>(
     store: &mut GraphStore<'_>,
     atoms: &[Expr],
@@ -633,10 +978,7 @@ fn predicate_projection(element: &Element) -> Option<Option<&str>> {
 }
 
 fn covers_edge(edge: &Element) -> bool {
-    edge.variable.is_none()
-        && !edge.labels.is_empty()
-        && edge.properties.is_empty()
-        && edge.predicate.is_none()
+    !edge.labels.is_empty()
 }
 
 fn expand_fixed_vertices<'p>(
@@ -793,10 +1135,55 @@ fn expand_labeled_vertices<'p>(
                 }
                 end = keep;
             }
-            let endpoints = window[..end]
-                .iter()
-                .map(|(edge, row)| (edge.node, Cow::Borrowed(*row)))
-                .collect();
+            let edges = &window[..end];
+            let needs_edge = step.edge.variable.is_some()
+                || !step.edge.properties.is_empty()
+                || step.edge.predicate.is_some();
+            let endpoints = if needs_edge {
+                let ids = edges.iter().map(|(edge, _)| edge.edge).collect::<Vec<_>>();
+                let mut roots = store.projected_members(
+                    false,
+                    label,
+                    &ids,
+                    predicate_projection(&step.edge).flatten(),
+                )?;
+                let missing: Vec<_> = edges
+                    .iter()
+                    .map(|(edge, _)| *edge)
+                    .filter(|e| !roots.contains_key(&e.edge))
+                    .collect();
+                if !missing.is_empty() {
+                    roots.extend(store.labeled_edge_roots(missing.into_iter())?);
+                }
+                if let Some(field) = predicate_projection(&step.edge).filter(|_| roots.len() >= 16)
+                {
+                    store
+                        .preload_projection(roots.values().map(|edge| edge.row).collect(), field)?;
+                }
+                let mut endpoints = Vec::with_capacity(end);
+                for &(edge, row) in edges {
+                    let entry = roots[&edge.edge];
+                    if let Some(bound) = match_element_with_proof(
+                        store,
+                        atoms,
+                        row,
+                        &step.edge,
+                        entry,
+                        ElementProof {
+                            label: Some(0),
+                            property: None,
+                        },
+                    )? {
+                        endpoints.push((edge.node, bound));
+                    }
+                }
+                endpoints
+            } else {
+                edges
+                    .iter()
+                    .map(|(edge, row)| (edge.node, Cow::Borrowed(*row)))
+                    .collect()
+            };
             match_fixed_targets(store, atoms, &step.node, node_field, endpoints, &mut out)?;
         }
     }
@@ -814,11 +1201,17 @@ fn match_fixed_targets<'p>(
     mut endpoints: Vec<(u64, Cow<'_, Bindings<'p>>)>,
     out: &mut Vec<(u64, Bindings<'p>)>,
 ) -> Result<(), QueryError> {
+    let initial_len = out.len();
     let label = node.labels.first();
     if let Some(label) = label {
-        let members =
-            store.label_members(true, label, endpoints.iter().map(|(id, _)| *id).collect())?;
-        endpoints.retain(|(id, _)| members.contains(id));
+        let ids: Vec<_> = endpoints.iter().map(|(id, _)| *id).collect();
+        let projected = store.projected_members(true, label, &ids, field.flatten())?;
+        let unknown = ids
+            .into_iter()
+            .filter(|id| !projected.contains_key(id))
+            .collect();
+        let members = store.label_members(true, label, unknown)?;
+        endpoints.retain(|(id, _)| projected.contains_key(id) || members.contains(id));
     }
     let check_node = node.variable.is_some()
         || node.labels.len() > 1
@@ -859,6 +1252,7 @@ fn match_fixed_targets<'p>(
         reserve_binding(store, &row)?;
         out.push((id, row));
     }
+    store.record_survivors(out.len() - initial_len);
     Ok(())
 }
 
@@ -1060,6 +1454,7 @@ fn find_constraint<'a>(
 
 fn ready(expr: &Expression, row: &Bindings<'_>) -> bool {
     match expr {
+        Expression::Count(_) => false,
         Expression::Atom(_) => true,
         Expression::Record(fields) => fields.iter().all(|(_, expr)| ready(expr, row)),
         Expression::Variable(name)

@@ -1,3 +1,4 @@
+mod packed;
 use super::super::mem_budget::{ControlledMemoryCategory, ControlledMemoryCharge};
 use super::*;
 use crate::graph::{Direction, IndexType, PropertyIndex};
@@ -81,6 +82,7 @@ pub(super) struct Neighbor {
 #[derive(Clone, Copy)]
 pub(super) struct LabeledNeighbor {
     pub edge: u64,
+    pub role: u64,
     pub node: u64,
 }
 
@@ -91,7 +93,6 @@ struct Definition {
 }
 
 const LOCATOR_DIRECTORY_BYTES: usize = 32 * 1024 * 1024;
-const LOCATOR_BUILD_MIN_PROBES: usize = 512;
 const LOCATOR_CACHE_GRAPHS: usize = 4;
 
 // An optional map from immutable element IDs to heap root row IDs. Only
@@ -115,94 +116,146 @@ struct LocatorEntry {
 }
 
 struct GraphReadCache {
+    packed: parking_lot::RwLock<packed::BlockCache>,
     locations: parking_lot::RwLock<NodeLocations>,
-    flat_locations: std::sync::OnceLock<Option<FlatNodeLocations>>,
-    location_builder: parking_lot::Mutex<()>,
     projected: [parking_lot::RwLock<Option<ProjectedPropertySnapshot>>; READ_CACHE_SHARDS],
     adjacency: [parking_lot::RwLock<Option<AdjacencySnapshot>>; READ_CACHE_SHARDS],
+    memberships: parking_lot::RwLock<Option<LabelMemberships>>,
     label_bounds: parking_lot::RwLock<Option<LabelBoundsSnapshot>>,
     index_definitions: parking_lot::RwLock<Option<IndexDefinitionsSnapshot>>,
     indexed_nodes: parking_lot::RwLock<Option<IndexedNodesSnapshot>>,
 }
 
 struct NodeLocations {
-    rows: AhHashMap<u64, RowId>,
+    blocks: AhHashMap<u64, LocatorBlock>,
     charge: ControlledMemoryCharge,
 }
 
-struct FlatNodeLocations {
-    rows: NodeLocationRows,
-    _charge: ControlledMemoryCharge,
+// Entries are populated by successful primary lookups. Four bitmap words
+// address 256 logical IDs without allocating slots for their missing IDs.
+#[derive(Default)]
+struct LocatorBlock {
+    occupied: [u64; 4],
+    roots: Vec<RowId>,
 }
 
-enum NodeLocationRows {
-    Sparse(Vec<(u64, RowId)>),
-    Dense { first: u64, slots: Vec<u64> },
+impl LocatorBlock {
+    fn position(&self, offset: u8) -> (usize, bool) {
+        let word = usize::from(offset / 64);
+        let bit = 1u64 << (offset % 64);
+        let prior = self.occupied[..word]
+            .iter()
+            .map(|bits| bits.count_ones())
+            .sum::<u32>();
+        let rank = prior + (self.occupied[word] & (bit - 1)).count_ones();
+        (rank as usize, self.occupied[word] & bit != 0)
+    }
 }
 
-impl FlatNodeLocations {
+impl NodeLocations {
     fn find(&self, id: u64) -> Option<RowId> {
-        match &self.rows {
-            NodeLocationRows::Sparse(rows) => {
-                let index = rows.binary_search_by_key(&id, |&(id, _)| id).ok()?;
-                Some(rows[index].1)
-            }
-            NodeLocationRows::Dense { first, slots } => {
-                let offset = usize::try_from(id.checked_sub(*first)?).ok()?;
-                let position = slots.get(offset)?.checked_sub(1)?;
-                Some(RowId {
-                    page_id: (position >> 16) as u32,
-                    slot_id: position as u16,
-                })
-            }
-        }
+        let block = self.blocks.get(&(id >> 8))?;
+        let (position, present) = block.position(id as u8);
+        present.then(|| block.roots[position])
     }
 
-    fn from_sorted(rows: Vec<(u64, RowId)>, mut charge: ControlledMemoryCharge) -> Self {
-        let rows = Self::dense_rows(&rows, &mut charge).unwrap_or(NodeLocationRows::Sparse(rows));
-        Self {
-            rows,
-            _charge: charge,
+    fn remember(&mut self, id: u64, row: RowId) {
+        let key = id >> 8;
+        // Includes the bitmap, vector header, key, and spare hash buckets.
+        if !self.blocks.contains_key(&key) {
+            let bytes = 128;
+            if bytes > LOCATOR_DIRECTORY_BYTES.saturating_sub(self.charge.bytes())
+                || !self.charge.try_grow_optional(bytes)
+            {
+                return;
+            }
         }
-    }
-
-    fn dense_rows(
-        rows: &[(u64, RowId)],
-        charge: &mut ControlledMemoryCharge,
-    ) -> Option<NodeLocationRows> {
-        let first = rows.first()?.0;
-        let slots_len = usize::try_from(rows.last()?.0 - first)
-            .ok()?
-            .checked_add(1)?;
-        let bytes = slots_len.checked_mul(std::mem::size_of::<u64>())?;
-        let sparse_bytes = charge.bytes();
-        if bytes > LOCATOR_DIRECTORY_BYTES
-            || bytes > sparse_bytes.saturating_mul(2)
-            || !charge.try_grow_optional(bytes)
-        {
-            return None;
+        let block = self.blocks.entry(key).or_default();
+        let offset = id as u8;
+        let (position, present) = block.position(offset);
+        if present {
+            return;
         }
-        let mut slots = Vec::new();
-        if slots.try_reserve_exact(slots_len).is_err() {
-            charge.shrink(bytes);
-            return None;
+        if block.roots.len() == block.roots.capacity() {
+            let extra = block.roots.capacity().clamp(4, 16);
+            let bytes = extra * std::mem::size_of::<RowId>();
+            if bytes > LOCATOR_DIRECTORY_BYTES.saturating_sub(self.charge.bytes())
+                || !self.charge.try_grow_optional(bytes)
+            {
+                return;
+            }
+            if block.roots.try_reserve_exact(extra).is_err() {
+                self.charge.shrink(bytes);
+                return;
+            }
         }
-        // Zero is a gap. Packed heap addresses use at most 48 bits.
-        slots.resize(slots_len, 0);
-        for &(id, row) in rows {
-            slots[(id - first) as usize] =
-                ((u64::from(row.page_id) << 16) | u64::from(row.slot_id)) + 1;
-        }
-        charge.shrink(sparse_bytes);
-        Some(NodeLocationRows::Dense { first, slots })
+        block.roots.insert(position, row);
+        block.occupied[usize::from(offset / 64)] |= 1u64 << (offset % 64);
     }
 }
 
 struct ProjectedPropertySnapshot {
     scn: u64,
-    field: String,
-    values: AhHashMap<RowId, Json>,
+    fields: AhHashMap<String, ProjectedField>,
     charge: ControlledMemoryCharge,
+}
+
+#[derive(Default)]
+struct ProjectedField {
+    integers: AhHashMap<(u32, u16), Box<IntegerSlots>>,
+    scalars: AhHashMap<RowId, Json>,
+}
+
+#[derive(Default)]
+struct IntegerSlots {
+    present: u32,
+    values: [i64; 32],
+}
+
+impl ProjectedField {
+    fn get(&self, row: RowId) -> Option<Json> {
+        let slot = usize::from(row.slot_id % 32);
+        if let Some(block) = self.integers.get(&(row.page_id, row.slot_id / 32)) {
+            if block.present & (1 << slot) != 0 {
+                return Some(Json::from(block.values[slot]));
+            }
+        }
+        self.scalars.get(&row).cloned()
+    }
+
+    fn remember(
+        &mut self,
+        row: RowId,
+        value: &Json,
+        charge: &mut ControlledMemoryCharge,
+        limit: usize,
+    ) {
+        let mut reserve = |bytes: usize| {
+            bytes <= limit.saturating_sub(charge.bytes()) && charge.try_grow_optional(bytes)
+        };
+        if let Some(number) = value.as_i64() {
+            let key = (row.page_id, row.slot_id / 32);
+            if !self.integers.contains_key(&key)
+                && !reserve(64 + std::mem::size_of::<IntegerSlots>())
+            {
+                return;
+            }
+            let block = self.integers.entry(key).or_default();
+            let slot = usize::from(row.slot_id % 32);
+            block.values[slot] = number;
+            block.present |= 1 << slot;
+        } else {
+            let bytes = projected_value_bytes(value);
+            if bytes <= 4096
+                && !value.is_object()
+                && !value.is_array()
+                && !self.scalars.contains_key(&row)
+                && reserve(bytes)
+            {
+                self.scalars.insert(row, value.clone());
+            }
+        }
+    }
 }
 
 struct AdjacencySnapshot {
@@ -231,6 +284,43 @@ impl AdjacencyBounds {
 
 type LabelKey = (u64, Vec<u8>);
 type LabelExtent = Option<(u64, u64)>;
+
+// One bit records whether the ID was probed. Another records membership.
+struct LabelMemberships {
+    scn: u64,
+    labels: AhHashMap<LabelKey, AhHashMap<u64, (u64, u64)>>,
+    charge: ControlledMemoryCharge,
+}
+
+impl LabelMemberships {
+    fn remember(&mut self, role: u64, label: &[u8], ids: &[u64], members: &AhHashSet<u64>) {
+        let limit =
+            (super::super::mem_budget::memory_target_bytes() / 128).clamp(1024 * 1024, 32 * MIB);
+        let key = (role, label.to_vec());
+        let bytes = 128 + label.len();
+        if !self.labels.contains_key(&key)
+            && (bytes > limit.saturating_sub(self.charge.bytes())
+                || !self.charge.try_grow_optional(bytes))
+        {
+            return;
+        }
+        let blocks = self.labels.entry(key).or_default();
+        for &id in ids {
+            let block = id / 64;
+            if !blocks.contains_key(&block)
+                && (self.charge.bytes() + 64 > limit || !self.charge.try_grow_optional(64))
+            {
+                continue;
+            }
+            let masks = blocks.entry(block).or_default();
+            let bit = 1 << (id % 64);
+            masks.0 |= bit;
+            if members.contains(&id) {
+                masks.1 |= bit;
+            }
+        }
+    }
+}
 
 struct LabelBoundsSnapshot {
     scn: u64,
@@ -314,21 +404,8 @@ impl GraphReadCache {
         let Some(mut locations) = self.locations.try_write() else {
             return;
         };
-        if self.flat_locations.get().is_some_and(Option::is_some) {
-            return;
-        }
-        // Allow for the hash table's spare capacity and growth.
-        const ENTRY_BYTES: usize = 64;
-        let mut remaining = LOCATOR_DIRECTORY_BYTES.saturating_sub(locations.charge.bytes());
         for (id, row) in rows {
-            if remaining < ENTRY_BYTES || locations.rows.contains_key(&id) {
-                continue;
-            }
-            if !locations.charge.try_grow_optional(ENTRY_BYTES) {
-                break;
-            }
-            locations.rows.insert(id, row);
-            remaining -= ENTRY_BYTES;
+            locations.remember(id, row);
         }
     }
 
@@ -353,25 +430,13 @@ impl GraphReadCache {
         items: &[&(RowId, Json)],
         limit: usize,
     ) {
-        if slot.try_read().is_some_and(|state| {
-            state.as_ref().is_some_and(|cache| {
-                cache.scn == scn
-                    && cache.field == field
-                    && limit.saturating_sub(cache.charge.bytes()) < 80
-            })
-        }) {
-            return;
-        }
         let Some(mut slot) = slot.try_write() else {
             return;
         };
         if slot.as_ref().is_some_and(|cache| cache.scn > scn) {
             return;
         }
-        if slot
-            .as_ref()
-            .is_none_or(|cache| cache.scn != scn || cache.field != field)
-        {
+        if slot.as_ref().is_none_or(|cache| cache.scn != scn) {
             let Some(charge) =
                 ControlledMemoryCharge::try_new_optional(ControlledMemoryCategory::DerivedCache, 0)
             else {
@@ -379,35 +444,25 @@ impl GraphReadCache {
             };
             *slot = Some(ProjectedPropertySnapshot {
                 scn,
-                field: field.to_owned(),
-                values: ah_hash_map(),
+                fields: ah_hash_map(),
                 charge,
             });
         }
-        let cache = slot.as_mut().expect("property snapshot was initialized");
-        let mut available = limit.saturating_sub(cache.charge.bytes());
-        let mut bytes = 0;
-        let mut additions = SmallVec::<[(RowId, &Json); 128]>::new();
-        for &(row, value) in items {
-            let reserve = projected_value_bytes(value);
-            if reserve > available
-                || reserve > 4096
-                || value.is_object()
-                || value.is_array()
-                || cache.values.contains_key(row)
+        let cache = slot.as_mut().expect("initialized projected fields");
+        if !cache.fields.contains_key(field) {
+            let bytes = 192 + field.len();
+            if bytes > limit.saturating_sub(cache.charge.bytes())
+                || !cache.charge.try_grow_optional(bytes)
             {
-                continue;
+                return;
             }
-            available -= reserve;
-            bytes += reserve;
-            additions.push((*row, value));
+            cache
+                .fields
+                .insert(field.to_owned(), ProjectedField::default());
         }
-        if bytes > 0 && cache.charge.try_grow_optional(bytes) {
-            cache.values.extend(
-                additions
-                    .into_iter()
-                    .map(|(row, value)| (row, value.clone())),
-            );
+        let column = cache.fields.get_mut(field).expect("initialized field");
+        for &(row, value) in items {
+            column.remember(*row, value, &mut cache.charge, limit);
         }
     }
 
@@ -521,7 +576,7 @@ impl NodeLocatorCache {
     }
 
     fn directory(&self, store: &GraphStore<'_>) -> Option<Arc<GraphReadCache>> {
-        if store.txn.txn_id != 0 {
+        if !store.share_read_snapshot {
             return None;
         }
         let same_graph = |entry: &&LocatorEntry| {
@@ -539,14 +594,14 @@ impl NodeLocatorCache {
         let charge =
             ControlledMemoryCharge::try_new_optional(ControlledMemoryCategory::DerivedCache, 0)?;
         let directory = Arc::new(GraphReadCache {
+            packed: Default::default(),
             locations: parking_lot::RwLock::new(NodeLocations {
-                rows: ah_hash_map(),
+                blocks: ah_hash_map(),
                 charge,
             }),
-            flat_locations: std::sync::OnceLock::new(),
-            location_builder: parking_lot::Mutex::new(()),
             projected: Default::default(),
             adjacency: Default::default(),
+            memberships: Default::default(),
             label_bounds: Default::default(),
             index_definitions: parking_lot::RwLock::default(),
             indexed_nodes: parking_lot::RwLock::default(),
@@ -654,13 +709,51 @@ impl NeighborBuffer {
     }
 }
 
+#[derive(Default, Debug)]
+struct TraversalCounters {
+    edge_candidates: std::sync::atomic::AtomicU64,
+    label_probes: std::sync::atomic::AtomicU64,
+    projection_hits: std::sync::atomic::AtomicU64,
+    heap_page_visits: std::sync::atomic::AtomicU64,
+    predicate_survivors: std::sync::atomic::AtomicU64,
+}
+
+struct TraversalProfile {
+    connection: u64,
+    counters: Option<Box<TraversalCounters>>,
+}
+
+impl TraversalProfile {
+    fn new(connection: u64) -> Self {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let enabled = *ENABLED.get_or_init(|| {
+            std::env::var_os("MYDB_GRAPH_PROFILE").as_deref() == Some(std::ffi::OsStr::new("1"))
+        });
+        Self {
+            connection,
+            counters: enabled.then(Box::default),
+        }
+    }
+}
+
+impl Drop for TraversalProfile {
+    fn drop(&mut self) {
+        if let Some(value) = &self.counters {
+            eprintln!("[graph-profile] connection={} {:?}", self.connection, value);
+        }
+    }
+}
+
 pub(super) struct GraphStore<'a> {
     db: &'a Arc<Database>,
     table: Arc<TableSchema>,
     name: String,
     pub txn: TxnView,
+    share_read_snapshot: bool,
     read_cache: std::sync::OnceLock<Option<Arc<GraphReadCache>>>,
     nodes: AhHashMap<u64, Option<ElementRef>>,
+    packed: packed::StatementProjection,
+    profile: TraversalProfile,
     projection_payloads: AhHashMap<RowId, Value>,
     projected_property: Option<String>,
     projected_values: AhHashMap<RowId, Json>,
@@ -820,13 +913,19 @@ impl<'a> GraphStore<'a> {
         txn: TxnView,
     ) -> Result<Self, QueryError> {
         let name = table.qualified_name();
+        let share_read_snapshot = !txn.historical
+            && !txn.dirty_read
+            && (txn.txn_id == 0 || (txn.read_only && db.transaction_is_read_only(txn.txn_id)));
         Ok(Self {
             db,
             table,
             name,
             txn,
+            share_read_snapshot,
             read_cache: std::sync::OnceLock::new(),
             nodes: ah_hash_map(),
+            packed: Default::default(),
+            profile: TraversalProfile::new(txn.connection_id as u64),
             projection_payloads: ah_hash_map(),
             projected_property: None,
             projected_values: ah_hash_map(),
@@ -955,9 +1054,7 @@ impl<'a> GraphStore<'a> {
     fn visible_node_root(&self, id: u64) -> Result<Option<ElementRef>, QueryError> {
         if let Some(row) = self
             .read_cache()
-            .and_then(|cache| cache.flat_locations.get())
-            .and_then(Option::as_ref)
-            .and_then(|locations| locations.find(id))
+            .and_then(|cache| cache.locations.try_read()?.find(id))
         {
             return Ok(Some(ElementRef {
                 id,
@@ -1004,89 +1101,6 @@ impl<'a> GraphStore<'a> {
         )
     }
 
-    fn build_flat_node_locations(&self) -> Result<Option<FlatNodeLocations>, QueryError> {
-        let Some(mut charge) =
-            ControlledMemoryCharge::try_new_optional(ControlledMemoryCategory::DerivedCache, 0)
-        else {
-            return Ok(None);
-        };
-        let bound = Some(IndexBound {
-            key: IndexKey(smallvec![KeyPart::UInt(NODE)]),
-            inclusive: true,
-        });
-        let mut cursor = self.db.range_index_snapshot_cursor(
-            &self.table,
-            self.index("g_out"),
-            bound.clone(),
-            bound,
-            self.txn,
-        )?;
-        let mut rows: Vec<(u64, RowId)> = Vec::new();
-        loop {
-            crate::engine::cancel::check_cancelled()?;
-            let (entries, page_bound) = cursor.next_leaf_chunk(4096)?;
-            if entries.is_empty() {
-                break;
-            }
-            let needed = rows.len() + entries.len();
-            if needed > rows.capacity() {
-                let fresh = (needed - rows.capacity()).max(16_384);
-                let size = std::mem::size_of::<(u64, RowId)>();
-                if (rows.capacity() + fresh) * size > LOCATOR_DIRECTORY_BYTES
-                    || !charge.try_grow_optional(fresh * size)
-                    || rows
-                        .try_reserve_exact(rows.capacity() - rows.len() + fresh)
-                        .is_err()
-                {
-                    return Ok(None);
-                }
-            }
-            let visible = self.index_visibility_mask(
-                "g_out",
-                page_bound,
-                entries.iter().map(|(_, row)| Ok(*row)),
-            )?;
-            for (slot, (key, row)) in entries.into_iter().enumerate() {
-                if visible.as_ref().is_some_and(|mask| !mask[slot]) {
-                    continue;
-                }
-                let [KeyPart::UInt(NODE), _, _, KeyPart::UInt(id)] = key.0.as_slice() else {
-                    return Err(invalid("Invalid node locator index key"));
-                };
-                rows.push((*id, row));
-            }
-        }
-        // Snapshot repairs can introduce out-of-order entries between chunks.
-        rows.sort_unstable_by_key(|&(id, _)| id);
-        rows.dedup_by_key(|(id, _)| *id);
-        Ok(Some(FlatNodeLocations::from_sorted(rows, charge)))
-    }
-
-    fn promote_node_locations(
-        &self,
-        cache: &GraphReadCache,
-        probes: usize,
-    ) -> Result<(), QueryError> {
-        if probes < LOCATOR_BUILD_MIN_PROBES || cache.flat_locations.get().is_some() {
-            return Ok(());
-        }
-        let Some(_builder) = cache.location_builder.try_lock() else {
-            return Ok(());
-        };
-        if cache.flat_locations.get().is_none() {
-            let flat = self.build_flat_node_locations()?;
-            let promoted = flat.is_some();
-            let _ = cache.flat_locations.set(flat);
-            if promoted {
-                let mut locations = cache.locations.write();
-                locations.rows = ah_hash_map();
-                let used = locations.charge.bytes();
-                locations.charge.shrink(used);
-            }
-        }
-        Ok(())
-    }
-
     // Every reached ID is already known to be a visible node in this view:
     // edge insert and endpoint delete serialize, and their changes publish
     // through the same transaction. The primary index only supplies row IDs.
@@ -1109,20 +1123,10 @@ impl<'a> GraphStore<'a> {
             window.sort_unstable();
             window.dedup();
             if let Some(cache) = &directory {
-                self.promote_node_locations(cache, window.len())?;
-                let flat = cache.flat_locations.get().and_then(Option::as_ref);
-                let locations = if flat.is_none() {
-                    cache.locations.try_read()
-                } else {
-                    None
-                };
+                let locations = cache.locations.try_read();
                 let before = window.len();
                 window.retain(|&id| {
-                    let row = flat.and_then(|flat| flat.find(id)).or_else(|| {
-                        locations
-                            .as_ref()
-                            .and_then(|locations| locations.rows.get(&id).copied())
-                    });
+                    let row = locations.as_ref().and_then(|locations| locations.find(id));
                     let Some(row) = row else {
                         return true;
                     };
@@ -1147,7 +1151,7 @@ impl<'a> GraphStore<'a> {
                 .collect();
             let index = self.index("PRIMARY");
             if window.len() <= MAX_ORDERED_ROOTS {
-                if let Some((roots, _)) = self.db.lookup_prefixes_prefetched(
+                if let Some((roots, _)) = self.db.lookup_exact_rows_prefetched(
                     &self.table,
                     index,
                     &keys,
@@ -1156,21 +1160,18 @@ impl<'a> GraphStore<'a> {
                 )? {
                     self.charge(roots.len() * 64)?;
                     if let Some(directory) = &directory {
-                        directory.remember_locations(roots.iter().filter_map(|(key, row)| {
-                            match key.0.as_slice() {
-                                [KeyPart::UInt(id)] => Some((*id, *row)),
-                                _ => None,
-                            }
-                        }));
+                        directory.remember_locations(
+                            roots
+                                .iter()
+                                .map(|&(slot, row)| (window[slot as usize], row)),
+                        );
                     }
-                    for (key, row) in roots {
-                        let [KeyPart::UInt(id)] = key.0.as_slice() else {
-                            return Err(invalid("Invalid node primary index key"));
-                        };
+                    for (slot, row) in roots {
+                        let id = window[slot as usize];
                         self.nodes.insert(
-                            *id,
+                            id,
                             Some(ElementRef {
-                                id: *id,
+                                id,
                                 role: NODE,
                                 row,
                             }),
@@ -1213,12 +1214,28 @@ impl<'a> GraphStore<'a> {
         Ok(())
     }
 
+    pub fn record_survivors(&self, count: usize) {
+        if let Some(c) = &self.profile.counters {
+            c.predicate_survivors
+                .fetch_add(count as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    pub fn projection_has_all(&self, row: RowId, fields: &[&str]) -> bool {
+        !self.packed.is_empty() && fields.iter().all(|name| self.packed.has_field(row, name))
+    }
+
     pub fn preload_projection(
         &mut self,
         mut ids: Vec<RowId>,
         field: Option<&str>,
     ) -> Result<(), QueryError> {
         self.clear_projection();
+        if let Some(name) = field {
+            if !self.packed.is_empty() {
+                ids.retain(|id| !self.packed.has_field(*id, name));
+            }
+        }
         let cache_limit = self.projection_charge.remaining().min(2 * 1024 * 1024);
         let min_batch = if field.is_some() { 2 } else { 8 };
         if ids.len() < min_batch || cache_limit == 0 {
@@ -1237,6 +1254,12 @@ impl<'a> GraphStore<'a> {
         // Read heap pages in physical order, then evaluate expressions in the
         // original result order. Duplicated paths share a single payload read.
         for window in ids.chunks(128) {
+            if let Some(c) = &self.profile.counters {
+                let pages = window.chunk_by(|a, b| a.page_id == b.page_id).count();
+                c.heap_page_visits
+                    .fetch_add(pages as u64, std::sync::atomic::Ordering::Relaxed);
+            }
+
             crate::engine::cancel::check_cancelled()?;
             let rows = self.db.read_row_columns_many_with_handle(
                 &heap,
@@ -1288,10 +1311,10 @@ impl<'a> GraphStore<'a> {
                                 shards[shard] = directory.projected[shard].try_read();
                             }
                             let cache = shards[shard].as_ref()?.as_ref()?;
-                            if cache.scn != scn || cache.field != field {
+                            if cache.scn != scn {
                                 return None;
                             }
-                            cache.values.get(id).map(|value| (*id, value.clone()))
+                            cache.fields.get(field)?.get(*id).map(|value| (*id, value))
                         })
                         .collect::<Vec<_>>()
                 };
@@ -1304,6 +1327,12 @@ impl<'a> GraphStore<'a> {
         // Scalar predicates borrow the JSON bytes. Give each ordered page
         // read a wider set of positions without accumulating whole payloads.
         for window in ids.chunks(512) {
+            if let Some(c) = &self.profile.counters {
+                let pages = window.chunk_by(|a, b| a.page_id == b.page_id).count();
+                c.heap_page_visits
+                    .fetch_add(pages as u64, std::sync::atomic::Ordering::Relaxed);
+            }
+
             crate::engine::cancel::check_cancelled()?;
             let mut inline = Vec::new();
             self.db.visit_inline_json_rows(
@@ -1372,6 +1401,9 @@ impl<'a> GraphStore<'a> {
     }
 
     pub fn property(&self, element: ElementRef, name: &str) -> Result<Json, QueryError> {
+        if let Some(value) = self.packed.property(element.row, name) {
+            return Ok(value);
+        }
         if self.projected_property.as_deref() == Some(name) {
             if let Some(value) = self.projected_values.get(&element.row) {
                 return Ok(value.clone());
@@ -1440,6 +1472,32 @@ impl<'a> GraphStore<'a> {
         ids.sort_unstable();
         ids.dedup();
         let mut members = ah_hash_set();
+        let directory = self
+            .read_cache()
+            .filter(|_| !self.txn.historical && ids.len() >= 16);
+        if let Some(slot) = directory.and_then(|cache| cache.memberships.try_read()) {
+            if let Some(blocks) = slot
+                .as_ref()
+                .filter(|s| s.scn == self.txn.snapshot_scn)
+                .and_then(|s| s.labels.get(&(role, label.clone())))
+            {
+                ids.retain(|id| {
+                    let bit = 1 << (id % 64);
+                    if let Some((known, yes)) = blocks.get(&(id / 64)) {
+                        if known & bit != 0 {
+                            if yes & bit != 0 {
+                                members.insert(*id);
+                            }
+                            return false;
+                        }
+                    }
+                    true
+                });
+            }
+        }
+        if ids.is_empty() {
+            return Ok(members);
+        }
         let filtered = if ids.len() >= 64 {
             match self.label_extent(role, &label)? {
                 Some(None) => return Ok(members),
@@ -1453,6 +1511,10 @@ impl<'a> GraphStore<'a> {
         } else {
             &ids
         };
+        if let Some(c) = &self.profile.counters {
+            c.label_probes
+                .fetch_add(filtered.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
         for window in filtered.chunks(1024) {
             crate::engine::cancel::check_cancelled()?;
             if window.len() >= 16 && !self.txn.historical {
@@ -1494,6 +1556,29 @@ impl<'a> GraphStore<'a> {
                 if self.has_label_id(role, id, &label)? {
                     members.insert(id);
                 }
+            }
+        }
+        if let Some(mut slot) = directory.and_then(|cache| cache.memberships.try_write()) {
+            if slot
+                .as_ref()
+                .is_none_or(|cache| cache.scn < self.txn.snapshot_scn)
+            {
+                if let Some(charge) = ControlledMemoryCharge::try_new_optional(
+                    ControlledMemoryCategory::DerivedCache,
+                    0,
+                ) {
+                    *slot = Some(LabelMemberships {
+                        scn: self.txn.snapshot_scn,
+                        labels: ah_hash_map(),
+                        charge,
+                    });
+                }
+            }
+            if let Some(cache) = slot
+                .as_mut()
+                .filter(|cache| cache.scn == self.txn.snapshot_scn)
+            {
+                cache.remember(role, &label, filtered, &members);
             }
         }
         Ok(members)
@@ -2047,6 +2132,7 @@ impl<'a> GraphStore<'a> {
                     *anchor,
                     LabeledNeighbor {
                         edge: *edge,
+                        role,
                         node: *node,
                     },
                     row,
@@ -2138,6 +2224,10 @@ impl<'a> GraphStore<'a> {
         if examined > remaining {
             return Err(too_many());
         }
+        if let Some(c) = &self.profile.counters {
+            c.edge_candidates
+                .fetch_add(examined as u64, std::sync::atomic::Ordering::Relaxed);
+        }
         self.edges_examined += examined;
         self.charge(examined * std::mem::size_of::<LabeledNeighbor>())?;
         Ok(found
@@ -2146,9 +2236,51 @@ impl<'a> GraphStore<'a> {
             .collect())
     }
 
+    // Visible label memberships prove the logical edge exists. Its immutable
+    // primary key supplies the heap root for reads in the same snapshot.
+    pub fn labeled_edge_roots(
+        &self,
+        edges: impl Iterator<Item = LabeledNeighbor>,
+    ) -> Result<AhHashMap<u64, ElementRef>, QueryError> {
+        let mut ids: Vec<_> = edges.map(|edge| (edge.edge, edge.role)).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        let keys: Vec<_> = ids
+            .iter()
+            .map(|(id, _)| IndexKey(smallvec![KeyPart::UInt(*id)]))
+            .collect();
+        let mut roots = ah_hash_map();
+        if let Some((rows, _)) = self.db.lookup_exact_rows_prefetched(
+            &self.table,
+            self.index("PRIMARY"),
+            &keys,
+            self.txn,
+            ids.len(),
+        )? {
+            for (slot, row) in rows {
+                let (id, role) = ids[slot as usize];
+                roots.insert(id, ElementRef { id, role, row });
+            }
+        } else {
+            for (id, _) in &ids {
+                if let Some(edge) = self.lookup_at(*id, self.txn)? {
+                    roots.insert(*id, edge);
+                }
+            }
+        }
+        if roots.len() != ids.len() {
+            return Err(invalid("Missing heap root for a visible labeled edge"));
+        }
+        Ok(roots)
+    }
+
     pub fn account_adjacency_batch(&mut self, batch: &AdjacentBatch) -> Result<(), QueryError> {
         if batch.examined > MAX_EDGES - self.edges_examined {
             return Err(invalid("GQL adjacency examination limit exceeded"));
+        }
+        if let Some(c) = &self.profile.counters {
+            c.edge_candidates
+                .fetch_add(batch.examined as u64, std::sync::atomic::Ordering::Relaxed);
         }
         self.edges_examined += batch.examined;
         self.charge(batch.examined * std::mem::size_of::<Neighbor>())
@@ -2194,6 +2326,10 @@ impl<'a> GraphStore<'a> {
                     break;
                 }
                 batch_size = 256;
+                if let Some(c) = &self.profile.counters {
+                    c.edge_candidates
+                        .fetch_add(entries.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                }
                 self.edges_examined += entries.len();
                 if self.edges_examined > MAX_EDGES {
                     return Err(invalid("GQL adjacency examination limit exceeded"));
@@ -2362,6 +2498,7 @@ impl<'a> GraphStore<'a> {
         if element(&current)? != entry {
             return Err(invalid("Graph element identity changed"));
         }
+        self.invalidate_projection(entry.id)?;
         let mut props = payload(&current.values[PAYLOAD])?;
         let mut labels = self.labels_for(entry, self.current())?;
         if label {
@@ -2463,6 +2600,7 @@ impl<'a> GraphStore<'a> {
             }
             self.nodes.remove(&entry.id);
         }
+        self.invalidate_projection(entry.id)?;
         self.delete_labels(entry)?;
         self.delete_row(entry.row)
     }
@@ -2474,6 +2612,7 @@ impl<'a> GraphStore<'a> {
             edge.row,
             crate::storage::LockMode::Exclusive,
         )?;
+        self.invalidate_projection(edge.id)?;
         self.delete_labels(edge)?;
         self.delete_row(edge.row)?;
         Ok(())
@@ -2661,5 +2800,74 @@ impl<'a> GraphStore<'a> {
         }
         self.delete_row(record.row_id)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+
+    #[test]
+    fn property_graph_lazy_locators_cover_sparse_ids_and_bitmap_boundaries() {
+        let mut map = NodeLocations {
+            blocks: ah_hash_map(),
+            charge: ControlledMemoryCharge::try_new_optional(
+                ControlledMemoryCategory::DerivedCache,
+                0,
+            )
+            .unwrap(),
+        };
+        let ids = [u64::MAX, 256, 64, 2, 0, 127, 63, 255, 128, 192, 191, 65536];
+        for (i, id) in ids.into_iter().enumerate() {
+            map.remember(
+                id,
+                RowId {
+                    page_id: i as u32,
+                    slot_id: u16::MAX,
+                },
+            );
+        }
+        for (i, id) in ids.into_iter().enumerate() {
+            map.remember(
+                id,
+                RowId {
+                    page_id: u32::MAX,
+                    slot_id: 0,
+                },
+            );
+            assert_eq!(
+                map.find(id),
+                Some(RowId {
+                    page_id: i as u32,
+                    slot_id: u16::MAX
+                })
+            );
+        }
+        for id in [1, 65, 126, 129, 257, u64::MAX - 1] {
+            assert_eq!(map.find(id), None);
+        }
+    }
+
+    #[test]
+    fn property_graph_shared_read_cache_requires_a_read_only_transaction_slot() {
+        let path = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        let db = Arc::new(Database::open(path.path()).unwrap());
+        let name = "test.__mydb_graph_visibility";
+        create(&db, name).unwrap();
+        let table = db.graph_descriptor(name).unwrap();
+        let read = db.begin_read_only_txn().unwrap();
+        let writer = db.begin_txn().unwrap();
+        for (id, expected) in [(read.txn_id, true), (writer.txn_id, false)] {
+            let view = db.session_statement_view(
+                id,
+                IsolationLevel::RepeatableRead,
+                Some(read.snapshot_scn),
+            );
+            assert!(view.read_only);
+            let store = GraphStore::new(&db, table.clone(), view).unwrap();
+            assert_eq!(store.read_cache().is_some(), expected);
+        }
+        db.rollback_txn(writer.txn_id).unwrap();
+        db.rollback_txn(read.txn_id).unwrap();
     }
 }

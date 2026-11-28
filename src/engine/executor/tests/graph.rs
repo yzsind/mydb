@@ -607,6 +607,11 @@ fn property_graph_labeled_adjacency_replays_committed_wal() {
         let engine = open_strict_test_engine(std::path::Path::new(&path));
         let session = &mut SessionContext::default();
         labeled_graph_fixture(&engine, session);
+        query(
+            &engine,
+            session,
+            "CREATE GRAPH PROJECTION crash_nodes ON kg NODE LABEL N (k,v)",
+        );
         engine.database_for_replication().checkpoint().unwrap();
         query(&engine, session, "BEGIN");
         query(
@@ -619,6 +624,7 @@ fn property_graph_labeled_adjacency_replays_committed_wal() {
             session,
             "MATCH (a:N {k:0}), (c:N {k:2}) INSERT (a)~[:Red & Blue]~(c)",
         );
+        query(&engine, session, "MATCH (n:N {k:2}) SET n.v=7");
         query(&engine, session, "COMMIT");
         query(&engine, session, "BEGIN");
         query(
@@ -626,6 +632,7 @@ fn property_graph_labeled_adjacency_replays_committed_wal() {
             session,
             "MATCH (a:N {k:0}), (b:N {k:1}) INSERT (a)-[:Red & Blue]->(b)",
         );
+        query(&engine, session, "MATCH (n:N {k:2}) SET n.v=9");
         std::process::exit(86);
     }
 
@@ -642,6 +649,7 @@ fn property_graph_labeled_adjacency_replays_committed_wal() {
     let engine = open_strict_test_engine(tmp.path());
     let session = &mut SessionContext::default();
     query(&engine, session, "SESSION SET GRAPH kg");
+    assert_eq!(rows(&engine,session,"FOR k IN [0,0,0,0,0,0,0,0] MATCH (:N {k:k})~[:Blue & Red]~(n:N WHERE n.v = 7) RETURN COUNT(n)"),vec![vec![Value::Int(8)]]);
     assert!(labeled_endpoints(&engine, session, "(:N {k:0})-[:Blue & Red]->(b)").is_empty());
     assert_eq!(
         labeled_endpoints(&engine, session, "(:N {k:0})~[:Blue & Red]~(b)"),
@@ -651,4 +659,179 @@ fn property_graph_labeled_adjacency_replays_committed_wal() {
         labeled_endpoints(&engine, session, "(:N {k:2})~[:Blue & Red]~(b)"),
         vec![Value::Int(0)]
     );
+}
+
+#[test]
+fn property_graph_covering_fields_count_and_late_projection() {
+    let tmp = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let engine = open_strict_test_engine(tmp.path());
+    let session = &mut SessionContext::default();
+    let writer = &mut SessionContext::default();
+    writer.connection_id = 72;
+    open_graph(&engine, session);
+    query(&engine, writer, "SESSION SET GRAPH kg");
+    query(&engine, session, "INSERT (:Root {k:1})");
+    for id in 0..32 {
+        let group = id % 3;
+        query(&engine, session, &format!("MATCH (a:Root) INSERT (b:N {{k:{id}, g:{group}, text:'v{id}'}}), (a)-[:E {{w:{id}}}]->(b)"));
+    }
+    let read = "MATCH (:Root)-[e:E WHERE e.w >= 1]->(b:N WHERE b.k < 31) RETURN CAST(b.g AS INT64) AS g, COUNT(e) AS c ORDER BY c DESC, g";
+    let top = "MATCH (:Root)-[e:E]->(b:N) RETURN CAST(b.text AS STRING) AS txt, CAST(b.k AS INT64) AS k ORDER BY b.g DESC, k LIMIT 4";
+    let expected = rows(&engine, session, read);
+    assert_eq!(
+        expected,
+        vec![
+            vec![Value::Int(0), Value::Int(10)],
+            vec![Value::Int(1), Value::Int(10)],
+            vec![Value::Int(2), Value::Int(10)]
+        ]
+    );
+    let expected_top = rows(&engine, session, top);
+    assert_eq!(
+        expected_top
+            .iter()
+            .map(|r| r[1].clone())
+            .collect::<Vec<_>>(),
+        vec![Value::Int(2), Value::Int(5), Value::Int(8), Value::Int(11)]
+    );
+    query(
+        &engine,
+        session,
+        "CREATE GRAPH PROJECTION nums ON kg NODE LABEL N (k,g,text)",
+    );
+    query(
+        &engine,
+        session,
+        "CREATE GRAPH PROJECTION weights ON kg EDGE LABEL E (w)",
+    );
+    assert_eq!(rows(&engine, session, read), expected);
+    assert_eq!(rows(&engine, session, top), expected_top);
+    assert_eq!(
+        rows(&engine, session, "MATCH (b:Missing) RETURN COUNT(*)"),
+        vec![vec![Value::Int(0)]]
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            session,
+            "MATCH (a:Root) OPTIONAL MATCH (a)-[e:Absent]->(b) RETURN COUNT(*), COUNT(e)"
+        ),
+        vec![vec![Value::Int(1), Value::Int(0)]]
+    );
+    query(
+        &engine,
+        session,
+        "SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ",
+    );
+    query(&engine, session, "START TRANSACTION READ ONLY");
+    assert_eq!(rows(&engine, session, read), expected);
+    query(&engine, writer, "BEGIN");
+    query(&engine, writer, "SAVEPOINT mark");
+    query(&engine, writer, "MATCH (b:N {k:2}) REMOVE b:N");
+    query(&engine, writer, "ROLLBACK TO mark");
+    query(&engine, writer, "MATCH (b:N {k:2}) SET b.g=8");
+    assert_ne!(rows(&engine, writer, read), expected);
+    assert_eq!(rows(&engine, session, read), expected);
+    query(&engine, writer, "COMMIT");
+    assert_eq!(rows(&engine, session, read), expected);
+    query(&engine, session, "COMMIT");
+    let updated = rows(&engine, session, read);
+    assert_ne!(updated, expected);
+    query(&engine, session, "DROP GRAPH PROJECTION nums ON kg");
+    query(&engine, session, "DROP GRAPH PROJECTION weights ON kg");
+    assert_eq!(rows(&engine, session, read), updated);
+    query(&engine, session, "MATCH (b:N) SET b.text=b.k");
+    query(&engine, session, "MATCH (b:N {k:31}) SET b.text='bad'");
+    assert!(engine
+        .execute_with_session(
+            session,
+            "MATCH (:Root)-[:E]->(b:N) RETURN CAST(b.text AS INT64) ORDER BY b.k LIMIT 1"
+        )
+        .is_err());
+}
+
+#[test]
+fn property_graph_projected_multigraph_matches_unpacked_after_restart() {
+    let tmp = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let reads = [
+        "MATCH (a:N)-[e:R WHERE e.w >= 2]->(b:N) RETURN CAST(a.k AS INT64) AS a, CAST(b.k AS INT64) AS b, CAST(e.w AS INT64) AS w ORDER BY a,b,w",
+        "MATCH (a:N)<-[e:R]-(b:N WHERE b.k < 12) RETURN CAST(a.k AS INT64) AS a, COUNT(e) AS n ORDER BY n DESC,a",
+        "MATCH (a:N)-[e:R]-(b:N) RETURN CAST(e.w AS INT64) AS w, CAST(b.k AS INT64) AS k ORDER BY w DESC,k LIMIT 7",
+    ];
+    let expected = {
+        let engine = open_strict_test_engine(tmp.path());
+        let session = &mut SessionContext::default();
+        open_graph(&engine, session);
+        query(
+            &engine,
+            session,
+            "CREATE UNIQUE GRAPH INDEX nk ON kg NODE LABEL N (k INT64)",
+        );
+        for i in 0..20 {
+            query(&engine, session, &format!("INSERT (:N {{k:{i}}})"));
+        }
+        let mut seed = 7u64;
+        for i in 0..120 {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let a = (seed >> 32) % 20;
+            let b = if i % 9 == 0 { a } else { (seed >> 18) % 20 };
+            let w = i % 5;
+            query(
+                &engine,
+                session,
+                &format!("MATCH (a:N {{k:{a}}}), (b:N {{k:{b}}}) INSERT (a)-[:R {{w:{w}}}]->(b)"),
+            );
+        }
+        let before = reads.map(|sql| rows(&engine, session, sql));
+        query(
+            &engine,
+            session,
+            "CREATE GRAPH PROJECTION pn ON kg NODE LABEL N (k)",
+        );
+        query(
+            &engine,
+            session,
+            "CREATE GRAPH PROJECTION pr ON kg EDGE LABEL R (w)",
+        );
+        assert_eq!(reads.map(|sql| rows(&engine, session, sql)), before);
+        before
+    };
+    let engine = open_strict_test_engine(tmp.path());
+    let session = &mut SessionContext::default();
+    query(&engine, session, "SESSION SET GRAPH kg");
+    assert_eq!(reads.map(|sql| rows(&engine, session, sql)), expected);
+    query(&engine, session, "MATCH (n:N {k:3}) DETACH DELETE n");
+    let changed = reads.map(|sql| rows(&engine, session, sql));
+    assert_ne!(changed, expected);
+    query(&engine, session, "DROP GRAPH PROJECTION pn ON kg");
+    query(&engine, session, "DROP GRAPH PROJECTION pr ON kg");
+    assert_eq!(reads.map(|sql| rows(&engine, session, sql)), changed);
+}
+
+#[test]
+fn property_graph_optional_join_counts_zero_and_parallel_paths() {
+    let tmp = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let engine = open_strict_test_engine(tmp.path());
+    let session = &mut SessionContext::default();
+    open_graph(&engine, session);
+    query(&engine,session,"INSERT (p:Member), (a:Club {k:1}), (b:Club {k:2}), (x:Article), (y:Article),
+        (p)-[:JOINS]->(a), (p)-[:JOINS]->(b), (p)-[:WRITES]->(x), (p)-[:WRITES]->(x), (p)-[:WRITES]->(y),
+        (x)-[:IN]->(a), (y)-[:IN]->(a)");
+    let pattern =
+        "MATCH (p:Member)-[:JOINS]->(f:Club) OPTIONAL MATCH (p)-[:WRITES]->(m:Article)-[:IN]->(f)
+        RETURN CAST(f.k AS INT64) AS k, COUNT(m), COUNT(*) ORDER BY k";
+    for n in [1i64, 24] {
+        let input = (0..n).map(|i| i.to_string()).collect::<Vec<_>>().join(",");
+        assert_eq!(
+            rows(
+                &engine,
+                session,
+                &format!("FOR seed IN [{input}] {pattern}")
+            ),
+            vec![
+                vec![Value::Int(1), Value::Int(3 * n), Value::Int(3 * n)],
+                vec![Value::Int(2), Value::Int(0), Value::Int(n)]
+            ]
+        );
+    }
 }

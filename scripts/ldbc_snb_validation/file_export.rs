@@ -165,8 +165,12 @@ fn export_shard(
     let mut visit = |v: &[Value]| -> io::Result<()> {
         let id = element_id(&v[0])?;
         let role = number(&v[1]) as usize;
-        counts[role] += 1;
         max_id = max_id.max(id);
+        // Projection metadata shares the ID sequence with graph elements.
+        if matches!(role, 7 | 8) {
+            return Ok(());
+        }
+        *counts.get_mut(role).ok_or_else(|| io::Error::other("Unknown graph storage role"))? += 1;
         match role {
             0 => {
                 max_node_id = max_node_id.max(id);

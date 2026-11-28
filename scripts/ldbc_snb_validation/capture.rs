@@ -282,7 +282,10 @@ fn capture_updates(
     let exported = start.elapsed();
     let db = engine.database_for_replication();
     let wal = db.wal_log();
-    let next_lsn = wal.lock().next_lsn();
+    let (next_lsn, initial_wal_bytes) = {
+        let log = wal.lock();
+        (log.next_lsn(), log.stats().physical_write_bytes)
+    };
     let mut reader =
         WalReader::open(&wal, next_lsn).map_err(|e| format!("open WAL reader: {e:?}"))?;
     let mut session = SessionContext::default();
@@ -336,11 +339,12 @@ fn capture_updates(
     }
     ledger.flush()?;
     let committed = start.elapsed();
+    let wal_bytes = wal.lock().stats().physical_write_bytes.saturating_sub(initial_wal_bytes);
     engine.shutdown()?;
     serde_json::to_writer(
         File::create(out.join("capture.json"))?,
         &json!({"open_export_seconds":exported.as_secs_f64(),"write_capture_seconds":(committed-exported).as_secs_f64(),"total_seconds":start.elapsed().as_secs_f64(),"commits":count,
-                 "statement_seconds":statement_seconds,"commit_seconds":commit_seconds,"delta_seconds":delta_seconds}),
+                 "statement_seconds":statement_seconds,"commit_seconds":commit_seconds,"delta_seconds":delta_seconds,"wal_physical_write_bytes":wal_bytes}),
     )?;
     Ok(())
 }

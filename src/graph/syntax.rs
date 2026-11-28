@@ -144,7 +144,7 @@ fn lex(sql: &str) -> Result<Vec<(usize, Token)>> {
                 let end = chars.peek().map_or(sql.len(), |&(i, _)| i);
                 Token::Word(sql[offset..end].into())
             }
-            c if "()[]{}.,:?;=<>!+~-&".contains(c) => Token::Symbol(c),
+            c if "()[]{}.,:?;=<>!+~-&*".contains(c) => Token::Symbol(c),
             _ => {
                 return Err(parse_error(
                     sql,
@@ -187,7 +187,29 @@ impl<'s> Parser<'s> {
             let unique = self.eat("UNIQUE");
             self.eat("PROPERTY");
             self.require("GRAPH")?;
-            if self.eat("INDEX") {
+            if !unique && self.eat("PROJECTION") {
+                let name = self.name()?;
+                self.require("ON")?;
+                let graph = self.name()?;
+                let node = self.eat("NODE");
+                if !node {
+                    self.require("EDGE")?;
+                }
+                self.require("LABEL")?;
+                let label = self.name()?;
+                self.require_symbol('(')?;
+                let fields = self.list(Parser::name)?;
+                self.require_symbol(')')?;
+                Command::CreateProjection {
+                    graph,
+                    name,
+                    spec: ReadProjection {
+                        node,
+                        label,
+                        fields,
+                    },
+                }
+            } else if self.eat("INDEX") {
                 let name = self.name()?;
                 self.require("ON")?;
                 let graph = self.name()?;
@@ -231,7 +253,14 @@ impl<'s> Parser<'s> {
         } else if self.eat("DROP") {
             self.eat("PROPERTY");
             self.require("GRAPH")?;
-            if self.eat("INDEX") {
+            if self.eat("PROJECTION") {
+                let name = self.name()?;
+                self.require("ON")?;
+                Command::DropProjection {
+                    graph: self.name()?,
+                    name,
+                }
+            } else if self.eat("INDEX") {
                 let name = self.name()?;
                 self.require("ON")?;
                 Command::DropIndex {
@@ -332,7 +361,20 @@ impl<'s> Parser<'s> {
             }
             let items = self.list(|p| {
                 let start = p.tokens[p.pos].0;
-                let expression = p.expression(0)?;
+                let expression = if p.at("COUNT")
+                    && matches!(p.tokens.get(p.pos + 1), Some((_, Token::Symbol('('))))
+                {
+                    p.pos += 2;
+                    let argument = if p.symbol('*') {
+                        None
+                    } else {
+                        Some(Box::new(p.expression(0)?))
+                    };
+                    p.require_symbol(')')?;
+                    Expression::Count(argument)
+                } else {
+                    p.expression(0)?
+                };
                 let alias = if p.eat("AS") {
                     p.name()?
                 } else {

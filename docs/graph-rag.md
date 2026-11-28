@@ -49,6 +49,26 @@ nodes with the specified label. Indexes accept UTF-8 strings up to 512 bytes
 or signed `INT64` values. A missing or null property has no index entry.
 Non-null values on indexed nodes must match the declared index type.
 
+Grouped `RETURN` supports `COUNT(*)` and `COUNT(expression)`. The other
+projected expressions form the grouping key. A null expression contributes
+zero to its count, including the missing side of an optional match. A grouped
+result can order by a projected expression or its alias.
+
+For repeated traversals over a large graph, use a property projection to
+pack label membership, heap locations and selected scalar fields into blocks:
+
+```sql
+CREATE GRAPH PROJECTION passage_times ON knowledge NODE LABEL Passage (created, key);
+CREATE GRAPH PROJECTION citation_scores ON knowledge EDGE LABEL CITES (weight);
+DROP GRAPH PROJECTION citation_scores ON knowledge;
+```
+
+Creating a projection takes the graph's exclusive metadata lock and builds
+the blocks from the current data. New elements use normal indexed traversal.
+Changing an element retires its block transactionally. Recreate a projection
+to cover new or changed elements. Projections use the database memory target
+and may be omitted on a particular access.
+
 ## Transactions and privileges
 
 Graph statements participate in the connection's SQL transaction. They support

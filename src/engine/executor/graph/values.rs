@@ -55,6 +55,7 @@ pub(super) fn eval(
     expr: &Expression,
 ) -> Result<Json, QueryError> {
     match expr {
+        Expression::Count(_) => Err(invalid("COUNT requires a grouped RETURN projection")),
         Expression::Atom(index) => {
             let atom = atoms
                 .get(*index)

@@ -129,8 +129,12 @@ fn scan(db: &Database, table: &TableSchema, view: TxnView, lo: u64, hi: u64) -> 
     let mut visit = |row: &[Value]| -> io::Result<()> {
         let id = element_id(&row[0])?;
         let role = number(&row[1]) as usize;
-        shard.counts[role] += 1;
         shard.extent = shard.extent.max(id);
+        // Projection metadata shares the ID sequence with graph elements.
+        if matches!(role, 7 | 8) {
+            return Ok(());
+        }
+        *shard.counts.get_mut(role).ok_or_else(|| invalid("Unknown graph storage role"))? += 1;
         match role {
             0 => {
                 let Value::Json(props) = &row[5] else {
