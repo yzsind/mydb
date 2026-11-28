@@ -21859,6 +21859,9 @@ fn collect_physical_plan_tables_into(plan: &PhysicalPlan, tables: &mut Vec<PlanT
         }
         PhysicalPlan::JsonTableScan {
             relation, columns, ..
+        }
+        | PhysicalPlan::GenerateSeries {
+            relation, columns, ..
         } => {
             let schema =
                 crate::storage::schema::TableSchema::synthetic_for_planning(relation, columns);

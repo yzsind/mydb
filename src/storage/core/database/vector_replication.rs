@@ -235,8 +235,22 @@ impl Database {
                                 mutation.generation,
                                 normalize_name(&index.name),
                             );
-                            if vector_storage_paged() && reloaded.insert(key.clone()) {
-                                self.vector_indexes.write().remove(&key);
+                            if vector_storage_paged() {
+                                if reloaded.insert(key.clone()) {
+                                    self.ensure_vector_backend_compatible(
+                                        &table,
+                                        index,
+                                        mutation.storage_id,
+                                        true,
+                                    )?;
+                                    self.vector_indexes.write().remove(&key);
+                                }
+                                // Source physical redo already owns every
+                                // graph mutation. Keep it cold until queried;
+                                // reloading the whole graph at every commit
+                                // makes incremental replay scale with table
+                                // size instead of the incoming changes.
+                                continue;
                             }
                             let graph = self.vector_graph_get_or_build_for_partition(
                                 &table,

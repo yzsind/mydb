@@ -16,6 +16,95 @@ fn ints(values: &[i64]) -> Vec<Vec<Value>> {
 }
 
 #[test]
+fn series_exists_and_in_use_hash_keys() {
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let engine = open_test_engine(dir.path());
+    for predicate in [
+        "EXISTS (SELECT generate_series i FROM generate_series(1,200000,2) b WHERE a.generate_series=b.generate_series)",
+        "generate_series IN (SELECT generate_series i FROM generate_series(1,200000,2) b)",
+    ] {
+        let sql = format!("SELECT SUM(i) FROM (SELECT generate_series i FROM generate_series(1,10000) a WHERE {predicate})");
+        let explain = rows(&engine, &format!("EXPLAIN FORMAT=TREE {sql}"));
+        let text = format!("{explain:?}");
+        assert!(text.to_ascii_lowercase().contains("hash"), "missing hash join: {text}");
+        assert!(!text.contains("Nested loop"), "quadratic join: {text}");
+        let result = rows(&engine, &sql);
+        assert_eq!(result, vec![vec![Value::DecimalCompact(25000000, 0)]]);
+    }
+}
+
+#[test]
+fn series_existence_join_semantics_match_apply() {
+    use crate::engine::executor::vec::config::{with_vec_mode, VecMode};
+
+    with_test_env(&[("MYDB_PLAN_CACHE", Some("off"))], || {
+        let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        let engine = open_test_engine(dir.path());
+        engine
+            .execute("CREATE TABLE series_keys(k BIGINT, v BIGINT)")
+            .unwrap();
+        engine
+            .execute("INSERT INTO series_keys VALUES (NULL,0),(1,0),(1,2),(3,0),(8,9)")
+            .unwrap();
+        engine
+            .execute("CREATE TABLE series_strings(k VARCHAR(20))")
+            .unwrap();
+        engine
+            .execute("INSERT INTO series_strings VALUES (NULL),('01'),('1'),('1.0'),('oops'),('3')")
+            .unwrap();
+        for sql in [
+        "SELECT n FROM generate_series(1,8) a(n) WHERE EXISTS (SELECT 1 FROM series_keys b WHERE a.n=b.k) ORDER BY n",
+        "SELECT n FROM generate_series(1,8) a(n) WHERE NOT EXISTS (SELECT 1 FROM series_keys b WHERE a.n=b.k) ORDER BY n",
+        "SELECT k,v FROM series_keys a WHERE EXISTS (SELECT 1 FROM generate_series(1,7,2) b(n) WHERE a.k=b.n) ORDER BY k,v",
+        "SELECT k,v FROM series_keys a WHERE NOT EXISTS (SELECT 1 FROM generate_series(1,7,2) b(n) WHERE a.k=b.n) ORDER BY k,v",
+        "SELECT k,v FROM series_keys a WHERE EXISTS (SELECT 1 FROM generate_series(1,7,2) b(n) WHERE a.k=b.n AND a.v<b.n) ORDER BY k,v",
+        "SELECT k FROM series_strings a WHERE EXISTS (SELECT 1 FROM generate_series(0,3) b(n) WHERE a.k=b.n) ORDER BY k",
+        "SELECT k,v FROM series_keys a WHERE NOT EXISTS (SELECT 1 FROM generate_series(1,7,2) b(n) WHERE a.k<=>b.n) ORDER BY k,v",
+        "SELECT n FROM generate_series(1,8) a(n) WHERE EXISTS (SELECT 1 FROM generate_series(1,20) b(m) WHERE a.n=MOD(b.m,3)+1) ORDER BY n",
+        "SELECT n FROM generate_series(1,8) a(n) WHERE NOT EXISTS (SELECT 1 FROM generate_series(NULL,5) b(m) WHERE a.n=b.m) ORDER BY n",
+        "SELECT n FROM generate_series(8,1,-1) a(n) WHERE n IN (SELECT m FROM generate_series(1,8,2) b(m)) ORDER BY n",
+        "SELECT n FROM generate_series(1.0,3.0,0.5) a(n) WHERE EXISTS (SELECT 1 FROM generate_series(1,3) b(m) WHERE a.n=b.m) ORDER BY n",
+        "SELECT n FROM generate_series(1,4) WITH ORDINALITY a(n,pos) WHERE EXISTS (SELECT 1 FROM generate_series(2,4,2) b(m) WHERE a.pos=b.m) ORDER BY n",
+        "SELECT n FROM generate_series(1,4) WITH ORDINALITY a(n,pos) WHERE EXISTS (SELECT 1 FROM generate_series(1,4) WITH ORDINALITY b(m,ord) WHERE a.n=b.m AND a.pos=b.ord AND b.m>2) ORDER BY n",
+        "SELECT d FROM generate_series('2026-01-01','2026-01-04',INTERVAL '1' DAY) a(d) WHERE EXISTS (SELECT 1 FROM generate_series('2026-01-01','2026-01-04',INTERVAL '2' DAY) b(d) WHERE a.d=b.d) ORDER BY d",
+    ] {
+        let expected = with_test_env(&[("MYDB_DECORRELATE", Some("off"))], || {
+            with_vec_mode(VecMode::Off, || rows(&engine, sql))
+        });
+        for mode in [VecMode::Off, VecMode::On] {
+            let hashed_sql = sql.replacen("SELECT ", "SELECT /*+ HASH_JOIN(a,b) */ ", 1);
+            let actual = with_vec_mode(mode, || rows(&engine, &hashed_sql));
+            assert_eq!(actual, expected, "{sql}; mode={mode:?}");
+        }
+    }
+    });
+}
+
+#[test]
+fn series_equality_join_types_match_nested_loops() {
+    use crate::engine::executor::vec::config::{with_vec_mode, VecMode};
+
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let engine = open_test_engine(dir.path());
+    for (join, count) in [
+        ("JOIN", 2),
+        ("LEFT JOIN", 4),
+        ("RIGHT JOIN", 4),
+        ("FULL JOIN", 6),
+    ] {
+        let body = format!("a.n,b.m FROM generate_series(1,4) a(n) {join} generate_series(3,6) b(m) ON a.n=b.m ORDER BY a.n,b.m");
+        let expected = rows(&engine, &format!("SELECT /*+ NO_HASH_JOIN(a,b) */ {body}"));
+        assert_eq!(expected.len(), count);
+        for mode in [VecMode::Off, VecMode::On] {
+            let actual = with_vec_mode(mode, || {
+                rows(&engine, &format!("SELECT /*+ HASH_JOIN(a,b) */ {body}"))
+            });
+            assert_eq!(actual, expected, "{join}; mode={mode:?}");
+        }
+    }
+}
+
+#[test]
 fn integer_series_basic() {
     let dir = tempfile::tempdir().unwrap();
     let engine = open_test_engine(dir.path());

@@ -4846,10 +4846,10 @@ impl Database {
     ///      `.lob`): free-list is cycle-free and every physical page is a
     ///      well-formed overflow page (`validate_structure`).
     ///   2. **Row-driven** chain walk: only when the table actually has
-    ///      externalized data (or a declared LOB column), materialize every
-    ///      live row — this reads each referenced chain, so a dangling /
-    ///      broken / cyclic chain surfaces as a 1030 corruption. Reuses the
-    ///      tested scan path rather than reimplementing row iteration.
+    ///      externalized data (or a declared LOB column), visit every live
+    ///      row in bounded physical ranges. This reads each referenced chain,
+    ///      so dangling, broken or cyclic chains surface as 1030 corruption.
+    ///      Reuses the tested scan path rather than reimplementing row iteration.
     pub(crate) fn check_table_lob_integrity(&self, table: &TableSchema) -> Vec<String> {
         let mut problems = Vec::new();
         let storage_ids = table.storage_ids();
@@ -4870,9 +4870,10 @@ impl Database {
         }
         if any_lob_pages || table_has_externalizable_column(table) {
             let qname = self.storage_key_for_table(table);
-            if let Err(e) = self.scan_rows(
+            if let Err(e) = self.scan_rows_ordered_streaming(
                 &qname,
                 TxnView::read_only(u64::MAX, crate::storage::IsolationLevel::ReadCommitted),
+                |_| Ok(()),
             ) {
                 problems.push(format!("row/LOB chain scan: {}", e.message()));
             }

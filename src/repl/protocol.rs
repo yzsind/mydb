@@ -46,6 +46,8 @@ pub enum MsgType {
     BaseBackupChunk = 9,
     BaseBackupEnd = 10,
     BaseBackupManifest = 11,
+    /// Authenticated, read-only seed eligibility check; creates no slot.
+    BaseBackupCheck = 12,
 }
 
 impl MsgType {
@@ -62,6 +64,7 @@ impl MsgType {
             9 => MsgType::BaseBackupChunk,
             10 => MsgType::BaseBackupEnd,
             11 => MsgType::BaseBackupManifest,
+            12 => MsgType::BaseBackupCheck,
             _ => {
                 return Err(Error::new(
                     ErrorKind::InvalidData,
@@ -75,6 +78,7 @@ impl MsgType {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Message {
     Handshake(Handshake),
+    BaseBackupCheck(Handshake),
     HandshakeAck(HandshakeAck),
     WalChunk(WalChunk),
     Heartbeat(Heartbeat),
@@ -214,6 +218,7 @@ impl Message {
     pub fn msg_type(&self) -> MsgType {
         match self {
             Message::Handshake(_) => MsgType::Handshake,
+            Message::BaseBackupCheck(_) => MsgType::BaseBackupCheck,
             Message::HandshakeAck(_) => MsgType::HandshakeAck,
             Message::WalChunk(_) => MsgType::WalChunk,
             Message::Heartbeat(_) => MsgType::Heartbeat,
@@ -229,7 +234,7 @@ impl Message {
 
     pub fn encode_payload(&self, out: &mut Vec<u8>) {
         match self {
-            Message::Handshake(m) => encode_handshake(m, out),
+            Message::Handshake(m) | Message::BaseBackupCheck(m) => encode_handshake(m, out),
             Message::HandshakeAck(m) => encode_handshake_ack(m, out),
             Message::WalChunk(m) => encode_wal_chunk(m, out),
             Message::Heartbeat(m) => encode_heartbeat(m, out),
@@ -248,6 +253,7 @@ impl Message {
         let mut r = Reader::new(payload);
         let msg = match msg_type {
             MsgType::Handshake => Message::Handshake(decode_handshake(&mut r)?),
+            MsgType::BaseBackupCheck => Message::BaseBackupCheck(decode_handshake(&mut r)?),
             MsgType::HandshakeAck => Message::HandshakeAck(decode_handshake_ack(&mut r)?),
             MsgType::WalChunk => Message::WalChunk(decode_wal_chunk(&mut r)?),
             MsgType::Heartbeat => Message::Heartbeat(decode_heartbeat(&mut r)?),

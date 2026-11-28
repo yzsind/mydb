@@ -320,7 +320,9 @@ impl SlotRegistry {
     /// Open the registry under `data_dir`, discovering any existing
     /// slot files.
     pub fn open(data_dir: impl Into<PathBuf>) -> Result<Self, QueryError> {
-        let dir: PathBuf = data_dir.into().join(SLOTS_DIR);
+        let data_dir = data_dir.into();
+        crate::replication::prepare_private_metadata_directory(&data_dir).map_err(io_to_query)?;
+        let dir: PathBuf = data_dir.join(SLOTS_DIR);
         fs::create_dir_all(&dir).map_err(io_to_query)?;
         let mut slots = HashMap::new();
         for entry in fs::read_dir(&dir).map_err(io_to_query)? {

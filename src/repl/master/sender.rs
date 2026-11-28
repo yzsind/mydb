@@ -134,8 +134,9 @@ pub async fn run_sender(
             ))?.map_err(io_err)?
         }
     };
+    let check_only = matches!(&inbound, Message::BaseBackupCheck(_));
     let req: Handshake = match inbound {
-        Message::Handshake(h) => h,
+        Message::Handshake(h) | Message::BaseBackupCheck(h) => h,
         other => {
             let _ = protocol::write_frame_async(
                 &mut writer,
@@ -208,7 +209,7 @@ pub async fn run_sender(
     // retention floor) pushed BaseBackup* messages at a steady-state
     // receiver that doesn't handle them; that case now answers with a
     // Resync so the replica re-seeds through its bootstrap path.
-    let backup_permit = if req.request_base_backup {
+    let backup_permit = if req.request_base_backup && !check_only {
         Arc::clone(&env.base_backup_slots).try_acquire_owned().ok()
     } else {
         None
@@ -216,7 +217,14 @@ pub async fn run_sender(
     let needs_base_backup = req.request_base_backup
         && env.db.is_some()
         && env.data_dir.is_some()
-        && backup_permit.is_some();
+        && (check_only || backup_permit.is_some());
+    let backup_error = if check_only && req.request_base_backup {
+        env.db
+            .as_ref()
+            .and_then(|db| crate::repl::base_backup::check_source_eligibility(db).err())
+    } else {
+        None
+    };
 
     let source = source_wire_state(&env);
     // Protocol v2 uses cluster/timeline ancestry rather than node UUID. A
@@ -256,8 +264,14 @@ pub async fn run_sender(
         needs_base_backup
     } else {
         in_range
-    }) && fork_reason.is_none();
-    let reason = if req.request_base_backup && backup_permit.is_none() {
+    }) && fork_reason.is_none()
+        && backup_error.is_none()
+        && (!check_only || req.request_base_backup);
+    let reason = if check_only && !req.request_base_backup {
+        "base backup check requires request_base_backup".to_string()
+    } else if let Some(err) = backup_error {
+        err.message().to_string()
+    } else if req.request_base_backup && !check_only && backup_permit.is_none() {
         "base backup concurrency limit reached".to_string()
     } else if req.request_base_backup && !needs_base_backup {
         "base backup is unavailable on this source".to_string()
@@ -293,6 +307,10 @@ pub async fn run_sender(
     protocol::write_frame_async(&mut writer, &Message::HandshakeAck(ack))
         .await
         .map_err(io_err)?;
+    if check_only {
+        writer.flush().await.map_err(io_err)?;
+        return Ok(());
+    }
     writer.flush().await.map_err(io_err)?;
     if !accepted {
         // Hint that a Resync (base backup) is needed when streaming can

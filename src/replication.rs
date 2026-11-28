@@ -7207,6 +7207,13 @@ fn replication_dir(data_dir: &Path) -> PathBuf {
     crate::storage::naming::system_replication_dir(data_dir)
 }
 
+/// Native bootstrap can create this shared directory before Database::open.
+/// Use the same no-follow, server-owner and private-mode policy as channels.
+pub(crate) fn prepare_private_metadata_directory(data_dir: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(data_dir)?;
+    private_metadata::ChannelDirectory::prepare_replication(data_dir)
+}
+
 fn channel_tombstone(data_dir: &Path, channel: &str) -> PathBuf {
     replication_dir(data_dir).join(format!("{channel}.disabled"))
 }

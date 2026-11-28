@@ -49,6 +49,168 @@ use sha2::{Digest, Sha256};
 
 const CHUNK_BYTES: usize = 1024 * 1024;
 
+type BackupReader = BufReader<tokio::io::ReadHalf<crate::repl::tls::ReplStream>>;
+type BackupWriter = BufWriter<tokio::io::WriteHalf<crate::repl::tls::ReplStream>>;
+
+async fn connect_backup_source(
+    master_host: &str,
+    master_port: u16,
+    replica_uuid: &str,
+    config: &crate::repl::config::ReplConfig,
+    check_only: bool,
+) -> Result<(BackupReader, BackupWriter, HandshakeAck), QueryError> {
+    let master_host = master_host.trim_matches(['[', ']']);
+    let addr = crate::repl::format_endpoint(master_host, master_port);
+    let stream = tokio::time::timeout(Duration::from_secs(10), TcpStream::connect(&addr))
+        .await
+        .map_err(|_| {
+            error(
+                crate::error::catalog::ER_NOT_SUPPORTED_YET,
+                format!("base backup connect {addr} timed out"),
+            )
+        })?
+        .map_err(|err| {
+            error(
+                crate::error::catalog::ER_NOT_SUPPORTED_YET,
+                format!("base backup connect {addr}: {err}"),
+            )
+        })?;
+    // Disable Nagle for the base-backup control frames (Pf2).
+    if let Err(e) = stream.set_nodelay(true) {
+        crate::util::logging::log_message(format_args!(
+            "mydb-repl replica: base backup set_nodelay failed: {e}"
+        ));
+    }
+    let stream = crate::repl::tls::connect(stream, config, master_host)
+        .await
+        .map_err(io_err)?;
+    let (rh, wh) = tokio::io::split(stream);
+    let mut reader = BufReader::new(rh);
+    let mut writer = BufWriter::new(wh);
+
+    let replica_uuid_bytes = uuid_string_to_bytes(replica_uuid).ok_or_else(|| {
+        error(
+            crate::error::catalog::ER_WRONG_VALUE,
+            "base backup replica UUID is invalid",
+        )
+    })?;
+    let handshake = Handshake {
+        auth_token: config.auth_token.clone(),
+        protocol_version: PROTOCOL_VERSION,
+        replica_uuid: replica_uuid_bytes,
+        // 0 = ask for "from the very beginning", which the master
+        // will treat as "you need a base backup first".
+        requested_start_lsn: 0,
+        last_known_master_uuid: [0; 16],
+        last_known_epoch: 0,
+        cluster_uuid: [0; 16],
+        last_known_timeline_uuid: [0; 16],
+        client_version: format!("mydb-base-backup/{}", env!("CARGO_PKG_VERSION")),
+        request_base_backup: true,
+        max_chunk_bytes: config.chunk_bytes.min(u32::MAX as usize) as u32,
+        format_compatibility: crate::storage::format_versions::native_replication_compatibility(),
+    };
+    protocol::write_frame_async(
+        &mut writer,
+        &if check_only {
+            Message::BaseBackupCheck(handshake)
+        } else {
+            Message::Handshake(handshake)
+        },
+    )
+    .await
+    .map_err(io_err)?;
+    writer.flush().await.map_err(io_err)?;
+
+    let ack: HandshakeAck = match read_backup_frame(&mut reader).await {
+        Ok(Message::HandshakeAck(a)) => a,
+        Ok(Message::Close(close)) => {
+            return Err(QueryError::internal_control(
+                crate::error::InternalErrorKind::ReplicaHandshakeRejected,
+                crate::error::catalog::MYDB_ER_REPLICATION_SECURITY,
+                format!("base backup handshake rejected: {}", close.reason),
+            ));
+        }
+        Ok(other) => {
+            return Err(error(
+                crate::error::catalog::ER_NOT_SUPPORTED_YET,
+                format!(
+                    "base backup: expected HandshakeAck, got {:?}",
+                    other.msg_type()
+                ),
+            ))
+        }
+        Err(err) => return Err(io_err(err)),
+    };
+    if !ack.accepted {
+        if ack.reason == "base backup concurrency limit reached" {
+            return Err(error(
+                crate::error::catalog::MYDB_ER_BASE_BACKUP_FAILED,
+                format!("base backup temporarily unavailable: {}", ack.reason),
+            ));
+        }
+        return Err(QueryError::internal_control(
+            crate::error::InternalErrorKind::ReplicaHandshakeRejected,
+            crate::error::catalog::ER_NOT_SUPPORTED_YET,
+            format!("base backup handshake rejected: {}", ack.reason),
+        ));
+    }
+    let local_format = crate::storage::format_versions::native_replication_compatibility();
+    if ack.format_compatibility != local_format {
+        return Err(QueryError::internal_control(
+            crate::error::InternalErrorKind::ReplicaHandshakeRejected,
+            crate::error::catalog::ER_SOURCE_FATAL_ERROR_READING_BINLOG,
+            format!(
+                "base backup format mismatch: master='{}', replica='{}'",
+                ack.format_compatibility, local_format
+            ),
+        ));
+    }
+
+    Ok((reader, writer, ack))
+}
+
+/// Check before persisting a resync request or disconnecting SQL sessions.
+/// Capture repeats the eligibility check to cover XA prepared after this probe.
+pub(crate) async fn check_backup_source(
+    endpoint: &str,
+    replica_uuid: &str,
+    config: &crate::repl::config::ReplConfig,
+) -> Result<(), QueryError> {
+    let (host, port) = endpoint.rsplit_once(':').ok_or_else(|| {
+        error(
+            crate::error::catalog::MYDB_ER_REPLICATION_STATE,
+            "invalid master endpoint",
+        )
+    })?;
+    let port = port.parse().map_err(|_| {
+        error(
+            crate::error::catalog::MYDB_ER_REPLICATION_STATE,
+            "invalid master port",
+        )
+    })?;
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        connect_backup_source(host, port, replica_uuid, config, true),
+    )
+    .await
+    .map_err(|_| {
+        error(
+            crate::error::catalog::MYDB_ER_BASE_BACKUP_FAILED,
+            "FORCE_RESYNC source preflight timed out; replica remains available",
+        )
+    })??;
+    Ok(())
+}
+
+pub(crate) fn check_source_eligibility(db: &Database) -> Result<(), QueryError> {
+    if db.xa_status_counters().0 > 0 {
+        return Err(error(crate::error::catalog::MYDB_ER_BASE_BACKUP_FAILED,
+            "native base backup cannot capture XA PREPARED branches; resolve them with XA COMMIT or XA ROLLBACK before seeding"));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 #[tokio::test]
 async fn issue_39_large_manifest_roundtrips_across_frames() {
@@ -345,10 +507,7 @@ where
         let drain_deadline = std::time::Instant::now() + Duration::from_millis(drain_timeout);
         loop {
             check_capture()?;
-            if db.xa_status_counters().0 > 0 {
-                return Err(error(crate::error::catalog::MYDB_ER_BASE_BACKUP_FAILED,
-                "native base backup cannot capture XA PREPARED branches; resolve them with XA COMMIT or XA ROLLBACK before seeding"));
-            }
+            check_source_eligibility(&db)?;
             if !db.has_active_backup_conflicts()
                 && db.capture.admissions.load(Ordering::SeqCst) == 0
             {
@@ -917,106 +1076,8 @@ pub(crate) async fn perform_base_backup_into_with_config(
         path: staging.clone(),
         data_dir: data_dir.to_path_buf(),
     };
-    let master_host = master_host.trim_matches(['[', ']']);
-    let addr = crate::repl::format_endpoint(master_host, master_port);
-    let stream = tokio::time::timeout(Duration::from_secs(10), TcpStream::connect(&addr))
-        .await
-        .map_err(|_| {
-            error(
-                crate::error::catalog::ER_NOT_SUPPORTED_YET,
-                format!("base backup connect {addr} timed out"),
-            )
-        })?
-        .map_err(|err| {
-            error(
-                crate::error::catalog::ER_NOT_SUPPORTED_YET,
-                format!("base backup connect {addr}: {err}"),
-            )
-        })?;
-    // Disable Nagle for the base-backup control frames (Pf2).
-    if let Err(e) = stream.set_nodelay(true) {
-        crate::util::logging::log_message(format_args!(
-            "mydb-repl replica: base backup set_nodelay failed: {e}"
-        ));
-    }
-    let stream = crate::repl::tls::connect(stream, &config, master_host)
-        .await
-        .map_err(io_err)?;
-    let (rh, wh) = tokio::io::split(stream);
-    let mut reader = BufReader::new(rh);
-    let mut writer = BufWriter::new(wh);
-
-    let replica_uuid_bytes = uuid_string_to_bytes(replica_uuid).ok_or_else(|| {
-        error(
-            crate::error::catalog::ER_WRONG_VALUE,
-            "base backup replica UUID is invalid",
-        )
-    })?;
-    let handshake = Handshake {
-        auth_token: config.auth_token.clone(),
-        protocol_version: PROTOCOL_VERSION,
-        replica_uuid: replica_uuid_bytes,
-        // 0 = ask for "from the very beginning", which the master
-        // will treat as "you need a base backup first".
-        requested_start_lsn: 0,
-        last_known_master_uuid: [0; 16],
-        last_known_epoch: 0,
-        cluster_uuid: [0; 16],
-        last_known_timeline_uuid: [0; 16],
-        client_version: format!("mydb-base-backup/{}", env!("CARGO_PKG_VERSION")),
-        request_base_backup: true,
-        max_chunk_bytes: config.chunk_bytes.min(u32::MAX as usize) as u32,
-        format_compatibility: crate::storage::format_versions::native_replication_compatibility(),
-    };
-    protocol::write_frame_async(&mut writer, &Message::Handshake(handshake))
-        .await
-        .map_err(io_err)?;
-    writer.flush().await.map_err(io_err)?;
-
-    let ack: HandshakeAck = match read_backup_frame(&mut reader).await {
-        Ok(Message::HandshakeAck(a)) => a,
-        Ok(Message::Close(close)) => {
-            return Err(QueryError::internal_control(
-                crate::error::InternalErrorKind::ReplicaHandshakeRejected,
-                crate::error::catalog::MYDB_ER_REPLICATION_SECURITY,
-                format!("base backup handshake rejected: {}", close.reason),
-            ));
-        }
-        Ok(other) => {
-            return Err(error(
-                crate::error::catalog::ER_NOT_SUPPORTED_YET,
-                format!(
-                    "base backup: expected HandshakeAck, got {:?}",
-                    other.msg_type()
-                ),
-            ))
-        }
-        Err(err) => return Err(io_err(err)),
-    };
-    if !ack.accepted {
-        if ack.reason == "base backup concurrency limit reached" {
-            return Err(error(
-                crate::error::catalog::MYDB_ER_BASE_BACKUP_FAILED,
-                format!("base backup temporarily unavailable: {}", ack.reason),
-            ));
-        }
-        return Err(QueryError::internal_control(
-            crate::error::InternalErrorKind::ReplicaHandshakeRejected,
-            crate::error::catalog::ER_NOT_SUPPORTED_YET,
-            format!("base backup handshake rejected: {}", ack.reason),
-        ));
-    }
-    let local_format = crate::storage::format_versions::native_replication_compatibility();
-    if ack.format_compatibility != local_format {
-        return Err(QueryError::internal_control(
-            crate::error::InternalErrorKind::ReplicaHandshakeRejected,
-            crate::error::catalog::ER_SOURCE_FATAL_ERROR_READING_BINLOG,
-            format!(
-                "base backup format mismatch: master='{}', replica='{}'",
-                ack.format_compatibility, local_format
-            ),
-        ));
-    }
+    let (mut reader, _writer, ack) =
+        connect_backup_source(master_host, master_port, replica_uuid, &config, false).await?;
 
     // After the handshake the master sends a `BaseBackupStart` because
     // we set `request_base_backup = true`. Anything else is a

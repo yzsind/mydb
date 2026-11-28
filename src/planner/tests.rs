@@ -1,6 +1,44 @@
 use super::*;
 
 #[test]
+fn series_relations_expose_join_key_metadata() {
+    for sql in [
+        "SELECT * FROM generate_series(1,100) a JOIN generate_series(1,100) b ON a.generate_series=b.generate_series",
+        "SELECT * FROM generate_series(1.0,10.0,0.5) a(n) JOIN generate_series(1,10) b(m) ON a.n=b.m",
+        "SELECT * FROM generate_series(5,1,-1) WITH ORDINALITY a(n,pos) JOIN generate_series(1,5) b(m) ON a.pos=b.m",
+        "SELECT * FROM generate_series('2026-01-01','2026-01-03',INTERVAL '1' DAY) a(d) JOIN generate_series('2026-01-01','2026-01-03',INTERVAL '1' DAY) b(d) ON a.d=b.d",
+    ] {
+        let Statement::Select(select) = crate::parser::parse_statement(sql).unwrap() else {
+            panic!("expected SELECT");
+        };
+        let source = &select.from[0];
+        let left = plan_generate_series(source, source.generate_series.as_ref().unwrap()).unwrap();
+        let source = &select.joins[0].table;
+        let right = plan_generate_series(source, source.generate_series.as_ref().unwrap()).unwrap();
+        for plan in [&left, &right] {
+            let tables = collect_physical_plan_tables(plan);
+            assert_eq!(tables.len(), 1, "missing source metadata: {sql}");
+            let PhysicalPlan::GenerateSeries { relation, columns, .. } = plan else {
+                unreachable!();
+            };
+            assert!(matches_table(relation, &tables[0].schema.name, tables[0].alias.as_deref()));
+            assert_eq!(tables[0].schema.columns.len(), columns.len());
+            for (actual, expected) in tables[0].schema.columns.iter().zip(columns) {
+                assert_eq!(actual.name, expected.name);
+                assert_eq!(actual.data_type.column_type(), expected.column_type);
+            }
+        }
+        let (left_keys, right_keys, null_safe, residual) = extract_join_keys_for_plans(
+            &left, &right, select.joins[0].condition.as_ref().unwrap(),
+        ).expect("series equality must be available as a hash key");
+        assert_eq!(left_keys.len(), 1);
+        assert_eq!(right_keys.len(), 1);
+        assert_eq!(null_safe, vec![false]);
+        assert!(residual.is_none(), "unexpected equality recheck: {sql}");
+    }
+}
+
+#[test]
 fn spatial_access_costs_residuals_and_competes_with_parallel_scans() {
     let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
     let engine = open_test_engine(dir.path());

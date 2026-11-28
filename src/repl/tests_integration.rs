@@ -700,6 +700,57 @@ mod online_apply {
     /// Bring up a replica engine with the production reconnect lifecycle.
     /// A local snapshot can temporarily block physical slot reclamation;
     /// retry it just as a running server would instead of ending the fixture.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wal_fault_seed_preflight_rejects_xa_without_slots_or_source_freeze() {
+        let (engine, _dir, service) = build_master_engine().await;
+        let endpoint = service.bind_addr().to_string();
+        let uuid = crate::repl::role::generate_uuid_string();
+        let config = ReplConfig::test_defaults();
+        crate::repl::base_backup::check_backup_source(&endpoint, &uuid, &config)
+            .await
+            .unwrap();
+        assert!(service.slots.lock().snapshot().is_empty());
+        let writer = engine.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut session = crate::engine::SessionContext::default();
+            for sql in [
+                "CREATE TABLE preflight(id INT)",
+                "XA START 'seed-check'",
+                "INSERT INTO preflight VALUES(1)",
+                "XA END 'seed-check'",
+                "XA PREPARE 'seed-check'",
+            ] {
+                writer.execute_with_session(&mut session, sql).unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        let err = crate::repl::base_backup::check_backup_source(&endpoint, &uuid, &config)
+            .await
+            .unwrap_err();
+        assert!(err.message().contains("XA PREPARED"), "{err:?}");
+        assert!(service.slots.lock().snapshot().is_empty());
+        let writer = engine.clone();
+        tokio::task::spawn_blocking(move || {
+            writer.execute("INSERT INTO preflight VALUES(2)").unwrap();
+            writer.execute("XA ROLLBACK 'seed-check'").unwrap();
+        })
+        .await
+        .unwrap();
+        crate::repl::base_backup::check_backup_source(&endpoint, &uuid, &config)
+            .await
+            .unwrap();
+        let mut bad_auth = config;
+        bad_auth.auth_token = "another-local-token-for-preflight".into();
+        assert!(
+            crate::repl::base_backup::check_backup_source(&endpoint, &uuid, &bad_auth)
+                .await
+                .is_err()
+        );
+        assert!(service.slots.lock().snapshot().is_empty());
+        service.shutdown().await;
+    }
+
     async fn spawn_replica(
         master_addr: std::net::SocketAddr,
     ) -> (

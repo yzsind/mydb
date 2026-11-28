@@ -101,6 +101,10 @@ fn check_file(file: &File) -> io::Result<()> {
 }
 
 impl ChannelDirectory {
+    pub(super) fn prepare_replication(data_dir: &Path) -> io::Result<()> {
+        Self::open_path(data_dir, true, false).map(|_| ())
+    }
+
     pub(super) fn open(data_dir: &Path, create: bool) -> io::Result<Self> {
         Self::open_path(data_dir, create, true)
     }

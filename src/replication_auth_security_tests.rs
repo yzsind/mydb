@@ -1,6 +1,47 @@
 use super::*;
 use std::os::unix::fs::{symlink, PermissionsExt};
 
+#[test]
+fn wal_fault_native_bootstrap_metadata_is_private_before_engine_open() {
+    for first in ["role", "progress", "resync", "slots"] {
+        let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        match first {
+            "role" => {
+                crate::repl::role::save(dir.path(), &crate::repl::role::RoleState::new_standalone())
+                    .unwrap()
+            }
+            "progress" => {
+                crate::repl::replica::progress::save_progress(dir.path(), &Default::default())
+                    .unwrap()
+            }
+            "resync" => {
+                crate::repl::replica::progress::write_resync_marker(dir.path(), "test").unwrap()
+            }
+            "slots" => {
+                crate::repl::master::SlotRegistry::open(dir.path()).unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let path = replication_dir(dir.path());
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o700,
+            "{first}"
+        );
+        ChannelDirectory::replication(dir.path()).unwrap();
+        for entry in fs::read_dir(&path).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_file() {
+                assert_eq!(
+                    entry.metadata().unwrap().permissions().mode() & 0o777,
+                    0o600,
+                    "{first}"
+                );
+            }
+        }
+    }
+}
+
 fn state() -> PersistedChannel {
     PersistedChannel {
         config: ReplicationChannelConfig {
