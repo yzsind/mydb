@@ -10,7 +10,7 @@ database process runs as the non-root user with UID/GID `10001:10001`. It contai
 the server, `mydb-backup`, the native Rust `mydb-cli`, a MySQL-compatible SQL
 client, timezone data, and third-party license/source notices.
 
-MyDB 1.0.3 is a public-preview release for feature validation and evaluation in
+MyDB 1.0.4 is a public-preview release for feature validation and evaluation in
 controlled environments. See the [product introduction](../README.md) for
 current capabilities and published performance results. The `latest` image tag
 can change; record `SELECT VERSION()` and pin an image digest for repeatable

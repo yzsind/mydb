@@ -5,8 +5,8 @@ documentation from the matching Git tag when operating a downloaded release.
 [Release notes](README.md#getting-started-and-deployment) and dated benchmark
 reports keep their identified versions, settings and evaluation boundaries.
 
-The current package version is `1.0.3`. Changes since 1.0.2 include new features
-and incompatible physical formats; see the [1.0.3 release notes](release-notes-1.0.3.md).
+The current package version is `1.0.4`. Changes since 1.0.3 include new features
+and incompatible physical formats; see the [1.0.4 release notes](release-notes-1.0.4.md).
 Read [current source changes](current-source.md) and
 [changing versions](changing-versions.md) before reusing a data directory,
 restoring a physical backup, or connecting native replicas. A product version

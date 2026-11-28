@@ -1,6 +1,6 @@
 [package]
 name = "mydb-cli"
-version = "1.0.3"
+version = "1.0.4"
 edition = "2021"
 rust-version = "1.95"
 description = "Interactive and batch SQL client for MyDB"

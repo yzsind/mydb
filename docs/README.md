@@ -4,7 +4,7 @@ Public product, SQL, deployment, and operations documentation. Start with the
 [project README](../README.md) for downloads and a first query.
 
 These guides describe the current source checkout, including changes after
-the 1.0.2 release. Product version strings alone do not identify compatible
+the 1.0.3 release. Product version strings alone do not identify compatible
 physical formats. Read [current source changes](current-source.md) before
 using a release data directory with a source build; use the matching tag's
 documentation for release packages. Dated release notes and benchmark reports
@@ -15,13 +15,14 @@ retain their original scope and measurements.
 | Document | Contents |
 | --- | --- |
 | [Project README](../README.md) | Downloads, quick start, building, and client examples |
+| [MyDB 1.0.4 Release Notes](release-notes-1.0.4.md) | Property graphs, image embeddings, online DDL, query and replication fixes, and required logical migration |
 | [MyDB 1.0.3 Release Notes](release-notes-1.0.3.md) | Partial indexes, transactional full-text statistics, SQL and recovery fixes, and required logical migration |
 | [MyDB 1.0.2 Release Notes](release-notes-1.0.2.md) | Public preview, changes since 1.0.1, and the required logical migration |
 | [MyDB 1.0.1 Release Notes](release-notes-1.0.1.md) | Public preview, changes since 1.0.0, and migration requirements |
 | [MyDB 1.0.0 Release Notes](release-notes-1.0.0.md) | Public-preview scope, features, packages, and compatibility boundaries |
 | [Why MyDB](why-mydb.md) | HTAP mixed workloads, AI capabilities, application benefits, and performance evidence |
 | [Feature Overview](feature-overview.md) | Capabilities, limitations, and release maturity |
-| [Current Source Changes](current-source.md) | Changes after 1.0.2, SQL behavior, credentials, and physical compatibility |
+| [Current Source Changes](current-source.md) | Current SQL behavior, credentials, and physical compatibility |
 | [MySQL 8.0 Compatibility](mysql80-compatibility.md) | Supported behavior, intentional differences, and migration boundaries |
 | [MyDB CLI](mydb-cli.md) | Interactive SQL, scripts, output, TLS, and client settings |
 | [Startup Configuration](configuration.md) | Configuration files, CLI, environment variables, system variables, and precedence |

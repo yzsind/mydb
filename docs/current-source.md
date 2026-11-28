@@ -1,18 +1,18 @@
 # Current Source Changes
 
-This page describes the source checkout as reviewed on November 24, 2026.
-The package version is `1.0.3`; see the [1.0.3 release notes](release-notes-1.0.3.md)
-for changes since `v1.0.2` and migration requirements. A product version string
+This page describes the source checkout as reviewed on November 28, 2026.
+The package version is `1.0.4`; see the [1.0.4 release notes](release-notes-1.0.4.md)
+for changes since `v1.0.3` and migration requirements. A product version string
 alone does not identify compatible physical formats. For release behavior,
 use the documentation at its Git tag. MyDB remains a public preview for
 controlled evaluation.
 
 ## Physical compatibility
 
-The released 1.0.2 catalog format is 72; this checkout uses catalog format 75
-for partial-index definitions and transactional FULLTEXT corpus state and
-publication fences. An earlier directory or physical backup cannot be opened
-as a format upgrade. Start an independent fresh directory and transfer reviewed
+This checkout uses catalog format 75 and WAL format 42. MyDB 1.0.3 uses the
+same catalog version but WAL format 41; 1.0.4 adds transactional private-to-final
+COPY file bindings. A 1.0.3 directory or physical backup cannot be opened as a
+format upgrade. Start an independent fresh directory and transfer reviewed
 logical schema and typed data. Recreate native replicas from the migrated
 primary; matching physical formats are required on both peers.
 

@@ -39,7 +39,7 @@ rules, and the catalog refresh process.
 The mydb database core is implemented in Rust (2021 edition, `tokio`). Its
 goal is compatibility with MySQL clients and common SQL, not a byte-for-byte
 replica of InnoDB, the plugin ABI, or the complete MySQL operations ecosystem.
-MyDB 1.0.3 is a public-preview release; the [Feature Overview](feature-overview.md)
+MyDB 1.0.4 is a public-preview release; the [Feature Overview](feature-overview.md)
 states release maturity, and this document records supported behavior,
 intentional differences, and migration boundaries.
 
@@ -1342,7 +1342,7 @@ degenerate into no-ops.
 
 ## 14. Version and Runtime
 
-- **Product version**: `1.0.3`; the MySQL handshake/SQL compatibility baseline remains 8.0.46, and the version string may append the product version and build date.
+- **Product version**: `1.0.4`; the MySQL handshake/SQL compatibility baseline remains 8.0.46, and the version string may append the product version and build date.
 - **Default port**: 8738; **pre-created database**: `test` (`DATABASE()` is NULL when the connection specifies no database, and unqualified table names report 1046); **default data directory**: `./data`.
 - **Default account**: `'root'@'localhost'` / `root` (bootstrap only; changeable via `MYDB_ROOT_PASSWORD`);
   the local TCP loopback matches localhost, and no remote root account is created by default.

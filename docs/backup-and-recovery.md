@@ -2,7 +2,7 @@
 
 This guide covers creating, inspecting, querying, restoring, archiving, and retaining native physical backups in mydb. It is intended for database administrators and operations staff. Current repository, image, bundle, and catalog versions are listed in the generated [storage format registry](storage-format-versions.md).
 
-MyDB 1.0.3 is a public-preview release; see the [Feature Overview](feature-overview.md) for release maturity and boundaries. Rehearse recovery in the target deployment environment before using these procedures. For recovery across versions, check the [storage format versions](storage-format-versions.md); the product version alone does not establish physical format compatibility.
+MyDB 1.0.4 is a public-preview release; see the [Feature Overview](feature-overview.md) for release maturity and boundaries. Rehearse recovery in the target deployment environment before using these procedures. For recovery across versions, check the [storage format versions](storage-format-versions.md); the product version alone does not establish physical format compatibility.
 
 ## 1. Capabilities and Recovery Scope
 
