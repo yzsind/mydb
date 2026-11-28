@@ -627,6 +627,7 @@ impl Database {
             )?;
             let mut charge = crate::engine::executor::mem_budget::ScopedCharge::new(0);
             for row in &mut rows {
+                crate::engine::cancel::check_cancelled()?;
                 charge.add_non_spillable(
                     crate::engine::executor::mem_budget::estimate_row_bytes(row)
                         .saturating_add(128),
@@ -641,6 +642,10 @@ impl Database {
                     rows,
                 },
             )?;
+            #[cfg(test)]
+            if let Some(hook) = self.fulltext_copy_statistics_test_hook.lock().unwrap().take() {
+                hook.pause();
+            }
         }
         Ok(())
     }

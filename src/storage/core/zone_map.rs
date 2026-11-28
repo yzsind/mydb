@@ -8380,10 +8380,6 @@ impl Database {
         Ok(())
     }
 
-    pub(crate) fn flush_for_rename_zone_map(&self, storage_id: u64) -> Result<(), QueryError> {
-        self.forget_zone_map(storage_id)
-    }
-
     fn open_paged_zone_map(
         &self,
         storage_id: u64,

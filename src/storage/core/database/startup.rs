@@ -719,6 +719,9 @@ impl Database {
             return Ok(false);
         }
         Self::pad_full_row_to_schema(&mut row.values, table);
+        if !table.index_contains_row(index, &row.values)? {
+            return Ok(false);
+        }
         Ok(table.stored_index_key(index, &row.values)? == *key)
     }
 

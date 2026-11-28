@@ -4705,6 +4705,7 @@ include!("core/database/online_constraints.rs");
 include!("core/database/constraint_index_merge.rs");
 include!("core/database/constraint_baseline.rs");
 include!("core/database/online_copy.rs");
+include!("core/database/online_exchange.rs");
 include!("core/database/copy_file_publication.rs");
 include!("core/database/partition_reorg.rs");
 include!("core/database/ctas_recovery.rs");
