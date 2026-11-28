@@ -26,7 +26,19 @@ reductions use snapshot validation and incremental catch-up. `LOCK=DEFAULT` and
 `LOCK=NONE` permit writes during validation; prepare and publish use brief
 writer barriers that continue to allow readers. `LOCK=SHARED/EXCLUSIVE` retains
 the requested write exclusion. The storage generation stays unchanged, and the
-base scan projects only the constrained columns.
+base scan projects only the constrained columns when no CHECK or FK needs the complete row.
+
+Supported combinations of encoding-compatible column changes, CHECK/FK actions,
+and column defaults/comments/visibility/order, index visibility, table metadata
+options and PCTFREE/PCTUSED share one private candidate and publish together.
+For example, `ALTER TABLE t MODIFY v INT NOT NULL, ALTER COLUMN v SET DEFAULT 7,
+COMMENT='validated', LOCK=NONE` permits DML during validation. Existing rows keep
+their previous instant-column backfill defaults. Pure metadata combinations also
+publish once and allow readers. Zone Map option changes, AUTO_INCREMENT counter
+changes, renames and physical rewrites are outside this combined validation plan;
+their existing capability checks and lock contracts continue to apply.
+Inline CHECK declarations inside MODIFY/CHANGE retain their existing execution
+plan; express a new CHECK as an ADD CHECK action to share this validation candidate.
 
 Concurrent writes continue to follow the published definition. If a committed
 row still violates the candidate at certification, the ALTER fails and keeps
