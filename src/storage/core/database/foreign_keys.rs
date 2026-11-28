@@ -2071,6 +2071,7 @@ impl Database {
         // Phase 2: create the backing index (synchronous build) if needed.
         let created_backing_index = backing_index.as_ref().map(|index| index.name.clone());
         if let Some(index) = backing_index {
+            let _preparation = crate::binlog::suspend_ddl_txn_context();
             self.add_index(table_name, index)?;
         }
         fk_schema.backing_index_id = self
@@ -2157,7 +2158,7 @@ impl Database {
             build_fk_runtime(&mut catalog);
             drop(catalog);
             self.note_catalog_table(table_id);
-            self.commit_catalog_txn()
+            self.commit_ddl_catalog_txn()
         })();
         let release = self.rollback_txn(ddl_txn.txn_id);
         let outcome = match (result, release) {
@@ -2167,6 +2168,7 @@ impl Database {
         };
         if outcome.is_err() {
             if let Some(index_name) = created_backing_index {
+                let _compensation = crate::binlog::suspend_ddl_txn_context();
                 let _ = self.drop_index(table_name, &index_name);
             }
         }
@@ -2224,7 +2226,7 @@ impl Database {
             build_fk_runtime(&mut catalog);
         }
         self.note_catalog_table(table_id);
-        self.commit_catalog_txn()?;
+        self.commit_ddl_catalog_txn()?;
         Ok(true)
     }
 }

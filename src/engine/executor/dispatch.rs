@@ -3556,18 +3556,6 @@ pub(super) fn execute_statement_with_qualification(
     }
 }
 
-/// Public re-exportable wrapper used by the event scheduler so it can
-/// drive the full dispatch pipeline without exposing the inner module
-/// as `pub`.
-pub(super) fn dispatch_execute_statement(
-    db: &Arc<Database>,
-    session: &mut SessionContext,
-    statement: Statement,
-    registry: &SessionRegistry,
-) -> Result<QueryResponse, QueryError> {
-    execute_statement(db, session, statement, registry)
-}
-
 pub(super) fn account_key(account: &AccountIdent) -> AccountKey {
     AccountKey::new(account.user.clone(), account.host.clone())
 }
@@ -7891,7 +7879,15 @@ fn execute_sql_prepared(
             session.prepared_numeric_parameter_types = context.parameters.clone();
         }
         crate::engine::params::with_params(params, || {
-            let execute = || execute_statement(db, session, statement, registry);
+            let execute = || {
+                super::execute_child_statement(
+                    db,
+                    session,
+                    statement,
+                    registry,
+                    &prepared.original_sql,
+                )
+            };
             match int_div_context {
                 Some(context) => {
                     crate::engine::expr::with_integer_overflow_context(context, execute)
@@ -10711,9 +10707,7 @@ pub(super) fn execute_qualified_statement(
         Statement::FlushLogs { kind } => {
             implicit_commit_for_ddl(db, session)?;
             if kind == crate::engine::logging::FlushLogKind::All {
-                if let Some(manager) = crate::binlog::manager() {
-                    manager.rotate()?;
-                }
+                crate::binlog::rotate_binary_logs_if_enabled()?;
             }
             if let Some(service) = crate::engine::logging::active_service() {
                 service.flush(kind)?;

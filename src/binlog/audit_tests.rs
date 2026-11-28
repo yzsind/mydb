@@ -914,3 +914,35 @@ fn audit_binlog_read_benchmark() {
         state.rebuild_file_index();
     }
 }
+
+#[test]
+fn audit1128_event_admission_matches_replication_packet_limit() {
+    for checksum in [BinlogChecksum::None, BinlogChecksum::Crc32] {
+        let config = BinlogConfig {
+            checksum,
+            ..Default::default()
+        };
+        for forced in [false, true] {
+            let overhead = EVENT_HEADER_LEN as usize
+                + usize::from(forced || checksum == BinlogChecksum::Crc32) * 4;
+            let max = MAX_REPLICATION_PACKET_BYTES - 3;
+            assert_eq!(
+                encoded_event_size(&config, max - overhead, forced).unwrap(),
+                max as u64
+            );
+            for length in [
+                max - overhead + 1,
+                MAX_REPLICATION_PACKET_BYTES,
+                u32::MAX as usize,
+                usize::MAX,
+            ] {
+                assert_eq!(
+                    encoded_event_size(&config, length, forced)
+                        .unwrap_err()
+                        .code(),
+                    1118
+                );
+            }
+        }
+    }
+}

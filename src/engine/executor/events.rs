@@ -753,18 +753,26 @@ fn run_event_body_with_tracking(
             // changes must be visible to expression evaluation on that worker.
             unsafe {
                 crate::engine::expr::with_session_expr_info_raw(session_ptr, || {
-                    if let Ok(statements) = parse_statements(&event.body_sql) {
-                        for statement in statements {
+                    let _mode =
+                        crate::parser::ParserSqlModeGuard::activate(session.temporal_sql_mode_bits);
+                    let (effective, ranges) = crate::parser::split_query_statements(
+                        &event.body_sql,
+                        session.temporal_sql_mode_bits,
+                    );
+                    if let Some(statements) = parse_statements(&event.body_sql)
+                        .ok()
+                        .filter(|statements| statements.len() == ranges.len())
+                    {
+                        for (statement, range) in statements.into_iter().zip(ranges) {
                             crate::mysql::connection_manager::record_internal_query();
                             super::authorize_statement(db, &session, &statement)?;
-                            super::routines::result_sink::discard(
-                                super::dispatch_execute_statement(
-                                    db,
-                                    &mut session,
-                                    statement,
-                                    registry,
-                                )?,
-                            )?;
+                            super::routines::result_sink::discard(super::execute_child_statement(
+                                db,
+                                &mut session,
+                                statement,
+                                registry,
+                                &effective[range],
+                            )?)?;
                         }
                         Ok(())
                     } else {
@@ -1888,6 +1896,55 @@ mod lifecycle_tests {
                 .await
                 .expect("scheduler wakeup was lost before the waiter registered");
         });
+    }
+    #[test]
+    fn audit1128_event_simple_and_compound_ddl_share_atomic_binlog_path() {
+        let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        let engine = super::super::StorageQueryEngine::open(dir.path()).unwrap();
+        crate::binlog::init_global(
+            dir.path().into(),
+            crate::binlog::BinlogConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        struct Reset(std::path::PathBuf);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                let _ = crate::binlog::init_global(self.0.clone(), Default::default());
+            }
+        }
+        let _reset = Reset(dir.path().into());
+        engine
+            .execute("CREATE TABLE event_rows(Id INT PRIMARY KEY)")
+            .unwrap();
+        engine.execute("CREATE EVENT simple_ddl ON SCHEDULE EVERY 1 SECOND DISABLE DO TRUNCATE TABLE event_rows").unwrap();
+        engine.execute("CREATE EVENT compound_ddl ON SCHEDULE EVERY 1 SECOND DISABLE DO BEGIN CREATE TABLE EventMade(MixedId INT); ALTER TABLE EventMade ADD COLUMN OtherValue INT; END").unwrap();
+        let registry = crate::engine::SessionRegistry::new();
+        for name in ["simple_ddl", "compound_ddl"] {
+            let event = engine.db.event_definition("test", name).unwrap();
+            run_event_body_with_tracking(&engine.db, &registry, &event, None).unwrap();
+        }
+        let QueryResponse::ResultSet(events) = engine.execute("SHOW BINLOG EVENTS").unwrap() else {
+            panic!("expected events")
+        };
+        for expected in [
+            "TRUNCATE TABLE event_rows",
+            "CREATE TABLE EventMade(MixedId INT)",
+            "ALTER TABLE EventMade ADD COLUMN OtherValue INT",
+        ] {
+            assert_eq!(
+                events
+                    .rows
+                    .iter()
+                    .filter(|row| row.last().unwrap().to_display_string() == expected)
+                    .count(),
+                1,
+                "{expected}: {:?}",
+                events.rows
+            );
+        }
     }
 }
 

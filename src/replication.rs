@@ -39,6 +39,7 @@ use crate::util::logging::log_message;
 mod private_metadata;
 use private_metadata::ChannelDirectory;
 
+const SOURCE_RECEIVE_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_CHANNEL: &str = "default";
 const DEFAULT_REPL_PORT: u16 = 3306;
 const DEFAULT_REPL_SERVER_ID: u32 = 9001;
@@ -202,7 +203,15 @@ impl ReplicationStatus {
             source_uuid: String::new(),
             count_received_heartbeats: 0,
             last_heartbeat_at_unix_secs: 0,
+            last_source_activity: None,
         }
+    }
+
+    pub(crate) fn io_connected(&self) -> bool {
+        self.running
+            && self
+                .last_source_activity
+                .is_some_and(|seen| seen.elapsed() < SOURCE_RECEIVE_TIMEOUT)
     }
 
     /// MySQL 8.0 `SHOW REPLICA STATUS` column layout — 60 fields in the
@@ -283,7 +292,11 @@ impl ReplicationStatus {
             Value::String(self.relay_log_file.clone()), // 8  Relay_Log_File
             Value::UInt(self.relay_log_pos),         // 9  Relay_Log_Pos
             Value::String(self.exec_source_log_file.clone()), // 10 Relay_Source_Log_File
-            yes_no(self.running),                    // 11 Replica_IO_Running
+            if self.running && !self.io_connected() {
+                Value::String("Connecting".into())
+            } else {
+                yes_no(self.running)
+            }, // 11 Replica_IO_Running
             yes_no(self.sql_running),                // 12 Replica_SQL_Running
             csv(&cfg.do_databases),                  // 13 Replicate_Do_DB
             csv(&cfg.ignore_databases),              // 14 Replicate_Ignore_DB
@@ -310,7 +323,7 @@ impl ReplicationStatus {
             Value::String(cfg.ssl_key.clone().unwrap_or_default()), // 32 Source_SSL_Key
             // MySQL reports NULL while the SQL (applier) thread is not running
             // — there is no meaningful "behind" measure without an applier.
-            if self.sql_running {
+            if self.sql_running && self.io_connected() {
                 if self.running
                     && !self.source_log_file.is_empty()
                     && self.exec_source_log_file == self.source_log_file
@@ -524,6 +537,7 @@ struct ChannelRuntime {
     /// admin. The SQL thread consults this after each transaction commit
     /// (DDL or XID) and stops itself when the condition fires.
     until: Mutex<Option<UntilCondition>>,
+    until_completed: AtomicBool,
     flush_policy: ReplicationFlushPolicy,
     /// Cached relay-log writer. We keep the file open across events to
     /// avoid the open/close syscall pair per record (TPC-C TM = ~32k
@@ -961,6 +975,7 @@ impl ReplicationManager {
                         io_join: Mutex::new(None),
                         sql_join: Mutex::new(None),
                         until: Mutex::new(None),
+                        until_completed: AtomicBool::new(false),
                         flush_policy: ReplicationFlushPolicy::from_env(),
                         relay_writer: Mutex::new(None),
                         relay_sync: Mutex::new(RelaySyncState::default()),
@@ -1112,12 +1127,15 @@ impl ReplicationManager {
         }
         // Install the UNTIL condition before the SQL thread spins up; it reads
         // it on each commit and self-stops when matched.
+        if !matches!(sel, ReplThreadSel::Io)
+            && (until.is_some() || runtime.until_completed.load(Ordering::Acquire))
         {
             let mut slot = runtime
                 .until
                 .lock()
                 .map_err(|_| poisoned_lock("replication until lock poisoned"))?;
             *slot = until;
+            runtime.until_completed.store(false, Ordering::Release);
         }
         let cfg = runtime
             .config
@@ -1423,6 +1441,7 @@ impl ReplicationManager {
         runtime.relay_cond.notify_all();
         let _ = fs::remove_file(relay_log_path(&self.data_dir, channel));
         *runtime.until.lock().map_err(|_| relay_lock_error())? = None;
+        runtime.until_completed.store(false, Ordering::Release);
         self.persist_runtime(&runtime)
     }
 
@@ -1607,6 +1626,7 @@ impl ReplicationManager {
             io_join: Mutex::new(None),
             sql_join: Mutex::new(None),
             until: Mutex::new(None),
+            until_completed: AtomicBool::new(false),
             flush_policy: ReplicationFlushPolicy::from_env(),
             relay_writer: Mutex::new(None),
             relay_sync: Mutex::new(RelaySyncState::default()),
@@ -1687,6 +1707,24 @@ struct ChannelRunner {
     engine: Arc<StorageQueryEngine>,
     runtime: Arc<ChannelRuntime>,
     process_handle: Option<Arc<crate::engine::session_registry::SessionHandle>>,
+}
+
+fn source_connection_options(cfg: &ReplicationChannelConfig) -> mysql::OptsBuilder {
+    mysql::OptsBuilder::new()
+        .ip_or_hostname(Some(cfg.source_host.clone()))
+        .tcp_port(cfg.source_port)
+        .user(Some(cfg.source_user.clone()))
+        .pass(Some(cfg.source_password.clone()))
+        .prefer_socket(false)
+        // FULL UPDATE events contain both images and can exceed the source's
+        // SQL max_allowed_packet. The client protocol supports up to 1 GiB.
+        .max_allowed_packet(Some(crate::binlog::MAX_REPLICATION_PACKET_BYTES))
+        .tcp_connect_timeout(Some(Duration::from_millis(
+            cfg.connect_retry_ms.clamp(100, 5_000),
+        )))
+        .read_timeout(Some(SOURCE_RECEIVE_TIMEOUT))
+        .write_timeout(Some(SOURCE_RECEIVE_TIMEOUT))
+        .tcp_keepalive_time_ms(Some(10_000))
 }
 
 impl ChannelRunner {
@@ -2603,7 +2641,7 @@ impl ChannelRunner {
                 return Err(err);
             }
         } else {
-            self.persist_runtime_maybe();
+            self.persist_runtime_maybe(true);
         }
         Ok(())
     }
@@ -2620,7 +2658,7 @@ impl ChannelRunner {
         if let Ok(mut committed) = self.runtime.io_committed_pos.lock() {
             *committed = Some((file.to_string(), pos));
         }
-        self.persist_runtime_maybe();
+        self.persist_runtime_maybe(true);
     }
 
     /// IO thread commit boundary (XID or `COMMIT` query). Durably writes a
@@ -2648,11 +2686,16 @@ impl ChannelRunner {
         Ok(())
     }
 
-    fn persist_runtime_maybe(&self) {
+    fn persist_runtime_maybe(&self, changed: bool) {
         let Ok(mut progress) = self.runtime.progress_persist.lock() else {
             return;
         };
-        progress.pending_updates = progress.pending_updates.saturating_add(1);
+        if changed {
+            progress.pending_updates = progress.pending_updates.saturating_add(1);
+        }
+        if progress.pending_updates == 0 {
+            return;
+        }
         if progress.pending_updates < self.runtime.flush_policy.progress_sync_txns
             && progress.last_sync.elapsed() < self.runtime.flush_policy.progress_sync_interval
         {
@@ -2691,6 +2734,7 @@ impl ChannelRunner {
     /// Common `START REPLICA UNTIL` self-stop: set the master stop so both
     /// threads wind down after the matching transaction.
     fn stop_on_until(&self) {
+        self.runtime.until_completed.store(true, Ordering::Release);
         self.update_status(|status| {
             status.running = false;
             status.io_state = "stopped on UNTIL condition".to_string();
@@ -2704,25 +2748,15 @@ impl ChannelRunner {
         self.update_status(|status| {
             status.running = true;
             status.io_state = format!("connecting to {}", cfg.source_label());
+            status.last_source_activity = None;
         });
         // Read/keepalive timeouts protect the IO thread from silent TCP
         // half-open (NAT idle, firewall DROP, source crash without RST). The
-        // source binlog dump requests a sub-second heartbeat below, so any
-        // multi-second silence is real trouble — 30s read_timeout remains a
-        // generous transport-failure bound. Without this, `stream.next()` would block
+        // source binlog dump requests a sub-second heartbeat below, so five
+        // seconds of silence bounds failure detection. Without this, `stream.next()` would block
         // until the OS TCP keepalive (Linux default ~2h) and `SHOW REPLICA
         // STATUS` would keep reporting IO=Yes indefinitely.
-        let mut opts = mysql::OptsBuilder::new()
-            .ip_or_hostname(Some(cfg.source_host.clone()))
-            .tcp_port(cfg.source_port)
-            .user(Some(cfg.source_user.clone()))
-            .pass(Some(cfg.source_password.clone()))
-            .prefer_socket(false)
-            // FULL UPDATE events contain both images and can exceed the source's
-            // SQL max_allowed_packet. The client protocol supports up to 1 GiB.
-            .max_allowed_packet(Some(1024 * 1024 * 1024))
-            .read_timeout(Some(std::time::Duration::from_secs(30)))
-            .tcp_keepalive_time_ms(Some(10_000));
+        let mut opts = source_connection_options(cfg);
         if !cfg.ssl_mode.requires_tls() && require_secure_transport_for_replication() {
             mark_io_error_fatal();
             return Err(error(
@@ -2885,6 +2919,10 @@ impl ChannelRunner {
             let event_ts = header.timestamp() as u64;
             let checksum_ok = verify_binlog_event_crc32(&event);
             self.update_status(|status| {
+                status.last_source_activity = Some(Instant::now());
+                if status.last_io_error.take().is_some() && status.last_sql_error.is_none() {
+                    status.last_error = None;
+                }
                 status.received_events = status.received_events.saturating_add(1);
                 status.source_log_file = current_file.clone();
                 if next_pos != 0 {
@@ -2971,7 +3009,7 @@ impl ChannelRunner {
                 // and also gives throttled channel metadata a periodic flush
                 // opportunity.
                 self.sync_pending_relay(false)?;
-                self.persist_runtime_maybe();
+                self.persist_runtime_maybe(false);
                 // Heartbeat events do not advance any position — they only
                 // prove the source-to-replica IO pipe is alive. Track count
                 // and last-seen so `SHOW REPLICA STATUS` /
@@ -4178,6 +4216,7 @@ impl ChannelRunner {
         self.update_status(|status| {
             status.last_error = Some(err.message().to_string());
             status.io_state = "retrying after error".to_string();
+            status.last_source_activity = None;
             status.last_io_error = Some(thread_error);
         });
     }
@@ -4307,7 +4346,7 @@ fn apply_write_rows(
         // Retry rows individually so new rows in a mixed replay batch survive.
         Err(err) if err.is(crate::error::catalog::ER_DUP_ENTRY) && apply_is_idempotent() => {
             for row in rows {
-                match db.insert_row(txn, &table_name, row.clone()) {
+                match db.insert_rows_detailed(txn, &table_name, vec![row.clone()]) {
                     Ok(_) => {}
                     Err(e) if e.is(crate::error::catalog::ER_DUP_ENTRY) => {
                         continue;
@@ -4336,6 +4375,10 @@ fn apply_update_rows(
 ) -> Result<(), QueryError> {
     let table_name = crate::storage::table_key(database, table);
     let schema = db.table(&table_name)?;
+    let materialize_identity = schema
+        .columns
+        .iter()
+        .any(|column| column.generated_expr.is_some() && !column.generated_stored);
     // HASH_SCAN for keyless tables: build a one-shot row index so each
     // before-image is an O(1) lookup instead of a full-table rescan.
     let mut keyless = keyless_matcher(
@@ -4345,10 +4388,12 @@ fn apply_update_rows(
         rows.iter().map(|row| row.before.as_slice()),
     )?;
     for update in rows {
-        let _partition = replication_partition_guard(&schema, &update.before)?;
+        let before =
+            materialize_replication_identity(db, &schema, &update.before, materialize_identity)?;
+        let _partition = replication_partition_guard(&schema, &before)?;
         let before_match = match keyless.as_mut() {
-            Some(m) => m.take_match(&update.before),
-            None => find_matching_row(db, txn, &schema, &update.before)?,
+            Some(m) => m.take_match(&before),
+            None => find_matching_row(db, txn, &schema, &before)?,
         };
         if let Some(row_id) = before_match {
             let after = update.after.clone();
@@ -4397,12 +4442,17 @@ fn apply_delete_rows(
 ) -> Result<(), QueryError> {
     let table_name = crate::storage::table_key(database, table);
     let schema = db.table(&table_name)?;
+    let materialize_identity = schema
+        .columns
+        .iter()
+        .any(|column| column.generated_expr.is_some() && !column.generated_stored);
     let mut keyless = keyless_matcher(db, txn, &schema, rows.iter().map(Vec::as_slice))?;
     for row in rows {
-        let _partition = replication_partition_guard(&schema, row)?;
+        let row = materialize_replication_identity(db, &schema, row, materialize_identity)?;
+        let _partition = replication_partition_guard(&schema, &row)?;
         let matched = match keyless.as_mut() {
-            Some(m) => m.take_match(row),
-            None => find_matching_row(db, txn, &schema, row)?,
+            Some(m) => m.take_match(&row),
+            None => find_matching_row(db, txn, &schema, &row)?,
         };
         if let Some(row_id) = matched {
             db.delete_row_by_id(txn, &schema, row_id)?;
@@ -4426,6 +4476,21 @@ fn apply_delete_rows(
         }
     }
     Ok(())
+}
+
+/// Recompute replica-local virtual values before index probes or partition routing.
+fn materialize_replication_identity<'a>(
+    db: &Database,
+    table: &TableSchema,
+    image: &'a [Value],
+    needs_materialization: bool,
+) -> Result<std::borrow::Cow<'a, [Value]>, QueryError> {
+    if !needs_materialization {
+        return Ok(std::borrow::Cow::Borrowed(image));
+    }
+    let mut values = image.to_vec();
+    db.materialize_generated_columns_for_insert(table, &mut values)?;
+    Ok(std::borrow::Cow::Owned(values))
 }
 
 // FULL row images carry every partition key. Keep the identity probe and
@@ -4508,17 +4573,37 @@ fn row_values_match(table: &TableSchema, left: &[Value], right: &[Value]) -> boo
         })
 }
 
-fn image_match_value(value: &Value, trim_char: bool) -> Option<String> {
-    if matches!(value, Value::Null) {
-        return None;
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum ImageMatchValue {
+    Binary(Vec<u8>),
+    Geometry(Vec<u8>),
+    Text(String),
+}
+
+impl ImageMatchValue {
+    fn capacity(&self) -> usize {
+        match self {
+            Self::Binary(bytes) | Self::Geometry(bytes) => bytes.capacity(),
+            Self::Text(text) => text.capacity(),
+        }
     }
-    let mut text = value_to_string(value);
-    if trim_char {
-        text.truncate(crate::util::pad_space::trim_trailing_spaces_len(
-            text.as_bytes(),
-        ));
+}
+
+fn image_match_value(value: &Value, trim_char: bool) -> Option<ImageMatchValue> {
+    match value {
+        Value::Null => None,
+        Value::Bytes(bytes) => Some(ImageMatchValue::Binary(bytes.clone())),
+        Value::Geometry(bytes) => Some(ImageMatchValue::Geometry(bytes.clone())),
+        _ => {
+            let mut text = value_to_string(value);
+            if trim_char {
+                text.truncate(crate::util::pad_space::trim_trailing_spaces_len(
+                    text.as_bytes(),
+                ));
+            }
+            Some(ImageMatchValue::Text(text))
+        }
     }
-    Some(text)
 }
 
 /// Only source-authoritative values identify a FULL row image. Tombstones
@@ -4569,7 +4654,7 @@ fn has_usable_unique_index(table: &TableSchema) -> bool {
 /// repeated images in one event map to distinct physical rows.
 struct KeylessRowIndex {
     indices: Vec<(usize, bool)>,
-    map: std::collections::HashMap<Vec<Option<String>>, Vec<RowId>>,
+    map: std::collections::HashMap<Vec<Option<ImageMatchValue>>, Vec<RowId>>,
     _charge: crate::engine::executor::mem_budget::ControlledMemoryCharge,
 }
 
@@ -4593,21 +4678,21 @@ impl KeylessRowIndex {
             .collect::<Vec<_>>();
         let mut charge =
             ControlledMemoryCharge::try_new(ControlledMemoryCategory::BinlogTransient, 0)?;
-        let mut wanted: HashMap<Vec<Option<String>>, usize> = HashMap::new();
+        let mut wanted: HashMap<Vec<Option<ImageMatchValue>>, usize> = HashMap::new();
         for image in images {
             let key = Self::image_key(&indices, image);
             charge.try_grow(
                 key.iter()
                     .map(|s| {
-                        s.as_ref().map_or(0, String::capacity)
-                            + std::mem::size_of::<Option<String>>()
+                        s.as_ref().map_or(0, ImageMatchValue::capacity)
+                            + std::mem::size_of::<Option<ImageMatchValue>>()
                     })
                     .sum::<usize>()
                     .saturating_add(128 + 2 * std::mem::size_of::<RowId>()),
             )?;
             *wanted.entry(key).or_default() += 1;
         }
-        let mut map = HashMap::<Vec<Option<String>>, Vec<RowId>>::new();
+        let mut map = HashMap::<Vec<Option<ImageMatchValue>>, Vec<RowId>>::new();
         let mut remaining = wanted.values().copied().sum::<usize>();
         if remaining != 0 {
             db.dml_candidate_rows_with_origin_streaming_until(table, txn, |row| {
@@ -4629,7 +4714,7 @@ impl KeylessRowIndex {
         })
     }
 
-    fn image_key(indices: &[(usize, bool)], image: &[Value]) -> Vec<Option<String>> {
+    fn image_key(indices: &[(usize, bool)], image: &[Value]) -> Vec<Option<ImageMatchValue>> {
         indices
             .iter()
             .map(|&(idx, trim_char)| image_match_value(&image[idx], trim_char))
@@ -5221,7 +5306,7 @@ fn mysql_value_to_mydb(
         };
         if let Some(ordinal) = ordinal {
             return if ordinal == 0 {
-                Ok(Value::String(String::new()))
+                Ok(Value::Bytes(Vec::new()))
             } else {
                 usize::try_from(ordinal - 1)
                     .ok()
@@ -6567,9 +6652,7 @@ fn io_error_is_fatal(error: &QueryError, marked_fatal: bool) -> bool {
 }
 
 fn source_error_message(err: &mysql::Error) -> String {
-    std::error::Error::source(err)
-        .map(ToString::to_string)
-        .unwrap_or_else(|| "Source protocol or value conversion failed".to_string())
+    err.to_string()
 }
 
 fn source_io_error(action: &str, err: mysql::Error) -> QueryError {
@@ -6593,7 +6676,12 @@ fn source_io_error(action: &str, err: mysql::Error) -> QueryError {
                 )
             })
         }
-        mysql::Error::IoError(err) => error(
+        mysql::Error::DriverError(mysql::DriverError::Timeout) => error(
+            crate::error::catalog::CR_SERVER_LOST,
+            format!("{action} from source failed: operation timed out"),
+        ),
+        mysql::Error::CodecError(mysql_common::proto::codec::error::PacketCodecError::Io(err))
+        | mysql::Error::IoError(err) => error(
             crate::error::catalog::CR_SERVER_LOST,
             format!("{action} from source failed: {err}"),
         ),
@@ -7074,11 +7162,9 @@ fn decode_query_event_sql(
 /// Apply a `DdlSessionState` to the synthesized replica session so the
 /// downstream DDL sees the same effective session as the source.
 fn apply_ddl_session_state(session: &mut SessionContext, state: &DdlSessionState) {
-    if state.sql_mode != 0 {
-        session.sql_mode = crate::binlog::sql_mode_bits_to_str(state.sql_mode);
-        session.temporal_sql_mode_bits =
-            crate::engine::api::parse_temporal_sql_mode_bits(&session.sql_mode);
-    }
+    session.sql_mode = crate::binlog::sql_mode_bits_to_str(state.sql_mode);
+    session.temporal_sql_mode_bits =
+        crate::engine::api::parse_temporal_sql_mode_bits(&session.sql_mode);
     session.foreign_key_checks = state.foreign_key_checks;
     session.sysvars.unique_checks = state.unique_checks;
     if let Some(tz) = &state.time_zone {
@@ -8259,6 +8345,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut status = ReplicationStatus::from_config(&cfg, tmp.path());
         status.running = true;
+        status.last_source_activity = Some(Instant::now());
         status.sql_running = true;
         status.source_log_file = "binlog.000001".into();
         status.exec_source_log_file = status.source_log_file.clone();
@@ -9790,6 +9877,7 @@ mod tests {
             io_join: Mutex::new(None),
             sql_join: Mutex::new(None),
             until: Mutex::new(None),
+            until_completed: AtomicBool::new(false),
             flush_policy: ReplicationFlushPolicy {
                 relay_sync_txns: 1,
                 ..ReplicationFlushPolicy::default()
@@ -10412,6 +10500,7 @@ mod tests {
             io_join: Mutex::new(None),
             sql_join: Mutex::new(None),
             until: Mutex::new(None),
+            until_completed: AtomicBool::new(false),
             flush_policy,
             relay_writer: Mutex::new(None),
             relay_sync: Mutex::new(RelaySyncState::default()),
@@ -11218,6 +11307,7 @@ mod tests {
             io_join: Mutex::new(None),
             sql_join: Mutex::new(None),
             until: Mutex::new(None),
+            until_completed: AtomicBool::new(false),
             flush_policy: ReplicationFlushPolicy {
                 relay_sync_txns: 1,
                 ..ReplicationFlushPolicy::default()
@@ -11355,6 +11445,7 @@ mod tests {
         out
     }
     include!("replication_audit_1028_tests.rs");
+    include!("replication_audit_1128_tests.rs");
 }
 
 fn poisoned_lock(message: &str) -> QueryError {

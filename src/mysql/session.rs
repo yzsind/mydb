@@ -3668,6 +3668,9 @@ where
         let replacement = async {
             if let Some(notify) = replaced {
                 notify.notified().await;
+                // Give the dump a chance to send a fatal ERR at a packet boundary.
+                // A backpressured partial write still has a bounded cancellation path.
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             } else {
                 std::future::pending::<()>().await;
             }
@@ -3766,6 +3769,16 @@ where
         let mut ack_buf: Vec<u8> = Vec::with_capacity(MAX_SEMI_SYNC_ACK_FRAME);
         let mut ack_read_tmp = [0u8; 512];
         loop {
+            if self
+                .registered_replica_guard
+                .as_ref()
+                .is_some_and(|guard| guard.is_replaced())
+            {
+                let err = crate::error::catalog::ER_SOURCE_FATAL_ERROR_READING_BINLOG
+                    .error("A replica with the same server_id has connected to the source; use unique replica server_id values");
+                self.write_error_packet(sequence_id, &err).await?;
+                return Ok(());
+            }
             if let Err(err) = crate::repl::ensure_logical_source_supported() {
                 self.write_error_packet(sequence_id, &err).await?;
                 return Ok(());
@@ -3805,6 +3818,16 @@ where
                 }
                 let last = events.len().saturating_sub(1);
                 for (idx, event) in events.into_iter().enumerate() {
+                    if self
+                        .registered_replica_guard
+                        .as_ref()
+                        .is_some_and(|guard| guard.is_replaced())
+                    {
+                        let err = crate::error::catalog::ER_SOURCE_FATAL_ERROR_READING_BINLOG
+                            .error("A replica with the same server_id has connected to the source; use unique replica server_id values");
+                        self.write_error_packet(sequence_id, &err).await?;
+                        return Ok(());
+                    }
                     // One ACK per batch covers every earlier commit. The
                     // receiver resets its packet counter while sending that
                     // ACK; reset the outgoing counter at this event boundary,

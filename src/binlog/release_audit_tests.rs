@@ -64,7 +64,10 @@ async fn release_audit_binlog_replacement_cancels_only_previous_registration() {
         Arc::new(BinlogSourceManager::open(dir.path().into(), test_config(dir.path())).unwrap());
     let first = manager.register_replica(semi_sync_replica(42)).unwrap();
     let notify = first.cancellation();
+    assert!(!first.is_replaced());
     let second = manager.register_replica(semi_sync_replica(42)).unwrap();
+    assert!(first.is_replaced());
+    assert!(!second.is_replaced());
     tokio::time::timeout(Duration::from_millis(100), notify.notified())
         .await
         .unwrap();
