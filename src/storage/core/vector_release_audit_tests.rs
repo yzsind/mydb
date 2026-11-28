@@ -63,6 +63,12 @@ fn vector_release_dropped_maintenance_handle_cannot_fence_replacement() {
     engine.execute("DROP TABLE t").unwrap();
     assert!(graph.ensure_valid().is_err());
     assert!(db.vector_retired_graphs.lock().is_empty());
+    // A cold stale caller must not resurrect a graph while its old files are
+    // retained for asynchronous retirement.
+    db.evict_table_vector_graphs(table.id);
+    assert!(db
+        .vector_graph_get_or_build_for_partition(&table, index, table.id)
+        .is_err());
     engine.execute("CREATE TABLE t(id INT PRIMARY KEY,v VECTOR(2) NOT NULL, INDEX ix(v) USING HNSW WITH(quantization=sq8))").unwrap();
     db.vector_maintenance_error(
         &table,

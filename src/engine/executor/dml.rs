@@ -803,8 +803,17 @@ pub(super) fn execute_update(
             // recheck while preserving matched-but-unchanged semantics.
             matched_rows.set(matched_rows.get() + 1);
             let new_values = apply_updates(values)?;
-            validate_view_check(&new_values)?;
-            Ok(new_values)
+            match validate_view_check(&new_values) {
+                Err(err) if stmt.ignore && crate::storage::ignorable_update_error(&err) => {
+                    crate::engine::api::push_statement_condition(
+                        crate::error::ConditionLevel::Warning,
+                        &err,
+                    );
+                    Ok(values.to_vec())
+                }
+                Err(err) => Err(err),
+                Ok(()) => Ok(new_values),
+            }
         };
         db.update_rows_with_changed_columns_noop_at(
             txn,

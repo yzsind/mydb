@@ -95,6 +95,7 @@ mod multi_table;
 pub(crate) mod partition_clause;
 pub(crate) mod partition_router;
 mod prepared_dml;
+mod prepared_numeric;
 pub(super) mod qualification;
 mod returning;
 pub(crate) mod routines;
@@ -903,6 +904,33 @@ fn response_row_count(response: &QueryResponse) -> i64 {
     }
 }
 
+/// Routine and SQL EXECUTE bodies own their DDL context, just like top-level SQL.
+fn execute_child_statement(
+    db: &Arc<Database>,
+    session: &mut SessionContext,
+    statement: Statement,
+    registry: &SessionRegistry,
+    source_sql: &str,
+) -> Result<QueryResponse, QueryError> {
+    let is_ddl = is_ddl_statement(&statement);
+    let binloggable = is_ddl
+        && !matches!(
+            statement,
+            Statement::OptimizeTable { .. } | Statement::RecycleBin(_)
+        )
+        && !statement_is_temp_ddl(session, &statement);
+    let _context = (binloggable && session.sql_log_bin && crate::binlog::enabled()).then(|| {
+        crate::binlog::enter_ddl_txn_context(
+            &session.current_database,
+            &ddl_binlog_source_sql(source_sql, &statement, &session.authenticated_as),
+            &binlog_ctx_from_session(session),
+            &session.authenticated_as,
+        )
+    });
+    let result = dispatch::execute_statement(db, session, statement, registry);
+    maybe_log_binlog_ddl(db, session, is_ddl, binloggable, source_sql, result)
+}
+
 fn maybe_log_binlog_ddl(
     db: &Database,
     session: &SessionContext,
@@ -1135,45 +1163,28 @@ fn ddl_binlog_source_sql(sql: &str, statement: &Statement, account: &AccountKey)
                         .map_or(token.span.end, |end| end.span.end),
                     _ => token.span.end,
                 };
-                return normalize_sql(&format!(
+                return format!(
                     "{}{}{}",
                     &sql[..token.span.start],
                     account.display(),
                     &sql[end..]
-                ));
+                );
             }
             if !symbolic_definer
                 && token.kind == SqlTokenKind::Word
                 && (tokens.token_text(&token).eq_ignore_ascii_case(object)
                     || (object == "VIEW" && tokens.token_text(&token).eq_ignore_ascii_case("SQL")))
             {
-                return normalize_sql(&format!(
+                return format!(
                     "{}DEFINER={} {}",
                     &sql[..token.span.start],
                     account.display(),
                     &sql[token.span.start..]
-                ));
+                );
             }
         }
     }
-    if matches!(
-        statement,
-        Statement::CreateUser(_)
-            | Statement::AlterUser(_)
-            | Statement::AlterUsers(_)
-            | Statement::SetPassword { .. }
-            | Statement::CreateRole { .. }
-            | Statement::DropRole { .. }
-            | Statement::DropUser { .. }
-            | Statement::RenameUser { .. }
-            | Statement::Grant(_)
-            | Statement::Revoke(_)
-            | Statement::SetDefaultRole(_)
-    ) {
-        sql.to_string()
-    } else {
-        normalize_sql(sql)
-    }
+    sql.to_string()
 }
 
 fn bind_binlog_account_targets(
@@ -2066,7 +2077,8 @@ pub(super) fn plan_semantics(
         character_set_client: Arc::from(session.character_set_client.as_str()),
         character_set_connection: Arc::from(session.character_set_connection.as_str()),
         collation_connection: Arc::from(session.collation_connection.as_str()),
-        div_precision_increment: session.sysvars.div_precision_increment.min(30) as u8,
+        div_precision_increment: session.expression_div_precision_increment(),
+        prepared_numeric_parameter_types: session.prepared_numeric_parameter_types.clone(),
         group_concat_max_len: session.group_concat_max_len,
     }
 }
@@ -3966,6 +3978,29 @@ impl QueryEngine for StorageQueryEngine {
 
     fn shutdown(&self) -> Result<(), QueryError> {
         StorageQueryEngine::shutdown(self)
+    }
+
+    fn prepare_numeric_context(
+        &self,
+        session: &SessionContext,
+        statement: Option<&Statement>,
+    ) -> Result<Option<crate::engine::api::PreparedNumericContext>, QueryError> {
+        match statement {
+            Some(statement) => prepared_numeric::bind(&self.db, session, statement),
+            None => Ok(None),
+        }
+    }
+
+    fn refresh_prepared_numeric_context(
+        &self,
+        session: &SessionContext,
+        statement: Option<&Statement>,
+        context: &mut Option<crate::engine::api::PreparedNumericContext>,
+    ) -> Result<Option<u8>, QueryError> {
+        match statement {
+            Some(statement) => prepared_numeric::refresh(&self.db, session, statement, context),
+            None => Ok(None),
+        }
     }
 
     fn prepare_statement_template(
@@ -6368,15 +6403,26 @@ impl StorageQueryEngine {
         // type-affecting session state as EXECUTE. Previously this path ran
         // outside both TLS scopes, so GROUP_CONCAT always advertised the
         // default 1024 cap and div/collation inference could use defaults.
+        let numeric = prepared_numeric::bind(&self.db, session, &statement)?;
+        let saved_precision = session.prepared_div_precision_increment;
+        let saved_types = session.prepared_numeric_parameter_types.take();
+        session.prepared_div_precision_increment =
+            numeric.as_ref().map(|context| context.precision);
+        session.prepared_numeric_parameter_types = numeric
+            .as_ref()
+            .and_then(|context| context.parameters.clone());
         let group_concat_max_len = session.group_concat_max_len;
-        crate::engine::executor::select::aggregate::with_group_concat_max_len(
+        let columns = crate::engine::executor::select::aggregate::with_group_concat_max_len(
             group_concat_max_len,
             || {
                 crate::engine::expr::with_session_expr_info(session, || {
                     describe_statement_columns(&self.db, session, &statement)
                 })
             },
-        )
+        );
+        session.prepared_div_precision_increment = saved_precision;
+        session.prepared_numeric_parameter_types = saved_types;
+        columns
     }
 
     fn execute_with_log_metadata(

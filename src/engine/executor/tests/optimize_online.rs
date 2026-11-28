@@ -621,7 +621,7 @@ fn optimize_online_cached_dml_rebind_keeps_explicit_transaction() {
 }
 
 #[test]
-fn optimize_online_rejects_partitioned_fulltext_before_rebuild() {
+fn optimize_online_rebuilds_partitioned_fulltext() {
     let dir = tempfile::tempdir().unwrap();
     let engine = open_strict_test_engine(dir.path());
     engine.execute("CREATE TABLE t(id INT PRIMARY KEY,body TEXT,FULLTEXT KEY ft(body)) PARTITION BY HASH(id) PARTITIONS 2").unwrap();
@@ -631,11 +631,13 @@ fn optimize_online_rejects_partitioned_fulltext_before_rebuild() {
     let old = engine.database().table("test.t").unwrap();
     let expected = rows(&engine, "SELECT * FROM t ORDER BY id");
     let result = rows(&engine, "OPTIMIZE TABLE t");
-    assert_eq!(result[0][2], Value::String("Error".into()));
-    assert!(result[0][3]
-        .to_display_string()
-        .contains("partitioned FULLTEXT"));
-    assert_eq!(
+    assert!(
+        result
+            .iter()
+            .all(|row| row[2].to_display_string() != "Error"),
+        "{result:?}"
+    );
+    assert_ne!(
         engine.database().table("test.t").unwrap().storage_ids(),
         old.storage_ids()
     );

@@ -366,6 +366,13 @@ impl CatalogManager {
         }
     }
 
+    fn clear_dd_object_rows(&self) -> Result<(), QueryError> {
+        self.dd_rows_by_object.write().map_err(|_| {
+            error(crate::error::catalog::ER_GET_ERRNO, "catalog row locator cache lock poisoned")
+        })?.clear();
+        Ok(())
+    }
+
     fn register_table(&self, key: &str, table: &TableSchema) {
         if !table.foreign_keys.is_empty() {
             self.has_foreign_keys.store(true, Ordering::Release);
@@ -593,14 +600,45 @@ impl CatalogManager {
         } else {
             Vec::new()
         };
+        // Remove the previous physical aliases before installing any new
+        // owner. EXCHANGE can reuse another changed object's id, so removing
+        // and inserting in one loop makes the result depend on object order.
+        let old_aliases = self
+            .table_headers
+            .read()
+            .map(|headers| {
+                known_keys
+                    .iter()
+                    .filter_map(|(id, key)| {
+                        let key = key.as_ref()?;
+                        let old = headers.get(key).filter(|old| old.id == *id)?;
+                        Some((
+                            key.clone(),
+                            std::iter::once(old.id)
+                                .chain(old.storage_ids())
+                                .collect::<Vec<_>>(),
+                        ))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
         let descriptors = changes
             .iter()
             .filter_map(|(_, current)| current.clone())
             .collect::<Vec<_>>();
         if let Ok(mut keys) = self.table_keys_by_id.write() {
+            for (key, aliases) in old_aliases {
+                for id in aliases {
+                    if keys.get(&id) == Some(&key) {
+                        keys.remove(&id);
+                    }
+                }
+            }
+            for (object_id, _) in &changes {
+                keys.remove(object_id);
+            }
             let mut installed = std::collections::BTreeSet::new();
-            for (object_id, current) in changes {
-                keys.remove(&object_id);
+            for (_, current) in changes {
                 if let Some((key, table)) = current {
                     if !installed.insert(key.clone()) {
                         continue;
@@ -746,6 +784,7 @@ struct CatalogTxn<'a> {
     sequence_changes: Vec<(Arc<SequenceSchema>, Option<Arc<SequenceSchema>>)>,
     sequence_leases: Vec<SequenceValueLease<'a>>,
     replacements: Vec<CatalogRowReplacement>,
+    fulltext_retirements: BTreeMap<u64, Vec<RetiredFulltextPrefix>>,
     delta_object_ids: Vec<u64>,
     delta_invalidate_all: bool,
     defer_table_publication: bool,
@@ -773,6 +812,7 @@ impl<'a> CatalogTxn<'a> {
             sequence_changes: Vec::new(),
             sequence_leases: Vec::new(),
             replacements: Vec::new(),
+            fulltext_retirements: BTreeMap::new(),
             delta_object_ids: Vec::new(),
             delta_invalidate_all: false,
             defer_table_publication: false,
@@ -810,6 +850,15 @@ impl<'a> CatalogTxn<'a> {
         self.commit_in(txn, false)
     }
 
+    fn retire_fulltext_prefix(&mut self, table_id: u64, prefix: RetiredFulltextPrefix) {
+        let prefixes = self.fulltext_retirements.entry(table_id).or_default();
+        if prefixes.iter().any(|existing| existing.covers(&prefix)) {
+            return;
+        }
+        prefixes.retain(|existing| !prefix.covers(existing));
+        prefixes.push(prefix);
+    }
+
     fn commit_ddl(self) -> Result<(), QueryError> {
         let txn = self.db.begin_txn()?;
         self.commit_in(txn, true)
@@ -824,6 +873,29 @@ impl<'a> CatalogTxn<'a> {
             db: self.db,
             txn_id: txn.txn_id,
         };
+        #[cfg(test)]
+        let retires_fulltext = !self.fulltext_retirements.is_empty();
+        for (table_id, prefixes) in std::mem::take(&mut self.fulltext_retirements) {
+            // Generation zero is outside physical index ownership. The actual
+            // writing transaction provides a durable unique identity, so a
+            // later DROP cannot overwrite a partially reclaimed older job.
+            let intent = DropTableIntent {
+                table_id,
+                retired_index: Some((txn.txn_id, 0)),
+                had_auto_increment: false,
+                database: String::new(),
+                table_name: String::new(),
+                files: Vec::new(),
+                vector_files: Vec::new(),
+                vector_directories: Vec::new(),
+                retired_table_cache: None,
+                retired_fulltext: Some(RetiredFulltextCounters {
+                    prefixes,
+                    resume: None,
+                }),
+            };
+            self.db.add_index_retirement(&mut self, &intent)?;
+        }
         if stage_ddl_binlog {
             if let Some((key, value)) = crate::replication::current_ddl_receipt()? {
                 self.replace(
@@ -928,6 +1000,7 @@ impl<'a> CatalogTxn<'a> {
         // Bind a fold/reset to its actual source transaction. Subsequent
         // histogram or DDL rewrites retain the marker and must not replay it.
         let mut generation_changes = HashSet::new();
+        let mut population_resets = HashSet::new();
         for replacement in &self.replacements {
             if replacement.dd_table_id != crate::storage::data_dictionary::DD_TABLES {
                 continue;
@@ -940,6 +1013,13 @@ impl<'a> CatalogTxn<'a> {
                     replacement.dd_table_id,
                     CatalogRowSelector::PrimaryValues(vec![Value::UInt(*id)]),
                 )?;
+                if let Some(Value::String(json)) = row.get(18) {
+                    let options: crate::storage::schema::TableOptions =
+                        serde_json::from_str(json).map_err(|_| crate::storage::stats_codec::corrupt())?;
+                    if options.row_generation_txn_id == txn.txn_id {
+                        population_resets.insert(*id);
+                    }
+                }
                 if old.first().is_some_and(|old| old.get(19) != row.get(19)) {
                     generation_changes.insert(*id);
                 }
@@ -971,6 +1051,10 @@ impl<'a> CatalogTxn<'a> {
                     replacement.dd_table_id,
                     CatalogRowSelector::PrimaryValues(vec![Value::UInt(id), Value::UInt(0)]),
                 )?;
+                if population_resets.contains(&id) {
+                    row[14] = Value::UInt(txn.txn_id);
+                    continue;
+                }
                 if let Some(old) = old.first() {
                     row[13] = if row[9] != old[9] && row[9] != Value::UInt(0) {
                         Value::UInt(txn.txn_id)
@@ -1067,6 +1151,16 @@ impl<'a> CatalogTxn<'a> {
                 crate::engine::auth::test_faults::hit("after_dd_rows")?;
             }
             #[cfg(test)]
+            if retires_fulltext {
+                self.db.crash_fulltext_retirement_for_test(txn.txn_id, 1)?;
+            }
+            #[cfg(test)]
+            if self.replacements.iter().any(|replacement| {
+                replacement.dd_table_id == crate::storage::data_dictionary::DD_FULLTEXT_COUNTERS
+            }) {
+                self.db.crash_fulltext_retirement_for_test(txn.txn_id, 3)?;
+            }
+            #[cfg(test)]
             if self.ai_mutation {
                 crate::engine::ai::catalog_faults::hit("after_dd_rows")?;
             }
@@ -1109,6 +1203,10 @@ impl<'a> CatalogTxn<'a> {
             CATALOG_TXN_ROLLBACKS.fetch_add(1, Ordering::Relaxed);
             return Err(err);
         }
+        #[cfg(test)]
+        if retires_fulltext {
+            self.db.crash_fulltext_retirement_for_test(txn.txn_id, 2)?;
+        }
         for id in auto_retirements { self.db.auto_increment.forget_table(id); }
         CATALOG_MUTATED_ROWS.fetch_add(mutation_rows, Ordering::Relaxed);
         CATALOG_TXN_COMMITS.fetch_add(1, Ordering::Relaxed);
@@ -1121,7 +1219,18 @@ impl<'a> CatalogTxn<'a> {
         self.sequence_changes.clear();
         self.db.catalog.publish_dd_object_rows(locator_updates);
         drop(_dd_commit_guards);
-        if !self.defer_table_publication {
+        // Reclaiming unreachable internal rows is not schema publication.
+        // Preserve prepared DML and dependency caches across every cleanup
+        // batch, while retaining normal publication for all defining DDL.
+        let retirement_only = self.delta_object_ids.is_empty()
+            && !self.delta_invalidate_all
+            && !self.replacements.is_empty()
+            && self.replacements.iter().all(|replacement| {
+                matches!(replacement.dd_table_id,
+                    crate::storage::data_dictionary::DD_FULLTEXT_COUNTERS
+                        | crate::storage::data_dictionary::DD_DDL_RETIREMENTS)
+            });
+        if !self.defer_table_publication && !retirement_only {
             self.db.catalog.publish_table_deltas(&self.delta_object_ids);
         }
         if let Some(publication) = security_publication { publication.publish(); }
@@ -1772,8 +1881,7 @@ impl Database {
                     if table.is_none() {
                         // Include private families left by an interrupted
                         // offline build that never acquired catalog metadata.
-                        txn.replace(crate::storage::data_dictionary::DD_FULLTEXT_COUNTERS,
-                            CatalogRowSelector::PrefixValues(vec![Value::UInt(table_id)]), Vec::new());
+                        self.stage_fulltext_table_retirement(&mut txn, table_id)?;
                     } else if let Some((generation, corpora, old_sids)) = old_fulltext.remove(&table_id) {
                         let retained = table.filter(|table| table.active_generation == generation)
                             .map(|table| table.indexes.iter().filter_map(|index| index.fulltext.as_ref().map(|meta| meta.corpus_id)).collect::<HashSet<_>>())
@@ -1787,19 +1895,27 @@ impl Database {
                                         .as_ref()
                                         .is_some_and(|meta| retained.contains(&meta.corpus_id))
                                 }) {
-                                    txn.replace(
-                                        crate::storage::data_dictionary::DD_FULLTEXT_COUNTERS,
-                                        CatalogRowSelector::PrefixValues(
-                                            self.fulltext_counter_prefix(table, index, *sid)?,
-                                        ),
-                                        Vec::new(),
-                                    );
+                                    txn.retire_fulltext_prefix(table_id, RetiredFulltextPrefix::Storage {
+                                        generation,
+                                        corpus_id: index.fulltext.as_ref().unwrap().corpus_id,
+                                        definition: fulltext_corpus_definition(table, index)?,
+                                        storage_id: *sid,
+                                    });
                                 }
                             }
                         }
-                        for corpus in corpora.difference(&retained) {
-                            txn.replace(crate::storage::data_dictionary::DD_FULLTEXT_COUNTERS,
-                                CatalogRowSelector::PrefixValues(vec![Value::UInt(table_id), Value::UInt(generation), Value::UInt(*corpus)]), Vec::new());
+                        if let Some(table) = table.filter(|table| table.active_generation != generation) {
+                            // Old scoring families are unreachable after a physical
+                            // generation switch. Retire them atomically, then reclaim
+                            // bounded batches without holding the publication lock.
+                            self.stage_fulltext_generation_retirement(&mut txn, table, generation)?;
+                        } else {
+                            for corpus in corpora.difference(&retained) {
+                                txn.retire_fulltext_prefix(
+                                    table_id,
+                                    RetiredFulltextPrefix::Corpus { generation, corpus_id: *corpus },
+                                );
+                            }
                         }
                     }
                     let rows = table
@@ -2228,7 +2344,9 @@ impl Database {
         table: &TableSchema,
         selector: &CatalogRowSelector,
     ) -> Result<Vec<RowId>, QueryError> {
-        if selector.whole_object() {
+        // Physical WAL replaces dictionary rows without running CatalogTxn's
+        // local locator publication. Resolve through the replicated indexes.
+        if !self.physical_replica_mode() && selector.whole_object() {
             if let Some(object_id) = selector.object_id() {
                 if let Some(row_ids) = self.catalog.dd_object_rows(table.id, object_id) {
                     return Ok(row_ids);
@@ -2892,7 +3010,12 @@ mod audit1123_fulltext_retirement_tests {
     #[test]
     fn audit1123_partition_ddl_retires_fulltext_counter_leaves() {
         let root = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
-        let engine = crate::engine::StorageQueryEngine::open(root.path()).unwrap();
+        let engine =
+            crate::engine::StorageQueryEngine::open_with_storage_config_without_background_workers(
+                root.path(),
+                crate::storage::StorageConfig::from_env(),
+            )
+            .unwrap();
         engine.execute("CREATE TABLE ft(k INT,s TEXT,FULLTEXT KEY f(s)) PARTITION BY RANGE(k)(PARTITION p0 VALUES LESS THAN(10),PARTITION pmax VALUES LESS THAN MAXVALUE)").unwrap();
         engine
             .execute("INSERT INTO ft VALUES(1,'alpha beta'),(11,'gamma delta')")
@@ -2907,7 +3030,18 @@ mod audit1123_fulltext_retirement_tests {
             .unwrap()
         };
         assert!(!counter_rows().is_empty());
+        let old_sids = db.table("ft").unwrap().storage_ids();
         engine.execute("ALTER TABLE ft DROP PARTITION p0").unwrap();
+        let current = db.table("ft").unwrap().storage_ids();
+        for sid in old_sids.iter().filter(|sid| !current.contains(sid)) {
+            assert!(db.catalog.table_key_by_id(*sid).is_none(), "retired leaf alias survived publication");
+        }
+        for _ in 0..32 {
+            if db.catalog_retirement_count_for_test() == 0 {
+                break;
+            }
+            db.maintain_catalog_retirements_until(|| false).unwrap();
+        }
         let live = db.table("ft").unwrap().storage_ids();
         assert!(counter_rows()
             .iter()

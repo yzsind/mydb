@@ -12,6 +12,18 @@ impl Drop for OnlineCopyHoldTimer {
     }
 }
 
+// All writable COPY entry points share the same derived-index backends.
+// Partitioned FULLTEXT readers use storage-qualified heap identities; private
+// COPY leaves build and replay their postings and corpus counters separately.
+fn online_copy_indexes_supported(source: &TableSchema) -> bool {
+    source.indexes.iter().all(|index| {
+        index.index_type.eq_ignore_ascii_case("BTREE")
+            || index.is_vector()
+            || index.is_spatial()
+            || index.is_fulltext()
+    })
+}
+
 // Online physical ALTER uses immutable read views and a private generation.
 // The log records transaction-qualified dirty rows, not speculative row images:
 // once a transaction is visible at a gap-free read watermark we materialize its
@@ -151,6 +163,21 @@ impl OnlineCopyRows {
 }
 
 impl Database {
+    /// Reserve the private assignments before exposing the new definition.
+    /// A replaced AUTO_INCREMENT column can leave an older cached allocator;
+    /// advancing its floor also preserves source-side reservations and gaps.
+    fn publish_alter_copy_auto_increment(
+        &self,
+        table: &TableSchema,
+        job: &AlterCopyJob,
+    ) -> Result<(), QueryError> {
+        let maximum = job.auto_increment_max.load(Ordering::Relaxed);
+        if maximum != 0 {
+            self.persist_auto_increment_max(table.id, maximum)?;
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(crate) fn install_online_copy_publish_test_hook(&self) -> Arc<DdlBackfillTestHook> {
         let hook = Arc::new(DdlBackfillTestHook::new());
@@ -164,28 +191,27 @@ impl Database {
         &self,
         table_name: &str,
         actions: &[crate::parser::AlterAction],
-        strict: bool,
+        _strict: bool,
         lock: crate::parser::AlterLock,
         copy_requested: bool,
     ) -> bool {
-        if (!strict && lock != crate::parser::AlterLock::Shared)
-            || !ddl_copy_streaming_enabled()
-            || (self.config.durability == DurabilityMode::Memory
-                && lock != crate::parser::AlterLock::Shared)
-        {
+        if !ddl_copy_streaming_enabled() {
             return false;
         }
         use crate::parser::AlterAction as A;
         if actions.is_empty()
             || !actions.iter().all(|a| match a {
-                A::AddColumn(column) => {
-                    !column.auto_increment || lock == crate::parser::AlterLock::Shared
-                }
+                A::AddColumn(_) => true,
                 A::ModifyColumn(_) | A::ChangeColumn { .. } => true,
-                A::AddIndex(i) => i.index_type.eq_ignore_ascii_case("BTREE"),
+                A::AddIndex(i) => i.index_type.eq_ignore_ascii_case("BTREE")
+                    || i.index_type.eq_ignore_ascii_case("FULLTEXT")
+                    || i.index_type.eq_ignore_ascii_case("SPATIAL")
+                    || i.index_type.eq_ignore_ascii_case("HNSW")
+                    || i.index_type.eq_ignore_ascii_case("IVF"),
                 A::Rebuild
                 | A::DropColumn(_)
                 | A::DropIndex(_)
+                | A::DropPrimaryKey
                 | A::MoveColumn { .. }
                 | A::SetColumnComment { .. }
                 | A::ConvertToCharset { .. } => true,
@@ -197,12 +223,7 @@ impl Database {
         let Ok(source) = self.table(table_name) else {
             return false;
         };
-        // Shared mode captures no concurrent writes, so derived special indexes
-        // only need the existing bulk builder. Writable replay stays BTREE/vector.
-        (source
-            .indexes
-            .iter()
-            .all(|index| index.index_type.eq_ignore_ascii_case("BTREE") || index.is_vector())
+        (online_copy_indexes_supported(&source)
             || (lock == crate::parser::AlterLock::Shared && !source.is_partitioned()))
             && (copy_requested
                 || actions.iter().any(|action| {
@@ -269,6 +290,9 @@ impl Database {
         };
         drop(barrier);
         self.unregister_alter_copy_job(source.id, result.as_ref().err());
+        if result.is_ok() {
+            self.request_catalog_retirement_cleanup();
+        }
         result
     }
 
@@ -323,6 +347,7 @@ impl Database {
         &self,
         source: &TableSchema,
         shadow: &TableSchema,
+        statistics: Option<&TableSchema>,
         ddl_txn: TxnView,
         job: &Arc<AlterCopyJob>,
         mapping: &mut OnlineCopyRows,
@@ -334,15 +359,36 @@ impl Database {
         let snapshot = StorageReadSnapshot::new(self);
         let read = snapshot.txn;
         let rows = self.take_online_copy_ready_rows(job, read)?;
+        let mut auto_values = BTreeMap::new();
+        let _auto_charge = crate::engine::executor::mem_budget::ControlledMemoryCharge::try_new(
+            crate::engine::executor::mem_budget::ControlledMemoryCategory::DdlOnlineLog,
+            if defaults.auto_increment.is_some() {
+                rows.rows.len().saturating_mul(192)
+            } else {
+                0
+            },
+        )?;
         let mut tail_bytes = 0usize;
         let count = rows.rows.len();
         // Remove the complete cohort before adding its replacement keys. A
         // committed transaction can swap unique values between multiple rows.
-        for (_, row) in &rows.rows {
+        for (storage_id, row) in &rows.rows {
             Self::check_alter_copy_cancelled(job)?;
             check_online_copy_deadline(deadline)?;
             if let Some(old_ref) = mapping.remove(row)? {
-                self.delete_online_copy_value(shadow, ddl_txn, old_ref)?;
+                let assigned = self.delete_online_copy_value(
+                    shadow,
+                    statistics,
+                    ddl_txn,
+                    old_ref,
+                    deadline,
+                    &mut tail_bytes,
+                )?;
+                if defaults.auto_increment.is_some() {
+                    if let Some(value) = assigned {
+                        auto_values.insert((*storage_id, *row), value);
+                    }
+                }
             }
         }
         for (storage_id, source_id) in rows.rows {
@@ -355,20 +401,19 @@ impl Database {
                 continue;
             };
             Self::pad_full_row_to_schema(&mut row.values, source);
-            let values =
-                self.prepare_alter_copy_values(shadow, row.values, strict, warnings, &defaults)?;
-            tail_bytes = tail_bytes.saturating_add(
-                crate::engine::executor::mem_budget::estimate_row_bytes(&values),
-            );
-            if deadline.is_some() && tail_bytes > 4 * 1024 * 1024 {
-                return Err(error(
-                    crate::error::catalog::ER_LOCK_WAIT_TIMEOUT,
-                    "online ALTER final tail exceeded 4 MiB; retry the ALTER",
-                ));
-            }
-            let location = self.insert_online_copy_value(shadow, ddl_txn, values)?;
+            let values = self.prepare_alter_copy_values_with_auto(
+                shadow,
+                row.values,
+                strict,
+                warnings,
+                &defaults,
+                auto_values.remove(&(storage_id, source_id)),
+            )?;
+            check_online_copy_tail_value(&values, deadline, &mut tail_bytes)?;
+            let location = self.insert_online_copy_value(shadow, statistics, ddl_txn, values)?;
             mapping.insert(source_id, location)?;
         }
+        check_online_copy_deadline(deadline)?;
         Self::set_alter_copy_job_replay_watermark(job, read.snapshot_scn);
         Ok(count)
     }
@@ -496,9 +541,12 @@ impl Database {
     fn delete_online_copy_value(
         &self,
         target: &TableSchema,
+        statistics: Option<&TableSchema>,
         txn: TxnView,
         location: crate::storage::DmlRowRef,
-    ) -> Result<(), QueryError> {
+        deadline: Option<Instant>,
+        tail_bytes: &mut usize,
+    ) -> Result<Option<Value>, QueryError> {
         let old = self
             .read_mvcc_row(location.storage_id, location.row_id)?
             .ok_or_else(|| {
@@ -507,6 +555,19 @@ impl Database {
                     "online ALTER shadow row is missing",
                 )
             })?;
+        check_online_copy_tail_value(&old.values, deadline, tail_bytes)?;
+        if let Some(statistics) = statistics {
+            self.maintain_fulltext_statistics(
+                txn.txn_id,
+                statistics,
+                if statistics.is_partitioned() {
+                    location.storage_id
+                } else {
+                    statistics.id
+                },
+                std::iter::once((Some(old.values.as_slice()), None)),
+            )?;
+        }
         for index in &target.indexes {
             for key in target.index_keys(index, &old.values)? {
                 self.with_index_dml(location.storage_id, &index.name, |file| {
@@ -529,12 +590,15 @@ impl Database {
             heap.delete(txn.txn_id, location.row_id)
         })?;
         self.free_external_refs(location.storage_id, &refs);
-        Ok(())
+        Ok(target
+            .auto_increment_column_index()
+            .and_then(|idx| old.values.get(idx).cloned()))
     }
 
     fn insert_online_copy_value(
         &self,
         target: &TableSchema,
+        statistics: Option<&TableSchema>,
         txn: TxnView,
         values: Vec<Value>,
     ) -> Result<crate::storage::DmlRowRef, QueryError> {
@@ -568,13 +632,26 @@ impl Database {
                 Ok((index.name.clone(), values.get(pos).cloned()))
             })
             .collect::<Result<Vec<_>, QueryError>>()?;
+        let rows = [values];
         let row_id = self.insert_online_copy_batch(
             txn.txn_id,
             storage_id,
             &target.row_codec,
             &[RowHeader::visible(txn.txn_id)],
-            &[values],
+            &rows,
         )?[0];
+        if let Some(statistics) = statistics {
+            self.maintain_fulltext_statistics(
+                txn.txn_id,
+                statistics,
+                if statistics.is_partitioned() {
+                    storage_id
+                } else {
+                    statistics.id
+                },
+                rows.iter().map(|row| (None, Some(row.as_slice()))),
+            )?;
+        }
         for (name, key) in keys {
             self.with_index_dml(storage_id, name, |file| {
                 file.insert_deferred(txn.txn_id, key, row_id, Some(self))
@@ -643,9 +720,23 @@ impl Database {
     ) -> Result<std::collections::BTreeSet<u64>, QueryError> {
         let _timer = OnlineIndexTimer(&DDL_COPY_REPLAY_US, Instant::now());
         let defaults = AlterCopyDefaults::new(source, target, job)?;
+        let statistics = target
+            .indexes
+            .iter()
+            .any(IndexSchema::is_fulltext)
+            .then_some(target);
         let snapshot = StorageReadSnapshot::new(self);
         let read = snapshot.txn;
         let rows = self.take_online_copy_ready_rows(job, read)?;
+        let mut auto_values = BTreeMap::new();
+        let _auto_charge = crate::engine::executor::mem_budget::ControlledMemoryCharge::try_new(
+            crate::engine::executor::mem_budget::ControlledMemoryCategory::DdlOnlineLog,
+            if defaults.auto_increment.is_some() {
+                rows.rows.len().saturating_mul(192)
+            } else {
+                0
+            },
+        )?;
         let mut tail_bytes = 0usize;
         let mut dirty = std::collections::BTreeSet::new();
         for (storage_id, row_id) in &rows.rows {
@@ -655,7 +746,19 @@ impl Database {
                 continue;
             };
             if let Some(old) = map.remove(row_id)? {
-                self.delete_online_copy_value(target, txn, old)?;
+                let assigned = self.delete_online_copy_value(
+                    target,
+                    statistics,
+                    txn,
+                    old,
+                    deadline,
+                    &mut tail_bytes,
+                )?;
+                if defaults.auto_increment.is_some() {
+                    if let Some(value) = assigned {
+                        auto_values.insert((*storage_id, *row_id), value);
+                    }
+                }
                 dirty.insert(old.storage_id);
                 *counts.entry(old.storage_id).or_default() -= 1;
             }
@@ -694,17 +797,15 @@ impl Database {
                 continue;
             };
             Self::pad_full_row_to_schema(&mut row.values, source);
-            let values =
-                self.prepare_alter_copy_values(target, row.values, strict, warnings, &defaults)?;
-            tail_bytes = tail_bytes.saturating_add(
-                crate::engine::executor::mem_budget::estimate_row_bytes(&values),
-            );
-            if deadline.is_some() && tail_bytes > 4 * 1024 * 1024 {
-                return Err(error(
-                    crate::error::catalog::ER_LOCK_WAIT_TIMEOUT,
-                    "online ALTER final tail exceeded 4 MiB; retry the ALTER",
-                ));
-            }
+            let values = self.prepare_alter_copy_values_with_auto(
+                target,
+                row.values,
+                strict,
+                warnings,
+                &defaults,
+                auto_values.remove(&(storage_id, row_id)),
+            )?;
+            check_online_copy_tail_value(&values, deadline, &mut tail_bytes)?;
             let target_id = if target.is_partitioned() {
                 target.route_row_to_partition(&values)?.storage_id
             } else {
@@ -716,13 +817,14 @@ impl Database {
                     "online partition rewrite would write into a retained leaf",
                 ));
             }
-            let location = self.insert_online_copy_value(target, txn, values)?;
+            let location = self.insert_online_copy_value(target, statistics, txn, values)?;
             dirty.insert(location.storage_id);
             maps.get_mut(&storage_id)
                 .unwrap()
                 .insert(row_id, location)?;
             *counts.entry(location.storage_id).or_default() += 1;
         }
+        check_online_copy_deadline(deadline)?;
         Self::set_alter_copy_job_replay_watermark(job, read.snapshot_scn);
         retained.watermark = read;
         Ok(dirty)
@@ -838,11 +940,16 @@ impl Database {
         // A private writer transaction alone does not pin RC undo. Register
         // the read horizon atomically with purge before choosing its snapshot.
         let is_reorg = rewrite.is_some();
+        let truncate = rewrite
+            .as_ref()
+            .is_some_and(|layout| layout.operation == "truncate_partition");
         let mut _source_snapshot = if is_reorg {
             None
         } else {
             Some(StorageReadSnapshot::new(self))
         };
+        let mut sync_guard = (self.config.durability != DurabilityMode::Memory)
+            .then(|| CopyPublicationGuard::new(self, job.job_id)).transpose()?;
         let txn = self.begin_txn()?;
         let _txn = OnlineCopyTxnGuard {
             db: self,
@@ -986,7 +1093,13 @@ impl Database {
                 &job,
             )?;
             let mut maps = BTreeMap::new();
-            for id in &source_ids {
+            // TRUNCATE publishes empty replacement leaves at the final
+            // barrier. Source writes in those leaves are intentionally
+            // discarded, including writes committed during preparation.
+            // Only retained-leaf population changes need replay; an absent
+            // mapping already selects that path in the shared replay code.
+            let copy_sources = if truncate { &[][..] } else { &source_ids[..] };
+            for id in copy_sources {
                 let mut map = OnlineCopyRows::new(self.data_dir(), job.job_id)?;
                 map.spill_path = self
                     .data_dir
@@ -1002,7 +1115,7 @@ impl Database {
             self.pause_ddl_backfill_for_test();
             let defaults = AlterCopyDefaults::new(&source, &target, &job)?;
             let scan_timer = OnlineIndexTimer(&DDL_COPY_SCAN_US, Instant::now());
-            for source_id in &source_ids {
+            for source_id in copy_sources {
                 let pages = self.with_heap_read(*source_id, |heap| heap.page_count())?;
                 DDL_COPY_SOURCE_BYTES
                     .fetch_add(pages.saturating_mul(PAGE_SIZE as u64), Ordering::Relaxed);
@@ -1083,6 +1196,9 @@ impl Database {
             for id in &build_ids {
                 self.build_online_copy_vectors(&target, *id)?;
             }
+            for id in &build_ids {
+                self.backfill_copied_fulltext_statistics(txn, &target, *id, *id)?;
+            }
             Self::set_alter_copy_job_state(&job, "CATCH_UP");
             let mut _held = None;
             if let Some(owner) = owner {
@@ -1104,6 +1220,9 @@ impl Database {
                         leaf.id = *id;
                         self.flush_online_copy_shadow(&leaf)?;
                         self.flush_online_copy_vectors(&target, *id)?;
+                    }
+                    if let Some(guard) = &mut sync_guard {
+                        for id in &build_ids { guard.retain_storage(&target, *id)?; }
                     }
                     for map in maps.values_mut() {
                         map.prepare_final_tail()?;
@@ -1160,10 +1279,11 @@ impl Database {
                         // Every target was flushed before taking X. Only
                         // tail-touched leaves require a second flush here.
                         for id in &dirty_targets {
-                            let mut leaf = target.clone();
-                            leaf.id = *id;
-                            self.flush_online_copy_shadow(&leaf)?;
-                            self.flush_online_copy_vectors(&target, *id)?;
+                            if let Some(guard) = &mut sync_guard {
+                                guard.retain_storage(&target, *id)?;
+                                guard.pending = true;
+                                self.flush_copy_storage_pages_without_sync(&target, *id)?;
+                            }
                         }
                         _held = Some(held);
                         break;
@@ -1194,6 +1314,7 @@ impl Database {
                 return Ok(warnings);
             }
             Self::enter_alter_copy_finalizing(&job)?;
+            self.publish_alter_copy_auto_increment(&target, &job)?;
             if is_reorg {
                 let live = self.table(&source.qualified_name())?;
                 target.stats = live.stats.clone();
@@ -1235,14 +1356,13 @@ impl Database {
             } else {
                 self.with_heap_read(target.id, |heap| heap.page_count())?
             };
-            for id in &build_ids {
-                self.backfill_copied_fulltext_statistics(txn, &target, *id, *id)?;
-            }
             let key = table_key(&source.database, &source.name);
             self.catalog_write()?
                 .tables
                 .insert(key.clone(), Arc::new(target.clone()));
             self.note_catalog_table(source.id);
+            #[cfg(test)]
+            self.copy_file_test_point(3)?;
             if let Err(err) = self.commit_catalog_txn_existing(txn) {
                 self.quarantine_mvcc(format!(
                     "online partition publication failed; restart recovery required: {}",
@@ -1253,6 +1373,8 @@ impl Database {
             }
             self.drop_table_modification_delta(source.id);
             committed = true;
+            #[cfg(test)]
+            self.copy_file_test_point(4)?;
             if is_reorg && partition_reorg_crash_at("after_swap") {
                 preserve_intent = true;
             }
@@ -1286,13 +1408,24 @@ impl Database {
                         .map(|(_, graph)| graph.clone()),
                 );
         }
-        if !committed {
+        if !committed && !self.mvcc_quarantined.load(Ordering::Acquire) {
             let _ = self.rollback_txn(txn.txn_id);
         }
         // Release the barriers before reclaiming obsolete private/source files.
         if let Some(owner) = owner {
             self.release_mdl_duration(owner, MdlDuration::Transaction);
         }
+        #[cfg(test)]
+        self.copy_file_test_point(5)?;
+        if let Some(guard) = &mut sync_guard {
+            if let Err(err) = guard.sync() {
+                self.quarantine_mvcc(format!("partition COPY deferred sync needs recovery: {}", err.message()));
+                self.unregister_reorg_storage_locs(&build_ids);
+                return Err(err);
+            }
+        }
+        #[cfg(test)]
+        self.copy_file_test_point(6)?;
         if preserve_intent {
             self.unregister_reorg_storage_locs(&build_ids);
             return result;
@@ -1488,7 +1621,16 @@ impl AlterCopyChangeLog {
     }
 }
 
-type OnlineCopyTxnGuard<'a> = RollbackTxnGuard<'a, true>;
+struct OnlineCopyTxnGuard<'a> { db: &'a Database, txn_id: u64 }
+impl Drop for OnlineCopyTxnGuard<'_> {
+    fn drop(&mut self) {
+        // An uncertain catalog decision is fail-stop; only restart may undo
+        // it. Ordinary pre-decision failures still roll back their candidate.
+        if !self.db.mvcc_quarantined.load(Ordering::Acquire)
+            && self.db.txns.read().slot(self.txn_id).is_some_and(|slot| slot.status == TxnStatus::Active)
+        { let _ = self.db.rollback_txn(self.txn_id); }
+    }
+}
 
 impl Database {
     fn build_online_copy_vectors(
@@ -1549,6 +1691,28 @@ fn online_copy_deadline() -> Instant {
         .min(60000);
     Instant::now() + Duration::from_millis(millis)
 }
+// Budget both old and new images. A deleted/shortened FULLTEXT document
+// must not bypass the byte limit before its old text is tokenized.
+fn check_online_copy_tail_value(
+    values: &[Value],
+    deadline: Option<Instant>,
+    tail_bytes: &mut usize,
+) -> Result<(), QueryError> {
+    if deadline.is_some() {
+        check_online_copy_deadline(deadline)?;
+        *tail_bytes = tail_bytes.saturating_add(
+            crate::engine::executor::mem_budget::estimate_row_bytes(values),
+        );
+        if *tail_bytes > 4 * 1024 * 1024 {
+            return Err(error(
+                crate::error::catalog::ER_LOCK_WAIT_TIMEOUT,
+                "online ALTER final tail exceeded 4 MiB; retry the ALTER",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn check_online_copy_deadline(deadline: Option<Instant>) -> Result<(), QueryError> {
     if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
         return Err(error(

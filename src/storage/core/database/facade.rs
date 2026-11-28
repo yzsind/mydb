@@ -830,7 +830,7 @@ impl Database {
             #[cfg(test)]
             vector_persist_failure: AtomicU64::new(0),
             vector_pending_wal: parking_lot::Mutex::new(BTreeMap::new()),
-            vector_copy_publications: parking_lot::Mutex::new(HashSet::new()),
+            vector_ddl_publications: parking_lot::Mutex::new(HashSet::new()),
             replica_vector_state: parking_lot::Mutex::new(ReplicaVectorState::default()),
             replica_vector_signal: parking_lot::Condvar::new(),
             vector_retired_graphs: parking_lot::Mutex::new(HashMap::new()),
@@ -871,6 +871,7 @@ impl Database {
             checkpoint_running: Mutex::new(()),
             replica_apply_checkpoint: RwLock::new(()),
             replica_applied_lsn_atomic: AtomicU64::new(replica_applied_seed),
+            replica_applied_logical_lsn_atomic: AtomicU64::new(replica_applied_seed),
             replica_restartpoint_tracker: Mutex::new(ReplicaRestartpointTracker::new(
                 replica_needs_full_sync,
             )),
@@ -960,6 +961,7 @@ impl Database {
             #[cfg(test)]
             recyclebin_test_free_pct: AtomicU64::new(u64::MAX),
             ddl_retirement_cleanup: parking_lot::Mutex::new(None),
+            ddl_retirement_waker: parking_lot::Mutex::new(None),
             partition_cleanup_background: AtomicBool::new(false),
             xa_reservations: parking_lot::Mutex::new(HashMap::new()),
             prepared_xa: parking_lot::RwLock::new(HashMap::new()),
@@ -984,6 +986,7 @@ impl Database {
             online_index_descriptors: parking_lot::RwLock::new(HashMap::new()),
             pending_primary_recovery: parking_lot::Mutex::new(Vec::new()),
             analyze_locks: parking_lot::Mutex::new(HashMap::new()),
+            copy_publication_wal: parking_lot::Mutex::new(BTreeMap::new()),
             #[cfg(test)]
             analyze_batch_test_hook: Mutex::new(None),
             #[cfg(test)]
@@ -997,6 +1000,10 @@ impl Database {
             #[cfg(test)]
             online_copy_publish_test_hook: Mutex::new(None),
             #[cfg(test)]
+            fulltext_copy_statistics_test_hook: Mutex::new(None),
+            #[cfg(test)]
+            retirement_cleanup_test_hook: Mutex::new(None),
+            #[cfg(test)]
             online_index_long_lived_wait_test_hook: Mutex::new(None),
             #[cfg(test)]
             vector_copy_committed_test_hook: Mutex::new(None),
@@ -1004,6 +1011,10 @@ impl Database {
             vector_apply_test_hook: Mutex::new(None),
             #[cfg(test)]
             online_index_validation_test_hook: Mutex::new(None),
+            #[cfg(test)]
+            copy_file_stage_test_hook: Mutex::new(None),
+            #[cfg(test)]
+            copy_sync_failure: AtomicBool::new(false),
         };
         for (table_id, (version, max_value, lsn)) in auto_increment_recovery {
             db.auto_increment.install(table_id, version, max_value)?;
@@ -1097,7 +1108,11 @@ impl Database {
         for table in db.catalog_read()?.tables.values() {
             db.primary_definition_highwater
                 .fetch_max(table.primary_definition_scn, Ordering::Release);
-            if table.primary_definition_scn != 0 {
+            if table.row_generation_txn_id != 0 {
+                db.primary_definition_highwater
+                    .fetch_max(db.visible_scn(), Ordering::Release);
+            }
+            if table.primary_definition_scn != 0 || table.row_generation_txn_id != 0 {
                 db.table_locks_sharded
                     .set_schema_floor(table.id, table.schema_version);
                 for id in table.storage_ids() {

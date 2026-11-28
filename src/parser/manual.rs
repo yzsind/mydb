@@ -5429,11 +5429,21 @@ fn parse_routine_set(sql: &str) -> Result<RoutineStmt, ParseError> {
 fn parse_routine_select_into(sql: &str) -> Result<RoutineStmt, ParseError> {
     let into = top_level_keyword_pos(sql, "INTO").unwrap();
     let after_into = into + "INTO".len();
+    if ["UNION", "INTERSECT", "EXCEPT", "INTO"]
+        .iter()
+        .any(|keyword| top_level_keyword_pos(&sql[after_into..], keyword).is_some())
+    {
+        let mut err = ParseError::at_zero(
+            "Misplaced INTO clause; INTO must be placed at the end of a set operation",
+        );
+        err.spec = crate::error::catalog::ER_MISPLACED_INTO;
+        return Err(err);
+    }
     let target_end = find_first_top_level_keyword(
         sql,
         after_into,
         &[
-            "FROM", "WHERE", "GROUP", "HAVING", "ORDER", "LIMIT", "FOR", "LOCK",
+            "FROM", "WHERE", "GROUP", "HAVING", "WINDOW", "ORDER", "LIMIT", "FOR", "LOCK",
         ],
     )
     .unwrap_or(sql.len());
@@ -5564,7 +5574,9 @@ fn parse_routine_while(label: Option<String>, sql: &str) -> Result<RoutineStmt, 
 fn parse_routine_repeat(label: Option<String>, sql: &str) -> Result<RoutineStmt, ParseError> {
     let after_repeat = consume_keyword_at(sql, 0, "REPEAT").unwrap_or(0);
     let inner = strip_compound_tail(after_repeat, sql, "END REPEAT", label.as_deref())?;
-    let until_pos = top_level_keyword_pos(inner, "UNTIL")
+    let until_pos = scan_routine_boundaries(inner, &["UNTIL"], true)
+        .1
+        .map(|(start, _, _)| start)
         .ok_or_else(|| parse_error_at_zero("REPEAT statement requires UNTIL"))?;
     Ok(RoutineStmt::Repeat {
         label,

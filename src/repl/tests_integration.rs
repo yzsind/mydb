@@ -700,6 +700,57 @@ mod online_apply {
     /// Bring up a replica engine with the production reconnect lifecycle.
     /// A local snapshot can temporarily block physical slot reclamation;
     /// retry it just as a running server would instead of ending the fixture.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wal_fault_seed_preflight_rejects_xa_without_slots_or_source_freeze() {
+        let (engine, _dir, service) = build_master_engine().await;
+        let endpoint = service.bind_addr().to_string();
+        let uuid = crate::repl::role::generate_uuid_string();
+        let config = ReplConfig::test_defaults();
+        crate::repl::base_backup::check_backup_source(&endpoint, &uuid, &config)
+            .await
+            .unwrap();
+        assert!(service.slots.lock().snapshot().is_empty());
+        let writer = engine.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut session = crate::engine::SessionContext::default();
+            for sql in [
+                "CREATE TABLE preflight(id INT)",
+                "XA START 'seed-check'",
+                "INSERT INTO preflight VALUES(1)",
+                "XA END 'seed-check'",
+                "XA PREPARE 'seed-check'",
+            ] {
+                writer.execute_with_session(&mut session, sql).unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        let err = crate::repl::base_backup::check_backup_source(&endpoint, &uuid, &config)
+            .await
+            .unwrap_err();
+        assert!(err.message().contains("XA PREPARED"), "{err:?}");
+        assert!(service.slots.lock().snapshot().is_empty());
+        let writer = engine.clone();
+        tokio::task::spawn_blocking(move || {
+            writer.execute("INSERT INTO preflight VALUES(2)").unwrap();
+            writer.execute("XA ROLLBACK 'seed-check'").unwrap();
+        })
+        .await
+        .unwrap();
+        crate::repl::base_backup::check_backup_source(&endpoint, &uuid, &config)
+            .await
+            .unwrap();
+        let mut bad_auth = config;
+        bad_auth.auth_token = "another-local-token-for-preflight".into();
+        assert!(
+            crate::repl::base_backup::check_backup_source(&endpoint, &uuid, &bad_auth)
+                .await
+                .is_err()
+        );
+        assert!(service.slots.lock().snapshot().is_empty());
+        service.shutdown().await;
+    }
+
     async fn spawn_replica(
         master_addr: std::net::SocketAddr,
     ) -> (
@@ -940,6 +991,356 @@ mod online_apply {
     }
 
     #[tokio::test]
+    async fn vector_online_ddl_replica_applies_private_base_and_committed_tail() {
+        struct Environment(Option<String>);
+        impl Drop for Environment {
+            fn drop(&mut self) {
+                if let Some(old) = &self.0 {
+                    std::env::set_var("MYDB_VECTOR_STORAGE", old);
+                } else {
+                    std::env::remove_var("MYDB_VECTOR_STORAGE");
+                }
+            }
+        }
+        let _environment = Environment(std::env::var("MYDB_VECTOR_STORAGE").ok());
+        for backend in ["memory", "paged"] {
+            std::env::set_var("MYDB_VECTOR_STORAGE", backend);
+            let (source, _source_dir, service) = build_master_engine().await;
+            let (replica, _replica_dir, mut lifecycle, _status) =
+                spawn_replica(service.bind_addr()).await;
+            for algo in ["HNSW", "IVF"] {
+                let writer = source.clone();
+                tokio::task::spawn_blocking(move || {
+                    writer
+                        .execute(
+                            "CREATE TABLE vector_live(id INT PRIMARY KEY,v VECTOR(2) NOT NULL)",
+                        )
+                        .unwrap();
+                    writer
+                        .execute("INSERT INTO vector_live VALUES(1,'[1,1]'),(2,'[2,2]')")
+                        .unwrap();
+                })
+                .await
+                .unwrap();
+                let hook = source
+                    .database_for_replication()
+                    .install_online_index_validation_test_hook();
+                let writer = source.clone();
+                let ddl = tokio::task::spawn_blocking(move || {
+                    let mut session = crate::engine::SessionContext::default();
+                    session.connection_id = 33071;
+                    writer.execute_with_session(
+                        &mut session,
+                        &format!("CREATE INDEX ix ON vector_live(v) USING {algo} LOCK=NONE"),
+                    )
+                });
+                let wait = hook.clone();
+                let reached = tokio::task::spawn_blocking(move || {
+                    wait.wait_until_reached(Duration::from_secs(10))
+                })
+                .await
+                .unwrap();
+                let writer = source.clone();
+                let writes = tokio::task::spawn_blocking(move || {
+                    writer.execute("UPDATE vector_live SET v='[9,9]' WHERE id=1")?;
+                    writer.execute("DELETE FROM vector_live WHERE id=2")?;
+                    writer.execute("INSERT INTO vector_live VALUES(3,'[0,0]')")?;
+                    writer.database_for_replication().checkpoint()
+                })
+                .await
+                .unwrap();
+                hook.release();
+                let result = ddl.await.unwrap();
+                assert!(reached, "{result:?}");
+                writes.unwrap();
+                result.unwrap();
+                let expected = vec![vec![Value::Int(3)], vec![Value::Int(1)]];
+                let query = "SELECT /*+ HNSW_EF(64) IVF_NPROBE(64) */ id FROM vector_live FORCE INDEX(ix) ORDER BY L2_DISTANCE(v,'[0,0]') LIMIT 2";
+                assert_eq!(
+                    poll_select_exact(&replica, query, &expected, 10000).await,
+                    expected,
+                    "{backend}/{algo}"
+                );
+                let writer = source.clone();
+                tokio::task::spawn_blocking(move || {
+                    writer.execute("DROP TABLE vector_live").unwrap()
+                })
+                .await
+                .unwrap();
+            }
+            lifecycle.stop_and_wait().await;
+            service.shutdown().await;
+        }
+    }
+
+    async fn resume_copy_replica(
+        dir: &std::path::Path,
+        master: std::net::SocketAddr,
+    ) -> (Arc<StorageQueryEngine>, ReceiverLifecycle) {
+        let directory = dir.to_path_buf();
+        let engine = tokio::task::spawn_blocking(move || {
+            Arc::new(
+                StorageQueryEngine::open_full(
+                    directory,
+                    QueryLogConfig::default(),
+                    Arc::new(SessionRegistry::new()),
+                )
+                .unwrap(),
+            )
+        })
+        .await
+        .unwrap();
+        let db = engine.database_for_replication().clone();
+        db.set_physical_replica_mode(true).unwrap();
+        let progress = crate::repl::replica::progress::load_progress(dir)
+            .unwrap()
+            .unwrap();
+        let role = crate::repl::role::load(dir).unwrap().unwrap();
+        let mut lifecycle = ReceiverLifecycle::new();
+        lifecycle
+            .start(
+                tokio::runtime::Handle::current(),
+                db.clone(),
+                db.wal_log(),
+                dir.to_path_buf(),
+                master.to_string(),
+                role.node_uuid.clone(),
+                ReplConfig {
+                    heartbeat: Duration::from_millis(10),
+                    reconnect_backoff: Duration::from_millis(10),
+                    ..ReplConfig::test_defaults()
+                },
+                progress.clone(),
+                Arc::new(PlMutex::new(String::new())),
+                Arc::new(PlMutex::new(progress)),
+                Arc::new(std::sync::Mutex::new(role)),
+            )
+            .unwrap();
+        (engine, lifecycle)
+    }
+
+    #[tokio::test]
+    async fn copy_file_publication_replica_restarts_after_binding_before_decision() {
+        let (source, _source_dir, service) = build_master_engine().await;
+        let (replica, replica_dir, mut lifecycle, _status) =
+            spawn_replica(service.bind_addr()).await;
+        let writer = source.clone();
+        tokio::task::spawn_blocking(move || {
+            writer
+                .execute(
+                    "CREATE TABLE copy_restart(id INT PRIMARY KEY,n INT,b LONGTEXT,INDEX ni(n))",
+                )
+                .unwrap();
+            writer
+                .execute("INSERT INTO copy_restart VALUES(1,10,REPEAT('x',20000)),(2,20,'base')")
+                .unwrap();
+        })
+        .await
+        .unwrap();
+        let expected = vec![
+            vec![Value::Int(1), Value::Int(10), Value::Int(20000)],
+            vec![Value::Int(2), Value::Int(20), Value::Int(4)],
+        ];
+        let sql = "SELECT id,n,LENGTH(b) FROM copy_restart ORDER BY id";
+        assert_eq!(
+            poll_select_exact(&replica, sql, &expected, 10000).await,
+            expected
+        );
+        let hook = source
+            .database_for_replication()
+            .install_copy_file_stage_test_hook(3);
+        let worker = source.clone();
+        let ddl = tokio::task::spawn_blocking(move || {
+            worker.execute("ALTER TABLE copy_restart MODIFY n BIGINT,LOCK=NONE")
+        });
+        let wait = hook.clone();
+        let reached =
+            tokio::task::spawn_blocking(move || wait.wait_until_reached(Duration::from_secs(15)))
+                .await
+                .unwrap();
+        if !reached {
+            hook.release();
+            panic!("DDL did not reach its binding: {:?}", ddl.await.unwrap());
+        }
+        let db = source.database_for_replication().clone();
+        let cutoff = tokio::task::spawn_blocking(move || {
+            let lsn = db.storage_status().current_lsn.saturating_sub(1);
+            LogManager::sync_durable_to(&db.wal_log(), lsn).unwrap();
+            lsn
+        })
+        .await
+        .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        while replica.database_for_replication().replica_applied_lsn() < cutoff {
+            if std::time::Instant::now() >= deadline {
+                hook.release();
+                panic!("replica did not apply the undecided binding");
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        lifecycle.stop_and_wait().await;
+        let checkpoint = replica.clone();
+        tokio::task::spawn_blocking(move || checkpoint.shutdown().unwrap())
+            .await
+            .unwrap();
+        drop(replica);
+        let (replica, mut resumed) =
+            resume_copy_replica(replica_dir.path(), service.bind_addr()).await;
+        assert_eq!(
+            poll_select_exact(&replica, sql, &expected, 10000).await,
+            expected,
+            "undecided DDL must retain source visibility"
+        );
+        hook.release();
+        ddl.await.unwrap().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        while replica
+            .database_for_replication()
+            .table("test.copy_restart")
+            .unwrap()
+            .active_generation
+            < 2
+        {
+            assert!(std::time::Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            poll_select_exact(&replica, sql, &expected, 10000).await,
+            expected
+        );
+        resumed.stop_and_wait().await;
+        let checkpoint = replica.clone();
+        tokio::task::spawn_blocking(move || checkpoint.shutdown().unwrap())
+            .await
+            .unwrap();
+        drop(replica);
+        let directory = replica_dir.path().to_path_buf();
+        let reopened = tokio::task::spawn_blocking(move || {
+            StorageQueryEngine::open_full(
+                directory,
+                QueryLogConfig::default(),
+                Arc::new(SessionRegistry::new()),
+            )
+            .unwrap()
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            poll_select_exact(&Arc::new(reopened), sql, &expected, 10000).await,
+            expected
+        );
+        service.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn copy_file_publication_replica_binds_base_and_lob_tail() {
+        struct Environment(Option<String>);
+        impl Drop for Environment {
+            fn drop(&mut self) {
+                if let Some(old) = &self.0 {
+                    std::env::set_var("MYDB_VECTOR_STORAGE", old);
+                } else {
+                    std::env::remove_var("MYDB_VECTOR_STORAGE");
+                }
+            }
+        }
+        let _environment = Environment(std::env::var("MYDB_VECTOR_STORAGE").ok());
+        for backend in ["memory", "paged"] {
+            std::env::set_var("MYDB_VECTOR_STORAGE", backend);
+            let (source, _source_dir, service) = build_master_engine().await;
+            let (replica, _replica_dir, mut lifecycle, _status) =
+                spawn_replica(service.bind_addr()).await;
+            for algo in ["HNSW", "IVF"] {
+                let writer = source.clone();
+                tokio::task::spawn_blocking(move || {
+                    writer
+                        .execute(&format!("CREATE TABLE vector_live(id INT PRIMARY KEY,n INT,b LONGTEXT,v VECTOR(2) NOT NULL,INDEX ix(v) USING {algo})"))
+                        .unwrap();
+                    writer
+                        .execute("INSERT INTO vector_live VALUES(1,10,'base','[1,1]'),(2,20,'base','[2,2]')")
+                        .unwrap();
+                })
+                .await
+                .unwrap();
+                let hook = source
+                    .database_for_replication()
+                    .install_online_copy_publish_test_hook();
+                let writer = source.clone();
+                let ddl = tokio::task::spawn_blocking(move || {
+                    let mut session = crate::engine::SessionContext::default();
+                    session.connection_id = 33071;
+                    writer.execute_with_session(
+                        &mut session,
+                        "ALTER TABLE vector_live MODIFY n BIGINT,LOCK=NONE",
+                    )
+                });
+                let wait = hook.clone();
+                let reached = tokio::task::spawn_blocking(move || {
+                    wait.wait_until_reached(Duration::from_secs(10))
+                })
+                .await
+                .unwrap();
+                let writer = source.clone();
+                let writes = tokio::task::spawn_blocking(move || {
+                    writer.execute(
+                        "UPDATE vector_live SET n=11,b=REPEAT('x',20000),v='[9,9]' WHERE id=1",
+                    )?;
+                    writer.execute("DELETE FROM vector_live WHERE id=2")?;
+                    writer.execute(
+                        "INSERT INTO vector_live VALUES(3,30,REPEAT('y',24000),'[0,0]')",
+                    )?;
+                    writer.database_for_replication().checkpoint()
+                })
+                .await
+                .unwrap();
+                hook.release();
+                let result = ddl.await.unwrap();
+                assert!(reached, "{result:?}");
+                writes.unwrap();
+                result.unwrap();
+                let expected = vec![vec![Value::Int(3)], vec![Value::Int(1)]];
+                let query = "SELECT /*+ HNSW_EF(64) IVF_NPROBE(64) */ id FROM vector_live FORCE INDEX(ix) ORDER BY L2_DISTANCE(v,'[0,0]') LIMIT 2";
+                assert_eq!(
+                    poll_select_exact(&replica, query, &expected, 10000).await,
+                    expected,
+                    "{backend}/{algo}"
+                );
+                assert_eq!(
+                    poll_select_exact(
+                        &replica,
+                        "SELECT id,n,LENGTH(b) FROM vector_live ORDER BY id",
+                        &vec![
+                            vec![Value::Int(1), Value::Int(11), Value::Int(20000)],
+                            vec![Value::Int(3), Value::Int(30), Value::Int(24000)]
+                        ],
+                        10000
+                    )
+                    .await,
+                    vec![
+                        vec![Value::Int(1), Value::Int(11), Value::Int(20000)],
+                        vec![Value::Int(3), Value::Int(30), Value::Int(24000)]
+                    ]
+                );
+                let checkpoint = replica.clone();
+                tokio::task::spawn_blocking(move || {
+                    checkpoint.database_for_replication().checkpoint()
+                })
+                .await
+                .unwrap()
+                .unwrap();
+                let writer = source.clone();
+                tokio::task::spawn_blocking(move || {
+                    writer.execute("DROP TABLE vector_live").unwrap()
+                })
+                .await
+                .unwrap();
+            }
+            lifecycle.stop_and_wait().await;
+            service.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
     async fn online_primary_key_publication_materializes_before_replica_reads() {
         let (source, _source_dir, service) = build_master_engine().await;
         let (replica, _replica_dir, mut lifecycle, _status) =
@@ -1034,8 +1435,436 @@ mod online_apply {
     }
 
     #[tokio::test]
+    async fn physical_replica_online_drop_column_replays_and_retires_indexes() {
+        let (source, _source_dir, service) = build_master_engine().await;
+        let (replica, _replica_dir, mut lifecycle, _status) =
+            spawn_replica(service.bind_addr()).await;
+        let writer = source.clone();
+        tokio::task::spawn_blocking(move || {
+            writer.execute("CREATE TABLE removed(id INT PRIMARY KEY,a INT,b INT,UNIQUE ab(a,b),INDEX ba(b,a))").unwrap();
+            writer.execute("INSERT INTO removed VALUES(1,10,100),(2,20,200)").unwrap();
+        }).await.unwrap();
+        let hook = source
+            .database_for_replication()
+            .install_ddl_backfill_test_hook();
+        let writer = source.clone();
+        let ddl = tokio::task::spawn_blocking(move || {
+            let mut session = crate::engine::SessionContext::default();
+            session.connection_id = 29901;
+            writer
+                .execute_with_session(&mut session, "ALTER TABLE removed DROP COLUMN a, LOCK=NONE")
+                .unwrap();
+        });
+        let wait = hook.clone();
+        assert!(tokio::task::spawn_blocking(
+            move || wait.wait_until_reached(Duration::from_secs(10))
+        )
+        .await
+        .unwrap());
+        let writer = source.clone();
+        tokio::task::spawn_blocking(move || {
+            writer
+                .execute("UPDATE removed SET b=101 WHERE id=1")
+                .unwrap();
+            writer
+                .execute("INSERT INTO removed VALUES(3,30,300)")
+                .unwrap();
+        })
+        .await
+        .unwrap();
+        hook.release();
+        ddl.await.unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if replica
+                .database_for_replication()
+                .table("test.removed")
+                .is_ok_and(|table| table.column_index("a").is_err())
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "replica did not publish column removal"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let writer = source.clone();
+        tokio::task::spawn_blocking(move || {
+            writer
+                .database_for_replication()
+                .maintain_catalog_retirements_until(|| false)
+                .unwrap();
+            writer
+                .execute("UPDATE removed SET b=201 WHERE id=2")
+                .unwrap();
+        })
+        .await
+        .unwrap();
+        let expected = vec![
+            vec![Value::Int(1), Value::Int(101)],
+            vec![Value::Int(2), Value::Int(201)],
+            vec![Value::Int(3), Value::Int(300)],
+        ];
+        for index in ["ab", "ba"] {
+            assert_eq!(
+                poll_select_exact(
+                    &replica,
+                    &format!(
+                        "SELECT id,b FROM removed FORCE INDEX({index}) WHERE b>=0 ORDER BY id"
+                    ),
+                    &expected,
+                    5000
+                )
+                .await,
+                expected
+            );
+        }
+        lifecycle.stop_and_wait().await;
+        service.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn physical_replica_fulltext_retirement_drop_scopes_follow_authority() {
+        for operation in ["index", "table", "leaf"] {
+            let (source, _source_dir, service) = build_master_engine().await;
+            source
+                .database_for_replication()
+                .set_catalog_retirement_waker(|| {});
+            source
+                .database_for_replication()
+                .set_recyclebin_variable("mydb_recyclebin", 0)
+                .unwrap();
+            let (replica, _replica_dir, mut lifecycle, _status) =
+                spawn_replica(service.bind_addr()).await;
+            let writer = source.clone();
+            tokio::task::spawn_blocking(move || {
+                writer.execute(&format!("CREATE TABLE ft_drop(id INT PRIMARY KEY,body TEXT,FULLTEXT ft(body)){}",if operation == "leaf" {" PARTITION BY RANGE(id)(PARTITION p0 VALUES LESS THAN(401),PARTITION p1 VALUES LESS THAN MAXVALUE)"} else {""})).unwrap();
+                writer.execute("INSERT INTO ft_drop SELECT n,CONCAT(IF(MOD(n,2)=0,'quartz ','amber '),'item',n) FROM generate_series(1,800) s(n)").unwrap();
+            }).await.unwrap();
+            let old = source
+                .database_for_replication()
+                .table("test.ft_drop")
+                .unwrap();
+            let count_sql = "SELECT COUNT(*) FROM ft_drop WHERE MATCH(body) AGAINST('quartz')";
+            assert_eq!(
+                poll_select_exact(&replica, count_sql, &[vec![Value::Int(400)]], 5000).await,
+                vec![vec![Value::Int(400)]]
+            );
+            let writer = source.clone();
+            tokio::task::spawn_blocking(move || {
+                if operation == "index" {
+                    writer.execute("DROP INDEX ft ON ft_drop").unwrap();
+                    writer.execute("CREATE FULLTEXT INDEX ft ON ft_drop(body)").unwrap();
+                    writer.execute("INSERT INTO ft_drop VALUES(9000,'quartz surviving')").unwrap();
+                } else if operation == "leaf" {
+                    writer.execute("ALTER TABLE ft_drop DROP PARTITION p0").unwrap();
+                    writer.execute("INSERT INTO ft_drop VALUES(9000,'quartz surviving')").unwrap();
+                } else {
+                    writer.execute("DROP TABLE ft_drop").unwrap();
+                    writer.execute("CREATE TABLE ft_drop(id INT PRIMARY KEY,body TEXT,FULLTEXT ft(body))").unwrap();
+                    writer.execute("INSERT INTO ft_drop VALUES(1,'quartz new'),(2,'amber new'),(3,'quartz surviving')").unwrap();
+                }
+            }).await.unwrap();
+            let expected = vec![vec![Value::Int(if operation == "index" {
+                401
+            } else if operation == "leaf" {
+                201
+            } else {
+                2
+            })]];
+            assert_eq!(
+                poll_select_exact(&replica, count_sql, &expected, 5000).await,
+                expected
+            );
+            let db = replica.database_for_replication().clone();
+            let source_log = source.database_for_replication().wal_log();
+            tokio::task::spawn_blocking(move || {
+                let count_old = || {
+                    let schema = crate::storage::data_dictionary::dd_table_schema(
+                        crate::storage::data_dictionary::DD_FULLTEXT_COUNTERS,
+                    )
+                    .unwrap();
+                    let view = db.begin_read_only_txn().unwrap();
+                    let rows = db
+                        .prefix_index_entries_visible(
+                            &schema,
+                            &schema.indexes[0],
+                            crate::storage::IndexKey::from(vec![
+                                crate::storage::KeyPart::UInt(old.id),
+                                crate::storage::KeyPart::UInt(old.active_generation),
+                                crate::storage::KeyPart::UInt(
+                                    old.indexes[1].fulltext.as_ref().unwrap().corpus_id,
+                                ),
+                            ]),
+                            view,
+                        )
+                        .unwrap()
+                        .len();
+                    db.rollback_txn(view.txn_id).unwrap();
+                    rows
+                };
+                let counters = count_old();
+                assert!(counters > 256);
+                let manifests = db.catalog_retirement_count_for_test();
+                assert!(manifests >= if operation == "leaf" { 1 } else { 2 });
+                let before = db.wal_log().lock().last_lsn();
+                db.maintain_catalog_retirements_until(|| false).unwrap();
+                assert_eq!(
+                    count_old(),
+                    counters,
+                    "replica must not retire authority counters"
+                );
+                assert_eq!(db.catalog_retirement_count_for_test(), manifests);
+                let after = db.wal_log().lock().last_lsn();
+                if after > before {
+                    let mut received =
+                        crate::wal::WalReader::open(&db.wal_log(), before + 1).unwrap();
+                    let mut source = crate::wal::WalReader::open(&source_log, before + 1).unwrap();
+                    while let Some(chunk) = received.next_chunk(after, 1 << 20).unwrap() {
+                        let expected = source
+                            .next_chunk(chunk.end_lsn, chunk.bytes.len())
+                            .unwrap()
+                            .unwrap();
+                        assert_eq!(
+                            chunk.bytes, expected.bytes,
+                            "replica generated divergent cleanup WAL"
+                        );
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            let replica_epoch = replica
+                .database_for_replication()
+                .catalog_publication_epoch();
+            let writer = source.clone();
+            tokio::task::spawn_blocking(move || {
+                for _ in 0..32 {
+                    if writer
+                        .database_for_replication()
+                        .catalog_retirement_count_for_test()
+                        == 0
+                    {
+                        return;
+                    }
+                    writer
+                        .database_for_replication()
+                        .maintain_catalog_retirements_until(|| false)
+                        .unwrap();
+                }
+                panic!("source retirement did not drain");
+            })
+            .await
+            .unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while replica
+                .database_for_replication()
+                .catalog_retirement_count_for_test()
+                != 0
+            {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "replica did not consume retirement WAL"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert_eq!(
+                poll_select_exact(&replica, count_sql, &expected, 5000).await,
+                expected
+            );
+            assert_eq!(
+                replica
+                    .database_for_replication()
+                    .catalog_publication_epoch(),
+                replica_epoch
+            );
+            lifecycle.stop_and_wait().await;
+            service.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn physical_replica_online_special_alter_preserves_derivatives() {
+        let (source, _source_dir, service) = build_master_engine().await;
+        // Keep authority cleanup pending until the replica has demonstrated
+        // that it cannot retire source-owned counters on its own.
+        source
+            .database_for_replication()
+            .set_catalog_retirement_waker(|| {});
+        let (replica, _replica_dir, mut lifecycle, _status) =
+            spawn_replica(service.bind_addr()).await;
+        let writer = source.clone();
+        tokio::task::spawn_blocking(move || {
+            writer.execute("CREATE TABLE transformed(id INT PRIMARY KEY,n INT,body TEXT,g GEOMETRY NOT NULL,FULLTEXT ft(body),SPATIAL sp(g))").unwrap();
+            writer.execute("INSERT INTO transformed VALUES(1,10,'quartz amber',ST_GeomFromText('POINT(1 1)')),(2,20,'silver amber',ST_GeomFromText('POINT(2 2)'))").unwrap();
+        })
+        .await
+        .unwrap();
+        let hook = source
+            .database_for_replication()
+            .install_online_copy_publish_test_hook();
+        let writer = source.clone();
+        let ddl = tokio::task::spawn_blocking(move || {
+            let mut session = crate::engine::SessionContext::default();
+            session.connection_id = 30901;
+            writer
+                .execute_with_session(
+                    &mut session,
+                    "ALTER TABLE transformed MODIFY n BIGINT, LOCK=NONE",
+                )
+                .unwrap();
+        });
+        let wait = hook.clone();
+        assert!(tokio::task::spawn_blocking(
+            move || wait.wait_until_reached(Duration::from_secs(10))
+        )
+        .await
+        .unwrap());
+        let writer = source.clone();
+        tokio::task::spawn_blocking(move || {
+            writer.execute("UPDATE transformed SET n=11,body='cobalt quartz',g=ST_GeomFromText('POINT(3 3)') WHERE id=1").unwrap();
+            writer.execute("INSERT INTO transformed VALUES(3,30,'quartz zircon',ST_GeomFromText('POINT(4 4)'))").unwrap();
+        })
+        .await
+        .unwrap();
+        hook.release();
+        ddl.await.unwrap();
+        let expected = vec![
+            vec![
+                Value::Int(1),
+                Value::Int(11),
+                Value::String("POINT(3 3)".into()),
+            ],
+            vec![
+                Value::Int(3),
+                Value::Int(30),
+                Value::String("POINT(4 4)".into()),
+            ],
+        ];
+        let query = "SELECT id,n,ST_AsText(g) FROM transformed WHERE MATCH(body) AGAINST('quartz' IN BOOLEAN MODE) ORDER BY id";
+        assert_eq!(
+            poll_select_exact(&replica, query, &expected, 5000).await,
+            expected
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while replica
+            .database_for_replication()
+            .table("test.transformed")
+            .unwrap()
+            .active_generation
+            != 2
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "replica did not publish generation"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let query = "SELECT id FROM transformed FORCE INDEX(sp) WHERE MBRContains(ST_GeomFromText('POLYGON((2.5 2.5,5 2.5,5 5,2.5 5,2.5 2.5))'),g) ORDER BY id";
+        let expected = vec![vec![Value::Int(1)], vec![Value::Int(3)]];
+        assert_eq!(
+            poll_select_exact(&replica, query, &expected, 5000).await,
+            expected
+        );
+        let score_sql = "SELECT id,MATCH(body) AGAINST('quartz') FROM transformed ORDER BY id";
+        let writer = source.clone();
+        let score = tokio::task::spawn_blocking(move || {
+            let QueryResponse::ResultSet(result) =
+                writer.execute(score_sql).unwrap().materialize().unwrap()
+            else {
+                panic!("rows")
+            };
+            result.rows
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            poll_select_exact(&replica, score_sql, &score, 5000).await,
+            score
+        );
+        let db = replica.database_for_replication().clone();
+        tokio::task::spawn_blocking(move || {
+            assert_eq!(db.catalog_retirement_count_for_test(), 1);
+            assert_eq!(db.maintain_catalog_retirements_until(|| false).unwrap(), 0);
+            assert_eq!(db.catalog_retirement_count_for_test(), 1);
+        })
+        .await
+        .unwrap();
+        let writer = source.clone();
+        tokio::task::spawn_blocking(move || {
+            assert_eq!(
+                writer
+                    .database_for_replication()
+                    .catalog_retirement_count_for_test(),
+                1
+            );
+            writer
+                .database_for_replication()
+                .maintain_catalog_retirements_until(|| false)
+                .unwrap();
+            assert_eq!(
+                writer
+                    .database_for_replication()
+                    .catalog_retirement_count_for_test(),
+                0
+            );
+        })
+        .await
+        .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while replica
+            .database_for_replication()
+            .catalog_retirement_count_for_test()
+            != 0
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "replica did not apply corpus retirement"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            poll_select_exact(&replica, score_sql, &score, 5000).await,
+            score
+        );
+        let writer = source.clone();
+        let assigned = tokio::task::spawn_blocking(move || {
+            writer.execute("ALTER TABLE transformed ADD seq BIGINT AUTO_INCREMENT,ADD UNIQUE seq_key(seq),LOCK=NONE").unwrap();
+            writer.execute("INSERT INTO transformed(id,n,body,g) VALUES(4,40,'quartz alum',POINT(5,5))").unwrap();
+            let QueryResponse::ResultSet(result) = writer.execute("SELECT id,seq FROM transformed ORDER BY id").unwrap().materialize().unwrap() else { panic!("rows") };
+            assert_eq!(result.rows.last(), Some(&vec![Value::Int(4),Value::Int(4)]));
+            result.rows
+        }).await.unwrap();
+        assert_eq!(
+            poll_select_exact(
+                &replica,
+                "SELECT id,seq FROM transformed ORDER BY id",
+                &assigned,
+                5000
+            )
+            .await,
+            assigned
+        );
+        let db = replica.database_for_replication().clone();
+        tokio::task::spawn_blocking(move || {
+            let table = db.table("test.transformed").unwrap();
+            assert_eq!(db.auto_increment_next_value(&table).unwrap(), Some(5));
+        })
+        .await
+        .unwrap();
+        lifecycle.stop_and_wait().await;
+        service.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn physical_replica_index_retirement_reuses_names_without_local_wal() {
         let (source, _source_dir, service) = build_master_engine().await;
+        // Keep source authority pending until the explicit drain below.
+        // Otherwise legitimate source cleanup WAL can race this assertion.
+        source
+            .database_for_replication()
+            .set_catalog_retirement_waker(|| {});
         let (replica, _replica_dir, mut lifecycle, _status) =
             spawn_replica(service.bind_addr()).await;
         let writer = source.clone();

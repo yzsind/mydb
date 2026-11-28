@@ -693,6 +693,10 @@ impl SpatialIndexFile {
             }
         }
     }
+    pub(super) fn flush_without_sync(&self) -> Result<(), QueryError> {
+        self.healthy()?;
+        self.pool.flush_file_pages(&self.file_key)
+    }
     pub(super) fn flush(&self) -> Result<(), QueryError> {
         self.healthy()?;
         if self.durability != DurabilityMode::Memory
@@ -958,26 +962,51 @@ impl SpatialIndexFile {
         })
     }
     pub(super) fn entries(&self) -> Result<Vec<(IndexKey, RowId)>, QueryError> {
-        self.healthy()?;
-        let _guard = self.structure.read();
-        let meta = self.meta()?;
-        let mut stack = vec![meta.root];
         let mut out = Vec::new();
+        self.visit_entries(|key, row_id| {
+            out.push((key, row_id));
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
+    pub(super) fn visit_entries(
+        &self,
+        visitor: impl FnMut(IndexKey, RowId) -> Result<(), QueryError>,
+    ) -> Result<(), QueryError> {
+        let _guard = self.structure.read();
+        self.visit_entries_optimistic(visitor)
+    }
+
+    // The outer IndexFile generation must be proved unchanged by the caller.
+    pub(super) fn visit_entries_optimistic(
+        &self,
+        mut visitor: impl FnMut(IndexKey, RowId) -> Result<(), QueryError>,
+    ) -> Result<(), QueryError> {
+        self.healthy()?;
+        let meta = self.meta()?;
+        let mut charge = crate::engine::executor::mem_budget::ControlledMemoryCharge::try_new(
+            crate::engine::executor::mem_budget::ControlledMemoryCategory::StorageScratch,
+            PAGE_SIZE * 4,
+        )?;
+        let mut stack = vec![meta.root];
         let mut seen = HashSet::new();
         while let Some(id) = stack.pop() {
+            crate::engine::cancel::check_cancelled()?;
+            charge.try_grow(128)?;
             if id == 0 || id >= meta.next || !seen.insert(id) {
                 return Err(corrupt("invalid child graph"));
             }
             let n = self.node(id)?;
             for e in n.items {
                 if n.level == 0 {
-                    out.push((key(e.mbr), unpack(e.pointer)));
+                    visitor(key(e.mbr), unpack(e.pointer))?;
                 } else {
                     stack.push(e.pointer);
                 }
             }
         }
-        Ok(out)
+        Ok(())
     }
     pub(super) fn insert_many(
         &self,
@@ -1250,11 +1279,22 @@ impl SpatialIndexFile {
 
     pub(super) fn validate(&self) -> Result<(), QueryError> {
         let _guard = self.structure.read();
+        self.validate_optimistic()
+    }
+
+    /// The caller proves that no outer IndexFile mutation spans this scan.
+    pub(super) fn validate_optimistic(&self) -> Result<(), QueryError> {
         let meta = self.meta()?;
+        let mut charge = crate::engine::executor::mem_budget::ControlledMemoryCharge::try_new(
+            crate::engine::executor::mem_budget::ControlledMemoryCategory::StorageScratch,
+            PAGE_SIZE * 4,
+        )?;
         let mut seen = HashSet::new();
         let mut rows = HashSet::new();
         let mut stack = vec![(meta.root, None, None)];
         while let Some((id, level, cover)) = stack.pop() {
+            crate::engine::cancel::check_cancelled()?;
+            charge.try_grow(128)?;
             if id == 0 || id >= meta.next || !seen.insert(id) {
                 return Err(corrupt("invalid page reachability"));
             }
@@ -1269,16 +1309,20 @@ impl SpatialIndexFile {
             }
             for e in n.items {
                 if n.level == 0 {
+                    charge.try_grow(256)?;
                     if !rows.insert((key(e.mbr), e.pointer)) {
                         return Err(corrupt("duplicate entry"));
                     }
                 } else {
+                    charge.try_grow(72)?;
                     stack.push((e.pointer, Some(n.level - 1), Some(e.mbr)));
                 }
             }
         }
         let mut free = meta.free;
         while free != 0 {
+            crate::engine::cancel::check_cancelled()?;
+            charge.try_grow(128)?;
             if free >= meta.next || !seen.insert(free) {
                 return Err(corrupt("invalid free list"));
             }

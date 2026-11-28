@@ -1393,6 +1393,7 @@ pub(crate) fn current_parameter_type_fingerprint() -> u64 {
         let context = TypeContext::context_free(&no_column, &no_placeholder);
         for (index, value) in params.iter().enumerate() {
             bound_value_type(value, &context).hash(&mut hasher);
+            crate::engine::expr::prepared_numeric_parameter_type(index).hash(&mut hasher);
             crate::engine::expr::xml_parameter_type(index).hash(&mut hasher);
             let shape = match value {
                 Value::String(s) => crate::vector::text_parameter_shape(s.as_bytes()),
@@ -2050,6 +2051,31 @@ fn infer_expr_type_checked(expr: &Expr, context: &TypeContext<'_>) -> ExprType {
             (context.resolve_column)(expr).unwrap_or_else(|| ExprType::new(Unknown, true))
         }
         Expr::Placeholder(index) => (context.resolve_placeholder)(*index)
+            .or_else(|| {
+                use crate::engine::api::PreparedNumericType;
+                let kind = match crate::engine::expr::prepared_numeric_parameter_type(*index)? {
+                    PreparedNumericType::Decimal => Decimal {
+                        precision: 65,
+                        scale: 30,
+                        unsigned: false,
+                    },
+                    PreparedNumericType::Double => Float {
+                        single: false,
+                        precision: None,
+                        scale: None,
+                    },
+                    PreparedNumericType::Signed => Integer {
+                        width: IntegerWidth::Big,
+                        unsigned: false,
+                    },
+                    PreparedNumericType::Unsigned => Integer {
+                        width: IntegerWidth::Big,
+                        unsigned: true,
+                    },
+                    PreparedNumericType::String => return None,
+                };
+                Some(ExprType::new(kind, true))
+            })
             .or_else(|| {
                 crate::engine::params::current_param(*index)
                     .as_ref()

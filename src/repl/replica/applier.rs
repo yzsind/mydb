@@ -755,6 +755,104 @@ mod tests {
     }
 
     #[test]
+    fn partial_txn_batch_reconnects_from_a_complete_frame_after_io_recovers() {
+        for prefix in 0..3 {
+            let source_dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+            let target_dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+            let db = Arc::new(Database::open(target_dir.path()).unwrap());
+            db.set_physical_replica_mode(true).unwrap();
+            let target_log = db.wal_log();
+            let baseline = target_log.lock().last_lsn();
+            let source_log = Arc::new(parking_lot::Mutex::new(
+                LogManager::open(source_dir.path()).unwrap(),
+            ));
+            let txn_id = 900_100;
+            let mut records = vec![WalPayload::BeginTxn { start_scn: 0 }];
+            for i in 0..prefix {
+                records.push(WalPayload::AutoIncrementAdvance {
+                    table_id: 999,
+                    version: 1,
+                    max_value: i + 1,
+                });
+            }
+            records.push(WalPayload::FileCreate {
+                path: "retry/image".into(),
+                after: b"replayed".to_vec(),
+            });
+            records.push(WalPayload::CommitTxn {
+                commit_scn: 1,
+                commit_unix_us: 1,
+                binlog: None,
+            });
+            if baseline != 0 {
+                source_log
+                    .lock()
+                    .append_reserved(baseline, 0, WalPayload::CheckpointBegin)
+                    .unwrap();
+            }
+            let batch =
+                LogManager::pre_encode_record(txn_id, WalPayload::TxnBatch { records }).unwrap();
+            let end = LogManager::append_pre_encoded_to(&source_log, batch).unwrap();
+            source_log.lock().flush().unwrap();
+            let initial = ReplicaProgress {
+                received_lsn: baseline,
+                durable_lsn: baseline,
+                applied_lsn: baseline,
+                durable_applied_lsn: baseline,
+                last_master_uuid: "master".into(),
+                ..Default::default()
+            };
+            let mut applier = Applier::with_database(
+                target_dir.path(),
+                target_log.clone(),
+                db.clone(),
+                initial.clone(),
+            );
+            std::fs::write(target_dir.path().join("retry"), b"blocks a directory").unwrap();
+            let chunk = WalReader::open(&source_log, baseline + 1)
+                .unwrap()
+                .next_chunk(end, 1 << 20)
+                .unwrap()
+                .unwrap();
+            assert!(applier.apply_chunk(&chunk, "master", 1).is_err());
+            assert!(db.is_txn_active(txn_id));
+            let mut reconciled = initial;
+            crate::repl::replica::progress::reconcile_applied(&mut reconciled, &db, &target_log);
+            assert_eq!(
+                reconciled.durable_applied_lsn, baseline,
+                "a partial physical frame must not become an ACK/resume boundary"
+            );
+            std::fs::remove_file(target_dir.path().join("retry")).unwrap();
+            let mut retry = Applier::with_database(
+                target_dir.path(),
+                target_log.clone(),
+                db.clone(),
+                reconciled.clone(),
+            );
+            let resent = WalReader::open(&source_log, reconciled.durable_applied_lsn + 1)
+                .unwrap()
+                .next_chunk(end, 1 << 20)
+                .unwrap()
+                .unwrap();
+            retry.apply_chunk(&resent, "master", 1).unwrap();
+            retry.flush_and_persist().unwrap();
+            assert_eq!(retry.progress().durable_applied_lsn, end);
+            assert!(!db.is_txn_active(txn_id));
+            assert_eq!(
+                std::fs::read(target_dir.path().join("retry/image")).unwrap(),
+                b"replayed"
+            );
+            assert_eq!(
+                retry
+                    .apply_chunk(&resent, "master", 1)
+                    .unwrap()
+                    .frames_applied,
+                0
+            );
+        }
+    }
+
+    #[test]
     fn release_audit_overlap_io_is_retryable() {
         let err = error(crate::error::catalog::ER_GET_ERRNO, "injected ENOSPC");
         let mapped = overlap_read_error(crate::wal::WalReaderError::Io(err));

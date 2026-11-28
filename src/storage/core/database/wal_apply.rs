@@ -77,6 +77,7 @@ struct OnlineHeapRedoFile {
     file: File,
     len: u64,
     owner: [u8; 16],
+    pool_key: Option<Arc<BufferPageFileKey>>,
 }
 
 impl OnlineHeapRedoFiles {
@@ -119,12 +120,16 @@ impl OnlineHeapRedoFiles {
                 Err(err) => return Err(io_err(err)),
             };
             let len = file.metadata().map_err(io_err)?.len();
+            let owner = page_owner_result(&path)?;
+            let pool_key = Database::parse_heap_table_id(relative)
+                .map(|id| Arc::new(BufferPool::heap_file_key(path, id)));
             self.files.insert(
                 relative.to_string(),
                 OnlineHeapRedoFile {
                     file,
                     len,
-                    owner: page_owner_result(&path)?,
+                    owner,
+                    pool_key,
                 },
             );
         }
@@ -312,9 +317,12 @@ impl Database {
                         )
                     })?;
                 let mut logical_prev_lsn = record.prev_txn_lsn;
+                let applied_prefix = self.replica_applied_logical_lsn_atomic
+                    .load(Ordering::Acquire)
+                    .max(self.replica_applied_lsn_atomic.load(Ordering::Acquire));
                 for (idx, payload) in records.iter().enumerate() {
                     let logical_lsn = first_logical_lsn + idx as u64;
-                    if logical_lsn <= self.replica_applied_lsn_atomic.load(Ordering::Acquire) {
+                    if logical_lsn <= applied_prefix {
                         logical_prev_lsn = logical_lsn;
                         continue;
                     }
@@ -328,7 +336,7 @@ impl Database {
                         },
                         heap_redo,
                     )?;
-                    self.replica_applied_lsn_atomic.fetch_max(logical_lsn, Ordering::Release);
+                    self.replica_applied_logical_lsn_atomic.fetch_max(logical_lsn, Ordering::Release);
                     logical_prev_lsn = logical_lsn;
                 }
             }
@@ -485,11 +493,41 @@ impl Database {
                     Ok(true)
                 })?;
                 self.note_dd_touch_if_needed(path, txn_id);
-                self.discard_heap_page_only(path, *page_id as u64)?;
+                self.discard_heap_page_only(path, *page_id as u64, heap_redo)?;
                 self.refresh_heap_handle_if_grown(path, *page_id as u64);
                 if crate::storage::core::heap_payload_counts_as_logical_row(payload) {
                     self.note_replicated_table_mutation(txn_id, path, 1, 1);
                 }
+            }
+            WalPayload::FilePublish { source, target } => {
+                crate::wal::validate_file_publication(source, target)?;
+                // The fresh generation is unreachable until CommitTxn reloads
+                // the DD. All source redo precedes this binding in the stream.
+                if source.ends_with(".idx") {
+                    // No master B-tree image is copied. The fresh final path
+                    // stays absent, and normal catalog publication materializes
+                    // the replica's derived layout. Startup-only repair markers
+                    // must not be introduced into an online descriptor switch.
+                    return Ok(());
+                }
+                heap_redo.files.remove(source);
+                heap_redo.files.remove(target);
+                self.buffer_pool.discard_pages_for_path(&self.data_dir.join(target))?;
+                let source_path = self.data_dir.join(source);
+                let target_path = self.data_dir.join(target);
+                if let Some(parent) = target_path.parent() { fs::create_dir_all(parent).map_err(io_err)?; }
+                if !target_path.try_exists().map_err(io_err)? {
+                    hard_link_owned_file(&source_path, &target_path).map_err(io_err)?;
+                } else if page_owner_result(&source_path)? != page_owner_result(&target_path)? {
+                    return Err(error(crate::error::catalog::ER_GET_ERRNO, "replicated COPY owner mismatch"));
+                }
+                self.replica_restartpoint_tracker.lock().map_err(|_| error(
+                    crate::error::catalog::ER_GET_ERRNO, "replica restartpoint tracker lock poisoned"
+                ))?.register(target)?;
+            }
+            WalPayload::FilePublishComplete { .. } => {
+                // Source B-tree layout/coverage cannot certify a replica's
+                // independent derived layout. Local restartpoint owns it.
             }
             WalPayload::DdlCommit { .. } => {
                 // CommitTxn is the visibility/durability authority. This
@@ -504,6 +542,7 @@ impl Database {
                         .or_default()
                         .push(insert);
                 }
+                let mut max_page = 0;
                 for (page_id, page_inserts) in by_page {
                     heap_redo.mutate_page(&self.data_dir, path, page_id, lsn, |page| {
                         for insert in page_inserts {
@@ -519,16 +558,10 @@ impl Database {
                         }
                         Ok(true)
                     })?;
+                    self.discard_heap_page_only(path, page_id, heap_redo)?;
+                    max_page = max_page.max(page_id);
                 }
                 self.note_dd_touch_if_needed(path, txn_id);
-                let mut max_page = 0u64;
-                for insert in inserts {
-                    let page = insert.page_id as u64;
-                    if page > max_page {
-                        max_page = page;
-                    }
-                    self.discard_heap_page_only(path, page)?;
-                }
                 self.refresh_heap_handle_if_grown(path, max_page);
                 let logical_rows = inserts
                     .iter()
@@ -571,7 +604,7 @@ impl Database {
                     Ok(true)
                 })?;
                 self.note_dd_touch_if_needed(path, txn_id);
-                self.discard_heap_page_only(path, *page_id as u64)?;
+                self.discard_heap_page_only(path, *page_id as u64, heap_redo)?;
                 self.refresh_heap_handle_if_grown(path, *page_id as u64);
                 let before_live = crate::storage::core::heap_payload_live_logical_state(before);
                 let after_live = crate::storage::core::heap_payload_live_logical_state(after);
@@ -601,7 +634,7 @@ impl Database {
                     Ok(true)
                 })?;
                 self.note_dd_touch_if_needed(path, txn_id);
-                self.discard_heap_page_only(path, *page_id as u64)?;
+                self.discard_heap_page_only(path, *page_id as u64, heap_redo)?;
                 self.refresh_heap_handle_if_grown(path, *page_id as u64);
                 let live_delta = patches
                     .iter()
@@ -631,7 +664,7 @@ impl Database {
                     Ok(true)
                 })?;
                 self.note_dd_touch_if_needed(path, txn_id);
-                self.discard_heap_page_only(path, *page_id as u64)?;
+                self.discard_heap_page_only(path, *page_id as u64, heap_redo)?;
                 self.refresh_heap_handle_if_grown(path, *page_id as u64);
                 let _ = before;
             }
@@ -686,7 +719,7 @@ impl Database {
                     },
                 )?;
                 self.note_dd_touch_if_needed(path, txn_id);
-                self.discard_heap_page_only(path, *page_id as u64)?;
+                self.discard_heap_page_only(path, *page_id as u64, heap_redo)?;
                 self.refresh_heap_handle_if_grown(path, *page_id as u64);
             }
             WalPayload::PageUpdate {
@@ -992,7 +1025,7 @@ impl Database {
             && crate::storage::data_dictionary::is_dd_table_id(info.table_id)
     }
 
-    /// B-tree and vector indexes are rebuilt locally from committed heap data.
+    /// B-tree files use a local layout; vector graph files use physical redo.
     fn path_is_index_file(path: &str) -> bool {
         is_index_object_path(path)
     }
@@ -1052,17 +1085,31 @@ impl Database {
     /// that page is O(1), where the whole-file scan in
     /// `invalidate_buffer_pool_path` walks every pool shard and was the
     /// dominant cost of replica apply under TPC-C.
-    fn discard_heap_page_only(&self, relative: &str, page_id: u64) -> Result<(), QueryError> {
+    fn discard_heap_page_only(
+        &self,
+        relative: &str,
+        page_id: u64,
+        redo: &OnlineHeapRedoFiles,
+    ) -> Result<(), QueryError> {
         let Some(table_id) = Self::parse_heap_table_id(relative) else {
             // Not a recognizable heap object — fall back to the
             // whole-file invalidation for safety.
             return self.invalidate_buffer_pool_path(relative);
         };
-        let abs = self.data_dir.join(relative);
-        let key = PageKey {
-            file: Arc::new(BufferPool::heap_file_key(abs, table_id)),
-            page_id,
-        };
+        // Resolve owner/control/image capabilities once per open file in this
+        // bounded chunk. Recreating a file key for every row performs repeated
+        // metadata I/O even when the affected page is absent from the pool.
+        let file = redo
+            .files
+            .get(relative)
+            .and_then(|file| file.pool_key.clone())
+            .unwrap_or_else(|| {
+                Arc::new(BufferPool::heap_file_key(
+                    self.data_dir.join(relative),
+                    table_id,
+                ))
+            });
+        let key = PageKey { file, page_id };
         self.buffer_pool.discard_page(&key)?;
         Ok(())
     }
@@ -1137,7 +1184,10 @@ impl Database {
         if !matches!(info.kind, crate::storage::naming::ObjectFileKind::Index) {
             return None;
         }
-        if info.ext != "rtree" && info.ext != "idx" && info.ext != "hnsw" && info.ext != "hvec" {
+        // Vector graph files share an index id with the companion B-tree,
+        // but have independent physical pages and cache owners. Retiring the
+        // companion on graph redo discards unflushed logical IndexBatch work.
+        if info.ext != "rtree" && info.ext != "idx" {
             return None;
         }
         // Startup keeps compact catalog headers without index definitions.
@@ -1474,7 +1524,9 @@ impl Database {
                                     self.primary_definition_highwater
                                         .fetch_max(commit_scn, Ordering::Release);
                                 }
-                                if table.primary_definition_scn != 0 {
+                                if table.primary_definition_scn != 0
+                                    || table.row_generation_txn_id == txn_id
+                                {
                                     self.table_locks_sharded
                                         .set_schema_floor(table.id, table.schema_version);
                                     for id in table.storage_ids() {
@@ -1495,8 +1547,17 @@ impl Database {
                     // only `live.tables` leaves a freshly replicated CREATE
                     // invisible to normal table lookup until restart.
                     self.catalog.publish_table_deltas(&object_ids);
-                    for (_, table) in &loaded {
-                        let Some(table) = table else { continue };
+                    for (id, table) in &loaded {
+                        let Some(table) = table else {
+                            self.drop_table_modification_delta(*id);
+                            continue;
+                        };
+                        // A physical ownership/generation publication carries a
+                        // complete population baseline at this transaction.
+                        if table.row_generation_txn_id == txn_id {
+                            self.drop_table_modification_delta(table.id);
+                            continue;
+                        }
                         let Some(previous) = old_tables.iter().find(|old| old.id == table.id)
                         else {
                             continue;
@@ -1771,6 +1832,7 @@ impl Database {
         let handle = cache.values().find(|h| h.read().path == abs).cloned();
         if let Some(handle) = handle {
             let index = handle.read();
+            let _mutation = index.begin_mutation();
             index
                 .spatial
                 .as_ref()
@@ -1795,21 +1857,21 @@ impl Database {
         txn_id: u64,
         ops: &[WalIndexOp],
     ) -> Result<(), QueryError> {
+        let entries = ops
+            .iter()
+            .map(|op| {
+                Ok(IndexBatchEntry {
+                    kind: op.kind,
+                    key: decode_wal_index_key(&op.key)?,
+                    row_id: wal_row_id_to_row_id(op.row_id),
+                })
+            })
+            .collect::<Result<Vec<_>, QueryError>>()?;
         // Fast path: catalog already knows this (table_id, index_name).
         // Apply via the live IndexFile so concurrent SELECTs see the
         // changes immediately.
         if let Some((table_id, index_name)) = self.parse_index_table_and_name(path) {
             self.note_replicated_hnsw(txn_id, table_id, &index_name);
-            let entries = ops
-                .iter()
-                .map(|op| {
-                    Ok(IndexBatchEntry {
-                        kind: op.kind,
-                        key: decode_wal_index_key(&op.key)?,
-                        row_id: wal_row_id_to_row_id(op.row_id),
-                    })
-                })
-                .collect::<Result<Vec<_>, QueryError>>()?;
             // Removing a source key before COMMIT must not hide its old
             // committed version from local snapshots. Use the same governed
             // repair registry as ordinary DML, before changing the B-tree.
@@ -1869,7 +1931,13 @@ impl Database {
                     })
                 })?;
             let index = handle.write();
-            index.apply_replicated_batch(txn_id, entries, lsn)?;
+            index
+                .apply_replicated_batch(txn_id, entries, lsn)
+                .map_err(|err| {
+                    err.map_message(|message| {
+                        format!("apply index batch {path} (lsn {lsn}): {message}")
+                    })
+                })?;
             // No flush here: index pages stay dirty in the shared
             // buffer pool (master PageUpdate/FileCreate images are
             // skipped for index files, so nothing discards them), and
@@ -1881,25 +1949,23 @@ impl Database {
         }
         // Slow path: catalog hasn't been reloaded yet (e.g. a CREATE
         // INDEX whose DD row commit is still pending). Reuse the
-        // recovery helper which writes raw bytes to disk; invalidate
-        // the buffer pool for that file so any subsequent live read
-        // refreshes from disk.
+        // recovery opener, but share the live pool so admission can evict its
+        // optional pages when the global raw-page budget is full. A private
+        // empty pool cannot reclaim allocations owned by this database.
+        // Memory-only pools cannot persist recovery pages, so retain the
+        // recovery-owned writeback pool for that durability mode.
         let log = std::sync::Arc::clone(&self.log);
-        let mut recovery_indexes: std::collections::HashMap<String, IndexFile> =
-            std::collections::HashMap::new();
-        redo_index_batch(
-            &self.data_dir,
-            log,
-            &mut recovery_indexes,
-            path,
-            lsn,
-            txn_id,
-            ops,
-        )?;
+        let _routing = btree_logical_wal::LsnScope::new(Some(lsn));
+        let index = if self.config.durability == DurabilityMode::Memory {
+            IndexFile::open_for_recovery(self.data_dir.join(path), log, lsn)?
+        } else {
+            IndexFile::open_for_recovery_with_buffer_pool(
+                self.data_dir.join(path), log, lsn, self.buffer_pool.clone(),
+            )?
+        };
+        index.apply_replicated_batch(txn_id, entries, lsn)?;
         let _routing = btree_logical_wal::LsnScope::new(None);
-        for index in recovery_indexes.values_mut() {
-            index.flush()?;
-        }
+        index.flush()?;
         self.invalidate_buffer_pool_path(path)?;
         Ok(())
     }

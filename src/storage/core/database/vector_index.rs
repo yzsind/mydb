@@ -618,7 +618,8 @@ impl Database {
         storage_id: u64,
         build: bool,
     ) -> Result<VectorGraph, QueryError> {
-        let filtered_table = table.indexes.iter().any(|i| i.is_vector() && i.predicate.is_some()).then(|| {
+        let filtered_table = (table.indexes.iter().any(|i| i.is_vector() && i.predicate.is_some())
+            || (build && index.vector_meta_for_table(table).metric_enum() == vector::Metric::Cosine)).then(|| {
             let mut candidate = table.clone(); candidate.indexes = vec![index.clone()]; candidate
         });
         let table = filtered_table.as_ref().unwrap_or(table);
@@ -2581,6 +2582,17 @@ impl Database {
         #[cfg(test)]
         VECTOR_BUILD_HEAP_SCANS.fetch_add(1, Ordering::Relaxed);
 
+        // Writable registries cannot validate undecided physical top rows.
+        // The private graph's ordinary MVCC scans validate its visible cohort
+        // without another heap pass, including filtered index membership.
+        let cosine = matches!(table.indexes.as_slice(), [index]
+            if index.is_vector() && index.vector_meta_for_table(table).metric_enum() == vector::Metric::Cosine);
+        let mut visit = |row_id, values: &[Value]| {
+            if cosine && matches!(values.first(), Some(Value::Vector(value)) if vector::distance::typed_is_zero(value)) {
+                return Err(vector::vector_err("COSINE indexes reject existing zero vectors"));
+            }
+            visit(row_id, values)
+        };
         crate::engine::cancel::check_cancelled()?;
         if let [index] = table.indexes.as_slice() {
             if index.is_vector() && index.predicate.is_some() {
@@ -3242,6 +3254,12 @@ impl Database {
         key: (u64, u64, u64, String),
         build: bool,
     ) -> Result<Arc<VectorGraph>, QueryError> {
+        if self.table_locks_sharded.is_retired(table.id) {
+            return Err(error(
+                crate::error::catalog::ER_TABLE_DEF_CHANGED,
+                "vector index owner was retired; rebind the table before building",
+            ));
+        }
         let build_lock = {
             let mut locks = self.vector_build_locks.lock();
             locks.retain(|_, owner| owner.strong_count() > 0);
@@ -3340,6 +3358,7 @@ impl Database {
             .vector_build_epoch
             .load(std::sync::atomic::Ordering::Acquire)
             != build_epoch
+            || self.table_locks_sharded.is_retired(table.id)
         {
             return Err(error(
                 crate::error::catalog::ER_GET_ERRNO,
@@ -3491,16 +3510,18 @@ impl Database {
                 return;
             }
             let admitted = match delta.charge.as_mut() {
-                Some(charge) => charge.try_grow(increase).is_ok(),
-                None => match crate::engine::executor::mem_budget::ControlledMemoryCharge::try_new(
+                // A private build is optional work for the committer. Do
+                // not latch terminal query OOM when its capture is refused.
+                Some(charge) => charge.try_grow_optional(increase),
+                None => match crate::engine::executor::mem_budget::ControlledMemoryCharge::try_new_optional(
                     crate::engine::executor::mem_budget::ControlledMemoryCategory::StorageScratch,
                     bytes,
                 ) {
-                    Ok(charge) => {
+                    Some(charge) => {
                         delta.charge = Some(charge);
                         true
                     }
-                    Err(_) => false,
+                    None => false,
                 },
             };
             if !admitted {
@@ -3511,6 +3532,10 @@ impl Database {
                 if let Some(charge) = delta.charge.as_mut() {
                     charge.shrink(previous - bytes);
                 }
+            }
+            if previous == 0 && delta.ops.try_reserve(1).is_err() {
+                delta.failed = true;
+                return;
             }
             delta.next_seq = delta.next_seq.saturating_add(1);
             delta.ops.insert(row_id, (delta.next_seq, vector));
@@ -3744,7 +3769,7 @@ impl Database {
         for index in table
             .indexes
             .iter()
-            .filter(|i| i.is_vector() && i.vector_algo() == VectorAlgo::Hnsw)
+            .filter(|i| i.is_vector() && i.state == IndexState::Public && i.vector_algo() == VectorAlgo::Hnsw)
         {
             if !table.index_contains_row(index, values)? { continue; }
             let col = table.column_index(&index.columns[0])?;
@@ -4031,7 +4056,7 @@ impl Database {
                     || !current
                         .indexes
                         .iter()
-                        .any(|item| item.index_id == index.index_id)
+                        .any(|item| item.index_id == index.index_id && item.state == IndexState::Public)
             })
         {
             return err;
@@ -4272,7 +4297,7 @@ impl Database {
         if pending.is_empty() {
             if self.vector_pending_wal.lock().contains_key(&txn_id) {
                 self.append_wal(0, WalPayload::VectorIndexComplete { txn_id, commit_scn })?;
-                if !self.vector_copy_publications.lock().contains(&txn_id) {
+                if !self.vector_ddl_publications.lock().contains(&txn_id) {
                     self.vector_pending_wal.lock().remove(&txn_id);
                 }
             }
@@ -4370,7 +4395,7 @@ impl Database {
             .unwrap_or_else(|e| e.into_inner())
             .remove(&txn_id);
         self.vector_commits_publishing.lock().remove(&txn_id);
-        if !self.vector_copy_publications.lock().contains(&txn_id) {
+        if !self.vector_ddl_publications.lock().contains(&txn_id) {
             self.vector_pending_wal.lock().remove(&txn_id);
         }
         Ok(())
@@ -4529,7 +4554,7 @@ impl Database {
             self.hnsw_tombstones_rolled_back
                 .fetch_add(discarded, std::sync::atomic::Ordering::Relaxed);
         }
-        self.vector_copy_publications.lock().remove(&txn_id);
+        self.vector_ddl_publications.lock().remove(&txn_id);
         self.vector_pending_wal.lock().remove(&txn_id);
         Ok(discarded)
     }
@@ -5257,7 +5282,7 @@ impl Database {
     pub(crate) fn pending_vector_journal_for_test(&self) -> (usize, usize) {
         (
             self.vector_pending_wal.lock().len(),
-            self.vector_copy_publications.lock().len(),
+            self.vector_ddl_publications.lock().len(),
         )
     }
 

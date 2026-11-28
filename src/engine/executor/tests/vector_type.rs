@@ -1219,11 +1219,15 @@ fn hnsw_drop_index_removes_snapshot_file() {
     engine.database().vector_graph_warm_all_for_test();
     engine.checkpoint().unwrap();
     assert_eq!(find_hnsw_files(dir.path()).len(), 1);
-    // DROP INDEX must remove both the in-memory graph and the on-disk file.
+    // DROP revokes the graph immediately; retirement removes its physical files.
     engine.execute("DROP INDEX idx_emb ON items").unwrap();
+    engine
+        .database()
+        .maintain_catalog_retirements_until(|| false)
+        .unwrap();
     assert!(
         find_hnsw_files(dir.path()).is_empty(),
-        "DROP INDEX must remove the .hnsw snapshot"
+        "retirement must remove the dropped .hnsw snapshot"
     );
     let _ = dim;
 }
@@ -1261,9 +1265,13 @@ fn hnsw_drop_table_removes_snapshot_file() {
     engine.checkpoint().unwrap();
     assert_eq!(find_hnsw_files(dir.path()).len(), 1);
     engine.execute("DROP TABLE items").unwrap();
+    engine
+        .database()
+        .maintain_catalog_retirements_until(|| false)
+        .unwrap();
     assert!(
         find_hnsw_files(dir.path()).is_empty(),
-        "DROP TABLE must remove every .hnsw snapshot for the table"
+        "retirement cleanup must remove every .hnsw snapshot for the dropped table"
     );
 }
 
@@ -3176,11 +3184,17 @@ fn paged_hnsw_drop_index_removes_hvec() {
     assert_eq!(id_list(&engine, knn), vec![3]);
     assert!(!find_hvec_files(dir.path()).is_empty());
 
-    // DROP INDEX must remove the .hvec file and route KNN back to a full scan.
+    // DROP immediately routes KNN to a scan; retirement removes the .hvec file.
     engine.execute("DROP INDEX idx_emb ON items").unwrap();
+    assert!(!explain_mentions_vector_index(&engine, knn));
+    assert_eq!(id_list(&engine, knn), vec![3]);
+    engine
+        .database()
+        .maintain_catalog_retirements_until(|| false)
+        .unwrap();
     assert!(
         find_hvec_files(dir.path()).is_empty(),
-        "DROP INDEX must delete the paged .hvec file"
+        "retirement must delete the dropped paged .hvec file"
     );
     assert!(!explain_mentions_vector_index(&engine, knn));
     assert_eq!(id_list(&engine, knn), vec![3]);

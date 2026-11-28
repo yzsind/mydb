@@ -109,10 +109,8 @@ pub fn load_progress(data_dir: impl AsRef<Path>) -> IoResult<Option<ReplicaProgr
 }
 
 pub fn save_progress(data_dir: impl AsRef<Path>, progress: &ReplicaProgress) -> IoResult<()> {
+    crate::replication::prepare_private_metadata_directory(data_dir.as_ref())?;
     let path = progress_path(&data_dir);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
     let tmp = path.with_extension("json.tmp");
     let bytes = crate::storage::metadata::encode(
         crate::storage::metadata::PROGRESS,
@@ -138,10 +136,8 @@ pub fn resync_marker_path(data_dir: impl AsRef<Path>) -> PathBuf {
 }
 
 pub fn write_resync_marker(data_dir: impl AsRef<Path>, reason: &str) -> IoResult<()> {
+    crate::replication::prepare_private_metadata_directory(data_dir.as_ref())?;
     let path = resync_marker_path(&data_dir);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
     let tmp = path.with_extension("json.tmp");
     let body = serde_json::json!({ "reason": reason });
     crate::repl::durable::atomic_write_sync(&path, &tmp, &serde_json::to_vec_pretty(&body)?)?;

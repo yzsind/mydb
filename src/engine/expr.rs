@@ -10,6 +10,8 @@ pub(crate) mod network;
 mod regexp_binary;
 pub(crate) mod xml;
 crate::engine::builtin_catalog::declare_retains_ast!();
+#[cfg(test)]
+mod string_extent_tests;
 mod string_kernels;
 pub(crate) mod string_search;
 use crate::charset::encode_file_text as load_file_encode_path;
@@ -80,6 +82,8 @@ pub(crate) struct SessionExprInfo {
     sql_mode: String,
     temporal_sql_mode_bits: u16,
     div_precision_increment: u8,
+    prepared_numeric_parameter_types:
+        Option<std::sync::Arc<crate::engine::api::PreparedNumericParameters>>,
     auto_increment: (u64, u64),
     time_zone: String,
     timestamp_override: f64,
@@ -462,7 +466,8 @@ fn capture_session_expr_info_with_variables(
         query_attributes: session.statement_query_attributes.clone(),
         sql_mode: session.sql_mode.clone(),
         temporal_sql_mode_bits: session.temporal_sql_mode_bits,
-        div_precision_increment: session.sysvars.div_precision_increment.min(30) as u8,
+        div_precision_increment: session.expression_div_precision_increment(),
+        prepared_numeric_parameter_types: session.prepared_numeric_parameter_types.clone(),
         auto_increment: (
             session.sysvars.auto_increment_increment,
             session.sysvars.auto_increment_offset,
@@ -1636,7 +1641,7 @@ impl SessionView<'_> {
     }
     fn div_precision_increment(&self) -> u8 {
         match self {
-            SessionView::Borrowed(s) => s.sysvars.div_precision_increment.min(30) as u8,
+            SessionView::Borrowed(s) => s.expression_div_precision_increment(),
             SessionView::Owned(i) => i.div_precision_increment,
         }
     }
@@ -1779,6 +1784,129 @@ pub(crate) fn session_temporal_sql_mode_bits() -> u16 {
 /// when no session is installed (parallel workers without a snapshot).
 pub(crate) fn session_only_full_group_by() -> bool {
     with_session_view(|view| view.map(|v| v.only_full_group_by()).unwrap_or(false))
+}
+
+pub(crate) fn prepared_numeric_parameter_type(
+    index: usize,
+) -> Option<crate::engine::api::PreparedNumericType> {
+    with_session_view(|view| match view {
+        Some(SessionView::Borrowed(session)) => session
+            .prepared_numeric_parameter_types
+            .as_ref()?
+            .types
+            .get(index)
+            .copied()
+            .flatten(),
+        Some(SessionView::Owned(info)) => info
+            .prepared_numeric_parameter_types
+            .as_ref()?
+            .types
+            .get(index)
+            .copied()
+            .flatten(),
+        None => None,
+    })
+}
+
+/// Numeric parameter reads are resolved by their consuming operator. Keep
+/// malformed text deferred so unused branches emit no warning and row-wise
+/// diagnostics retain their original frequency and left-to-right order.
+pub(crate) fn prepared_arithmetic_operand(
+    index: Option<usize>,
+    value: &Value,
+    op: BinaryOp,
+) -> Result<Option<Value>, QueryError> {
+    use crate::engine::api::PreparedNumericType;
+    if !matches!(
+        op,
+        BinaryOp::Add
+            | BinaryOp::Sub
+            | BinaryOp::Mul
+            | BinaryOp::Div
+            | BinaryOp::IntDiv
+            | BinaryOp::Mod
+    ) {
+        return Ok(None);
+    }
+    let Some(text) = crate::types::value_str(value) else {
+        return Ok(None);
+    };
+    let Some(domain) = index.and_then(prepared_numeric_parameter_type) else {
+        return Ok(None);
+    };
+    if domain == PreparedNumericType::String {
+        return Ok(None);
+    }
+    if domain == PreparedNumericType::Double {
+        return numeric(value).map(|value| Some(Value::Double(value)));
+    }
+    let parsed = crate::util::decimal::parse_lenient_f64(text);
+    if parsed.clean && !parsed.value.is_finite() {
+        return Ok(None);
+    }
+    let decimal = domain == PreparedNumericType::Decimal || op == BinaryOp::Div;
+    if !parsed.clean || text.trim().is_empty() {
+        let kind = if decimal { "DECIMAL" } else { "INTEGER" };
+        let message = format!("Truncated incorrect {kind} value: '{text}'");
+        if strict_numeric_conversion_is_error() {
+            return Err(crate::error::catalog::ER_TRUNCATED_WRONG_VALUE.error(message));
+        }
+        crate::engine::api::push_statement_warning(
+            crate::error::ConditionLevel::Warning,
+            crate::error::catalog::ER_TRUNCATED_WRONG_VALUE,
+            message,
+        );
+    }
+    if decimal {
+        let prefix = crate::util::decimal::numeric_prefix(text);
+        return Ok(Some(
+            crate::util::decimal::parse_exact_decimal_big(prefix)
+                .map(|(magnitude, scale)| {
+                    Value::from_exact_decimal(crate::util::decimal::ExactDecimal::from_big(
+                        magnitude, scale,
+                    ))
+                })
+                .unwrap_or(Value::DecimalCompact(0, 0)),
+        ));
+    }
+    let integer = crate::util::decimal::parse_lenient_int(text).value;
+    Ok(Some(if domain == PreparedNumericType::Unsigned {
+        Value::UInt(integer as u64)
+    } else {
+        Value::Int(integer.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64)
+    }))
+}
+
+pub(crate) fn prepared_string_parameter_requires_scalar(expr: &Expr) -> bool {
+    struct Find(bool);
+    impl crate::parser::visit::AstVisitor for Find {
+        fn enter_expr(&mut self, expr: &Expr) {
+            if let Expr::Placeholder(index) = expr {
+                self.0 |= prepared_numeric_parameter_type(*index).is_some_and(|domain| {
+                    domain != crate::engine::api::PreparedNumericType::String
+                }) && crate::engine::params::with_current_param(*index, |value| {
+                    value.is_some_and(|value| crate::types::value_str(value).is_some())
+                });
+            }
+        }
+        fn continue_expr_walk(&self) -> bool {
+            !self.0
+        }
+    }
+    let mut find = Find(false);
+    crate::parser::visit::visit_expr(&mut find, expr);
+    find.0
+}
+
+pub(crate) fn prepared_arithmetic_expr_value(
+    expr: &Expr,
+    value: Value,
+    op: BinaryOp,
+) -> Result<Value, QueryError> {
+    let Expr::Placeholder(index) = expr else {
+        return Ok(value);
+    };
+    Ok(prepared_arithmetic_operand(Some(*index), &value, op)?.unwrap_or(value))
 }
 
 /// Session `div_precision_increment` — extra fractional digits added by
@@ -1995,39 +2123,19 @@ pub(crate) fn strict_dml_expression() -> bool {
     DML_EXPRESSION_DEPTH.with(|depth| depth.get() != 0) && strict_sql_mode()
 }
 
-/// Enforce `NO_ZERO_DATE` at CAST time: when the session bit is on and
-/// the CAST target is a temporal type receiving an explicit zero value
-/// (`'0000-00-00 …'`), errors under strict mode and emits a warning
-/// otherwise. This mirrors `storage::core::constraints::zero_date_policy`
-/// but runs on the SELECT side so `SELECT DATE '0000-00-00'` /
-/// `CAST('0000-00-00' AS DATE)` respect the session's sql_mode instead
-/// of silently returning the zero sentinel. `what` names the target type
-/// for the error message ("DATE"/"DATETIME"). `value` is only consulted
-/// for its stringified form when non-strict warnings need it.
-pub(crate) fn cast_zero_date_policy(what: &str, value: &Value) -> Result<(), QueryError> {
-    let bits = session_temporal_sql_mode_bits();
-    if bits & crate::engine::api::TEMPORAL_MODE_NO_ZERO_DATE == 0 {
-        return Ok(());
+/// Zero-date casts are warnings yielding NULL in query expressions. Strict
+/// assignment expressions promote the same conversion condition to an error.
+pub(crate) fn cast_zero_date_policy(what: &str, value: &Value) -> Result<bool, QueryError> {
+    if session_temporal_sql_mode_bits() & crate::engine::api::TEMPORAL_MODE_NO_ZERO_DATE == 0 {
+        return Ok(true);
     }
-    // Strict → error 1292 (matches write-side `temporal_violation`);
-    // non-strict → warning 1264 + return the zero sentinel to the caller.
-    let strict = bits & crate::engine::api::TEMPORAL_MODE_STRICT != 0
-        || bits & crate::engine::api::TEMPORAL_MODE_EXPLICIT == 0;
-    let msg = if what == "DATE" {
-        format!("incorrect {what} value: '0000-00-00' (NO_ZERO_DATE)")
-    } else {
-        let s = string_value(value);
-        format!("incorrect {what} value: '{s}' (NO_ZERO_DATE)")
-    };
-    if strict {
-        return Err(crate::error::catalog::ER_TRUNCATED_WRONG_VALUE.error(msg));
+    let err = crate::error::catalog::ER_TRUNCATED_WRONG_VALUE
+        .error(format!("Incorrect {what} value: '{}'", string_value(value)));
+    if strict_dml_expression() {
+        return Err(err);
     }
-    crate::engine::api::push_statement_warning(
-        crate::error::ConditionLevel::Warning,
-        crate::error::catalog::ER_WARN_DATA_OUT_OF_RANGE,
-        msg,
-    );
-    Ok(())
+    crate::engine::api::push_statement_condition(crate::error::ConditionLevel::Warning, &err);
+    Ok(false)
 }
 
 #[cold]
@@ -2101,6 +2209,9 @@ pub(crate) fn cast_value_to_date(value: &Value) -> Result<Value, QueryError> {
     match value {
         Value::Date(_) => return Ok(value.clone()),
         Value::DateTime(micros) => {
+            if *micros == crate::types::ZERO_DATETIME {
+                return Ok(Value::Date(crate::types::ZERO_DATE));
+            }
             let (year, month, day, ..) = crate::types::datetime_components(*micros);
             if let Some(date) = date_value_from_components(year, month, day) {
                 return Ok(date);
@@ -2109,7 +2220,9 @@ pub(crate) fn cast_value_to_date(value: &Value) -> Result<Value, QueryError> {
         _ => {}
     }
     if is_zero_datetime_value(value) {
-        cast_zero_date_policy("DATE", value)?;
+        if !cast_zero_date_policy("DATE", value)? {
+            return Ok(Value::Null);
+        }
         return Ok(Value::Date(crate::types::ZERO_DATE));
     }
     let normalized = date_context_colon_value(value);
@@ -2128,6 +2241,9 @@ pub(crate) fn cast_value_to_date(value: &Value) -> Result<Value, QueryError> {
     }
     if value_is_stringish(value) {
         let text = str_value(value);
+        if text.trim_start().starts_with('-') {
+            return Ok(warn_invalid_temporal_cast("date", value));
+        }
         if text.len() > 10 && text.is_char_boundary(10) {
             let tail = text[10..].trim_start();
             if !tail.is_empty() && !tail.as_bytes()[0].is_ascii_digit() {
@@ -2223,7 +2339,6 @@ pub(crate) fn cast_value_to_datetime(value: &Value, fsp: u8) -> Result<Value, Qu
         }
         Value::Date(days) => {
             if *days == crate::types::ZERO_DATE {
-                cast_zero_date_policy("DATETIME", value)?;
                 return Ok(Value::DateTime(crate::types::ZERO_DATETIME));
             }
             if let Some((year, month, day)) = crate::types::decode_tagged_date(*days) {
@@ -2237,7 +2352,9 @@ pub(crate) fn cast_value_to_datetime(value: &Value, fsp: u8) -> Result<Value, Qu
         _ => {}
     }
     if is_zero_datetime_value(value) {
-        cast_zero_date_policy("DATETIME", value)?;
+        if !cast_zero_date_policy("DATETIME", value)? {
+            return Ok(Value::Null);
+        }
         return Ok(Value::DateTime(crate::types::ZERO_DATETIME));
     }
     if matches!(
@@ -4000,7 +4117,7 @@ impl ValueKey {
         if collation_id == 63 {
             match value {
                 Value::String(text) => {
-                    return ValueKey::Bytes(KeyBytes::from_slice(text.as_bytes()))
+                    return ValueKey::Bytes(KeyBytes::from_slice(text.as_bytes()));
                 }
                 Value::SmallString(bytes) => return ValueKey::Bytes(KeyBytes::from_slice(bytes)),
                 Value::Bytes(bytes) => return ValueKey::Bytes(KeyBytes::from_slice(bytes)),
@@ -4374,7 +4491,7 @@ fn eval_const_inner(expr: &Expr) -> Result<Value, QueryError> {
             op: UnaryOp::Neg,
             expr,
         } => {
-            let value = eval_const(expr)?;
+            let value = prepared_arithmetic_expr_value(expr, eval_const(expr)?, BinaryOp::Sub)?;
             duplicate_negated_int_div_zero_warning(expr, &value);
             eval_negate_typed(
                 value,
@@ -4470,11 +4587,13 @@ fn eval_const_inner(expr: &Expr) -> Result<Value, QueryError> {
             } else {
                 eval_const(left)?
             };
+            let l = prepared_arithmetic_expr_value(left, l, *op)?;
             let r = if comparison {
                 exact_decimal_comparison_literal(right).unwrap_or(eval_const(right)?)
             } else {
                 eval_const(right)?
             };
+            let r = prepared_arithmetic_expr_value(right, r, *op)?;
             let (l, r) = coerce_binary_literal_operands(left, *op, right, l, r);
             match op {
                 BinaryOp::And | BinaryOp::Or | BinaryOp::Concat => unreachable!(),
@@ -4765,7 +4884,11 @@ fn eval_expr_legacy_inner(
             op: UnaryOp::Neg,
             expr,
         } => {
-            let value = eval_expr_legacy(expr, table, values)?;
+            let value = prepared_arithmetic_expr_value(
+                expr,
+                eval_expr_legacy(expr, table, values)?,
+                BinaryOp::Sub,
+            )?;
             duplicate_negated_int_div_zero_warning(expr, &value);
             let evaluate = || {
                 eval_negate_typed(
@@ -5860,6 +5983,261 @@ pub(crate) fn function_uses_numeric_hex_literals(name: &str) -> bool {
         .any(|candidate| name.eq_ignore_ascii_case(candidate))
 }
 
+/// Validate native call shapes before short-circuit evaluation can hide them.
+/// Unknown names retain stored-function resolution and qualified namespaces.
+pub(crate) fn validate_native_function_arity(name: &str, args: &[Expr]) -> Result<(), QueryError> {
+    if crate::engine::ai::is_function(name) || crate::engine::http::is_function(name) {
+        // Their dedicated binders validate arity together with the allowed
+        // execution context, before any external request can be dispatched.
+        return Ok(());
+    }
+    let normalized = crate::engine::sys_schema::NormalizedFuncName::new(name);
+    let upper = normalized.as_str();
+    if let Some(spec) = crate::engine::expr_type::builtin_spec(upper) {
+        return expect_arg_range(
+            name,
+            args,
+            usize::from(spec.min_arity),
+            usize::from(spec.max_arity),
+        );
+    }
+    if let Some(spec) = crate::engine::geo::sql::function_spec(upper) {
+        return expect_arg_range(
+            name,
+            args,
+            usize::from(spec.min_args),
+            usize::from(spec.max_args),
+        );
+    }
+    if let Some(function) = math::MathFunction::from_name(upper) {
+        return function.check_arity(name, args);
+    }
+    if let Some(function) = network::NetworkFunction::from_name(upper) {
+        return function.check_arity(args);
+    }
+    match upper {
+        "YEAR" | "MONTH" | "DAY" | "DAYOFMONTH" | "HOUR" | "MINUTE" | "SECOND" | "LENGTH"
+        | "OCTET_LENGTH" | "BIT_LENGTH" | "ASCII" | "LOAD_FILE" => expect_arg_count(name, args, 1),
+        "NOW" | "CURRENT_TIMESTAMP" | "LOCALTIME" | "LOCALTIMESTAMP" | "CURTIME"
+        | "CURRENT_TIME" | "UTC_TIMESTAMP" | "UTC_TIME" | "SYSDATE" => {
+            expect_arg_range(name, args, 0, 1)
+        }
+        "CONVERT_USING" => expect_arg_range(name, args, 2, 3),
+        "JSON_OBJECT" if args.len() % 2 != 0 => Err(error(
+            crate::error::catalog::ER_WRONG_PARAMCOUNT_TO_NATIVE_FCT,
+            format!("Incorrect parameter count in the call to native function '{name}'"),
+        )),
+        "TRIM" => expect_arg_range(name, args, 1, 3),
+        "SUBSTRING" | "SUBSTR" | "MID" => expect_arg_range(name, args, 2, 3),
+        "LEFT" | "RIGHT" | "__MEMBER_OF" | "JSON_OVERLAPS" | "GET_LOCK" => {
+            expect_arg_count(name, args, 2)
+        }
+        "ROUND" => expect_arg_range(name, args, 1, 2),
+        "JSON_CONTAINS_PATH" | "JSON_SEARCH" => expect_min_args(name, args, 3),
+        "JSON_DEPTH"
+        | "JSON_PRETTY"
+        | "COMPRESS"
+        | "UNCOMPRESS"
+        | "UNCOMPRESSED_LENGTH"
+        | "RELEASE_LOCK"
+        | "IS_FREE_LOCK"
+        | "IS_USED_LOCK" => expect_arg_count(name, args, 1),
+        "JSON_ARRAY_APPEND" | "JSON_ARRAY_INSERT" | "JSON_SET" | "JSON_INSERT" | "JSON_REPLACE"
+            if args.len() < 3 || args.len() % 2 != 1 =>
+        {
+            Err(error(
+                crate::error::catalog::ER_WRONG_PARAMCOUNT_TO_NATIVE_FCT,
+                format!("Incorrect parameter count in the call to native function '{name}'"),
+            ))
+        }
+        "JSON_VALUE" if args.len() != 2 && args.len() != 7 => Err(error(
+            crate::error::catalog::ER_WRONG_PARAMCOUNT_TO_NATIVE_FCT,
+            format!("Incorrect parameter count in the call to native function '{name}'"),
+        )),
+        "__IS_TRUE" => expect_arg_count(name, args, 1),
+        "__IS_FALSE" => expect_arg_count(name, args, 1),
+        "__LIKE_DYNAMIC_ESCAPE" => expect_arg_count(name, args, 4),
+        "CURDATE" | "CURRENT_DATE" => expect_arg_count(name, args, 0),
+        "VERSION" => expect_arg_count(name, args, 0),
+        "DATABASE" | "SCHEMA" => expect_arg_count(name, args, 0),
+        "USER" | "SESSION_USER" => expect_arg_count(name, args, 0),
+        "__MYDB_RLS_GUARD" => expect_arg_count(name, args, 2),
+        "__MYDB_RLS_SETTINGS" => expect_arg_count(name, args, 2),
+        "RLS_CONTEXT" => expect_arg_count(name, args, 1),
+        "CURRENT_USER" => expect_arg_count(name, args, 0),
+        "CURRENT_ROLE" => expect_arg_count(name, args, 0),
+        "CONNECTION_ID" => expect_arg_count(name, args, 0),
+        "CONCAT" | "__GROUP_CONCAT_VALUE" => expect_min_args(name, args, 1),
+        "CONCAT_WS" => expect_min_args(name, args, 2),
+        "__TEMPORAL_COMPARISON_KEY" => expect_arg_count(name, args, 1),
+        "__DISTINCT_COLLATION_KEY" => expect_arg_count(name, args, 1),
+        "REPLACE" => expect_arg_count(name, args, 3),
+        "REGEXP_LIKE" => expect_arg_range(name, args, 2, 3),
+        "INSTR" | "POSITION" => expect_arg_count(name, args, 2),
+        "MOD" => expect_arg_count(name, args, 2),
+        "IFNULL" => expect_arg_count(name, args, 2),
+        "COALESCE" => expect_min_args(name, args, 1),
+        "NULLIF" => expect_arg_count(name, args, 2),
+        "IF" => expect_arg_count(name, args, 3),
+        "DATEDIFF" => expect_arg_count(name, args, 2),
+        "UNIX_TIMESTAMP" => expect_arg_range(name, args, 0, 1),
+        "FROM_UNIXTIME" => expect_arg_range(name, args, 1, 2),
+        "DATE_FORMAT" => expect_arg_count(name, args, 2),
+        "EXTRACT" | "EXTRACT_COMPOUND" => expect_arg_count(name, args, 2),
+        "CAST" => expect_min_args(name, args, 2),
+        "COLLATE" => expect_arg_count(name, args, 2),
+        "REPEAT" => expect_arg_count(name, args, 2),
+        "MASK_INNER" => expect_arg_range(name, args, 3, 4),
+        "MASK_OUTER" => expect_arg_range(name, args, 3, 4),
+        "KEYRING_KEY_GENERATE" => expect_arg_count(name, args, 3),
+        "KEYRING_KEY_STORE" => expect_arg_count(name, args, 3),
+        "KEYRING_KEY_FETCH" => expect_arg_count(name, args, 1),
+        "KEYRING_KEY_REMOVE" => expect_arg_count(name, args, 1),
+        "KEYRING_KEY_LENGTH" => expect_arg_count(name, args, 1),
+        "KEYRING_KEY_TYPE" => expect_arg_count(name, args, 1),
+        "CHAR_USING" => expect_arg_count(name, args, 2),
+        "INSERT" => expect_arg_count(name, args, 4),
+        "__FIND_IN_SET_SET" | "__FIND_IN_SET_SET_BINARY" => expect_min_args(name, args, 3),
+        "FIND_IN_SET" => expect_arg_count(name, args, 2),
+        "FIELD" => expect_min_args(name, args, 2),
+        "__ENUM_ORDINAL" => expect_min_args(name, args, 2),
+        "__SET_ORDINAL" | "__SET_ORDINAL_BINARY" => expect_min_args(name, args, 2),
+        "__COLLATION_SORT_KEY" => expect_arg_count(name, args, 2),
+        "__ENUM_CMP" | "__SET_CMP" | "__SET_CMP_BINARY" => expect_min_args(name, args, 4),
+        "ELT" => expect_min_args(name, args, 2),
+        "FORMAT" => expect_arg_range(name, args, 2, 3),
+        "STRCMP" => expect_arg_count(name, args, 2),
+        "RAND" => expect_arg_range(name, args, 0, 1),
+        "TRUNCATE" => expect_arg_count(name, args, 2),
+        "PI" => expect_arg_count(name, args, 0),
+        "CONV" => expect_arg_count(name, args, 3),
+        "DATE_ADD" | "ADDDATE" | "DATE_SUB" | "SUBDATE" => expect_arg_range(name, args, 2, 2),
+        "STR_TO_DATE" => expect_arg_count(name, args, 2),
+        "WEEK" | "WEEKOFYEAR" => expect_arg_range(name, args, 1, 2),
+        "MAKEDATE" => expect_arg_count(name, args, 2),
+        "MAKETIME" => expect_arg_count(name, args, 3),
+        "TIMEDIFF" => expect_arg_count(name, args, 2),
+        "TIMESTAMPDIFF" => expect_arg_count(name, args, 3),
+        "TIMESTAMPADD" => expect_arg_count(name, args, 3),
+        "ADDTIME" | "SUBTIME" => expect_arg_count(name, args, 2),
+        "PERIOD_ADD" => expect_arg_count(name, args, 2),
+        "PERIOD_DIFF" => expect_arg_count(name, args, 2),
+        "LAST_INSERT_ID" => expect_arg_range(name, args, 0, 1),
+        "UUID" => expect_arg_count(name, args, 0),
+        "NEXTVAL" => expect_arg_count(name, args, 1),
+        "CURRVAL" => expect_arg_count(name, args, 1),
+        "LASTVAL" => expect_arg_count(name, args, 0),
+        "SETVAL" => expect_arg_range(name, args, 2, 3),
+        "SLEEP" => expect_arg_count(name, args, 1),
+        "SHA2" => expect_arg_count(name, args, 2),
+        "JSON_EXTRACT" => expect_min_args(name, args, 2),
+        "JSON_LENGTH" => expect_arg_range(name, args, 1, 2),
+        "JSON_KEYS" => expect_arg_range(name, args, 1, 2),
+        "JSON_CONTAINS" => expect_arg_range(name, args, 2, 3),
+        "JSON_REMOVE" => expect_min_args(name, args, 2),
+        "EXPORT_SET" => expect_arg_range(name, args, 3, 5),
+        "MAKE_SET" => expect_min_args(name, args, 2),
+        "REGEXP_INSTR" => expect_arg_range(name, args, 2, 6),
+        "REGEXP_REPLACE" => expect_arg_range(name, args, 3, 6),
+        "REGEXP_SUBSTR" => expect_arg_range(name, args, 2, 5),
+        "DIV" => expect_arg_count(name, args, 2),
+        "UTC_DATE" => expect_arg_count(name, args, 0),
+        "TIMESTAMP" => expect_arg_range(name, args, 1, 2),
+        "GET_FORMAT" => expect_arg_count(name, args, 2),
+        "CONVERT_TZ" => expect_arg_count(name, args, 3),
+        "CHARSET" => expect_arg_count(name, args, 1),
+        "COLLATION" => expect_arg_count(name, args, 1),
+        "COERCIBILITY" => expect_arg_count(name, args, 1),
+        "ICU_VERSION" => expect_arg_count(name, args, 0),
+        "ROW_COUNT" => expect_arg_count(name, args, 0),
+        "FOUND_ROWS" => expect_arg_count(name, args, 0),
+        "BENCHMARK" => expect_arg_count(name, args, 2),
+        "SUBSTRING_INDEX" => expect_arg_count(name, args, 3),
+        "WEIGHT_STRING" => expect_arg_range(name, args, 1, 1),
+        "WEIGHT_STRING_TYPED" => expect_arg_count(name, args, 3),
+        "YEARWEEK" => expect_arg_range(name, args, 1, 2),
+        "TIME_FORMAT" => expect_arg_count(name, args, 2),
+        "INTERVAL" | "__INTERVAL_LIST" => expect_min_args(name, args, 2),
+        "UUID_SHORT" => expect_arg_count(name, args, 0),
+        "NAME_CONST" => expect_arg_count(name, args, 2),
+        "SYSTEM_USER" => expect_arg_count(name, args, 0),
+        "LIST_ADD" | "LIST_DROP" => expect_arg_count(name, args, 2),
+        "SYS_GET_CONFIG" => expect_arg_count(name, args, 2),
+        "VERSION_MAJOR" | "VERSION_MINOR" | "VERSION_PATCH" => expect_arg_count(name, args, 0),
+        "PS_IS_ACCOUNT_ENABLED" | "PS_IS_THREAD_INSTRUMENTED" => expect_min_args(name, args, 1),
+        "PS_CURRENT_THREAD_ID" => expect_arg_count(name, args, 0),
+        "GTID_SUBSET" => expect_arg_count(name, args, 2),
+        "GTID_SUBTRACT" => expect_arg_count(name, args, 2),
+        "STATEMENT_DIGEST" | "STATEMENT_DIGEST_TEXT" => expect_arg_count(name, args, 1),
+        "RELEASE_ALL_LOCKS" => expect_arg_count(name, args, 0),
+        "CHAR_LENGTH" | "CHARACTER_LENGTH" => expect_arg_count(name, args, 1),
+        "LOWER" | "LCASE" => expect_arg_count(name, args, 1),
+        "UPPER" | "UCASE" => expect_arg_count(name, args, 1),
+        "LTRIM" | "RTRIM" => expect_arg_count(name, args, 1),
+        "REVERSE" => expect_arg_count(name, args, 1),
+        "ABS" => expect_arg_count(name, args, 1),
+        "CEIL" | "CEILING" => expect_arg_count(name, args, 1),
+        "FLOOR" => expect_arg_count(name, args, 1),
+        "SQRT" => expect_arg_count(name, args, 1),
+        "SIGN" => expect_arg_count(name, args, 1),
+        "DATE" => expect_arg_count(name, args, 1),
+        "SPACE" => expect_arg_count(name, args, 1),
+        "UNHEX" => expect_arg_count(name, args, 1),
+        "ORD" => expect_arg_count(name, args, 1),
+        "BIN" => expect_arg_count(name, args, 1),
+        "OCT" => expect_arg_count(name, args, 1),
+        "QUOTE" => expect_arg_count(name, args, 1),
+        "CRC32" => expect_arg_count(name, args, 1),
+        "DAYNAME" => expect_arg_count(name, args, 1),
+        "MONTHNAME" => expect_arg_count(name, args, 1),
+        "DAYOFWEEK" => expect_arg_count(name, args, 1),
+        "DAYOFYEAR" => expect_arg_count(name, args, 1),
+        "WEEKDAY" => expect_arg_count(name, args, 1),
+        "QUARTER" => expect_arg_count(name, args, 1),
+        "LAST_DAY" => expect_arg_count(name, args, 1),
+        "TO_DAYS" => expect_arg_count(name, args, 1),
+        "FROM_DAYS" => expect_arg_count(name, args, 1),
+        "TIME" => expect_arg_count(name, args, 1),
+        "TIME_TO_SEC" => expect_arg_count(name, args, 1),
+        "SEC_TO_TIME" => expect_arg_count(name, args, 1),
+        "ISNULL" => expect_arg_count(name, args, 1),
+        "MD5" => expect_arg_count(name, args, 1),
+        "SHA1" | "SHA" => expect_arg_count(name, args, 1),
+        "JSON_UNQUOTE" => expect_arg_count(name, args, 1),
+        "JSON_VALID" => expect_arg_count(name, args, 1),
+        "JSON_TYPE" => expect_arg_count(name, args, 1),
+        "TO_BASE64" => expect_arg_count(name, args, 1),
+        "FROM_BASE64" => expect_arg_count(name, args, 1),
+        "SOUNDEX" => expect_arg_count(name, args, 1),
+        "BIT_COUNT" => expect_arg_count(name, args, 1),
+        "MICROSECOND" => expect_arg_count(name, args, 1),
+        "TO_SECONDS" => expect_arg_count(name, args, 1),
+        "JSON_QUOTE" => expect_arg_count(name, args, 1),
+        "IS_UUID" => expect_arg_count(name, args, 1),
+        "RANDOM_BYTES" => expect_arg_count(name, args, 1),
+        "JSON_STORAGE_SIZE" => expect_arg_count(name, args, 1),
+        "JSON_STORAGE_FREE" => expect_arg_count(name, args, 1),
+        "FORMAT_BYTES" => expect_arg_count(name, args, 1),
+        "FORMAT_PICO_TIME" => expect_arg_count(name, args, 1),
+        "FORMAT_TIME" => expect_arg_count(name, args, 1),
+        "FORMAT_STATEMENT" => expect_arg_count(name, args, 1),
+        "FORMAT_PATH" => expect_arg_count(name, args, 1),
+        "QUOTE_IDENTIFIER" => expect_arg_count(name, args, 1),
+        "EXTRACT_SCHEMA_FROM_FILE_NAME" | "EXTRACT_TABLE_FROM_FILE_NAME" => {
+            expect_arg_count(name, args, 1)
+        }
+        "PS_IS_CONSUMER_ENABLED" => expect_arg_count(name, args, 1),
+        "MYSQL_QUERY_ATTRIBUTE_STRING" => expect_arg_count(name, args, 1),
+        "PS_IS_INSTRUMENT_DEFAULT_ENABLED" | "PS_IS_INSTRUMENT_DEFAULT_TIMED" => {
+            expect_arg_count(name, args, 1)
+        }
+        "PS_THREAD_ID" => expect_arg_count(name, args, 1),
+        "PS_THREAD_ACCOUNT" => expect_arg_count(name, args, 1),
+        "VALIDATE_PASSWORD_STRENGTH" => expect_arg_count(name, args, 1),
+        _ => Ok(()),
+    }
+}
+
 fn eval_function_inner<F>(name: &str, args: &[Expr], mut eval_arg: F) -> Result<Value, QueryError>
 where
     F: FnMut(&Expr) -> Result<Value, QueryError>,
@@ -5925,7 +6303,7 @@ where
                     return Err(error(
                         crate::error::catalog::ER_PARSE_ERROR,
                         "invalid target for ':=' user-variable assignment",
-                    ))
+                    ));
                 }
             };
             let value = match &args[1] {
@@ -8220,7 +8598,7 @@ where
                     return Err(error(
                         crate::error::catalog::ER_WRONG_VALUE,
                         format!("unsupported TIMESTAMPDIFF unit '{unit}'"),
-                    ))
+                    ));
                 }
             };
             Ok(Value::Int(diff))
@@ -8639,7 +9017,7 @@ where
                             Err(err)
                                 if err.is(crate::error::catalog::ER_JSON_DOCUMENT_TOO_DEEP) =>
                             {
-                                return Err(err)
+                                return Err(err);
                             }
                             Err(_) => false,
                         }
@@ -9233,11 +9611,7 @@ where
                     .unwrap_or(1)
                     .max(1);
                 let start_byte = regexp_start_byte_allow_end(&expr, pos)?;
-                for (idx, mat) in re
-                    .find_iter(&expr)
-                    .filter(|m| m.start() >= start_byte)
-                    .enumerate()
-                {
+                for (idx, mat) in re.find_iter(&expr[start_byte..]).enumerate() {
                     if idx as i64 + 1 == occurrence {
                         return Ok(Value::String(mat.as_str().to_string()));
                     }
@@ -9842,7 +10216,7 @@ where
                     match parse_time_value_components(&values[0]) {
                         Ok(parts) => parts,
                         Err(err) => {
-                            return Ok(warn_invalid_temporal_function("time", &values[0], err))
+                            return Ok(warn_invalid_temporal_function("time", &values[0], err));
                         }
                     };
                 if (u64::from(h) * 3600 + u64::from(m) * 60 + u64::from(s)) * 1_000_000
@@ -10318,10 +10692,12 @@ where
                         )
                     }))
                 }
-                None => Err(error(
-                    crate::error::catalog::ER_SP_DOES_NOT_EXIST,
-                    format!("function '{name}' is not supported"),
-                )),
+                None => Err(with_session_view(|view| {
+                    crate::engine::executor::routines::missing_function(
+                        view.as_ref().map_or("", SessionView::database),
+                        name,
+                    )
+                })),
             }
         }
     }
@@ -11752,13 +12128,6 @@ where
     F: FnMut(&Expr) -> Result<Value, QueryError>,
 {
     let value = eval_one(name, args, eval_arg)?;
-    // Boolean expressions have integer 0/1 values, but MySQL keeps their
-    // boolean source type when a temporal extractor consumes them. They map
-    // to the zero temporal value without the "incorrect datetime" warning
-    // used for a character string such as '1'.
-    if args.first().is_some_and(expr_is_boolean_typed) && !matches!(value, Value::Null) {
-        return Ok(Value::Int(0));
-    }
     null_or(value, |value| extract_datetime_part(name, part, &value))
 }
 
@@ -11768,7 +12137,16 @@ pub(crate) fn extract_datetime_part(
     value: &Value,
 ) -> Result<Value, QueryError> {
     let part = part.to_ascii_uppercase();
-    if matches!(value, Value::Int(0) | Value::UInt(0))
+    if (matches!(value, Value::Int(0) | Value::UInt(0))
+        || matches!(
+            value,
+            Value::Float(_)
+                | Value::Double(_)
+                | Value::Decimal(_)
+                | Value::DecimalCompact(..)
+                | Value::Decimal128(..)
+                | Value::DecimalWide(_)
+        ) && numeric(value).is_ok_and(|n| n >= 0.0 && n < 1.0))
         && matches!(part.as_str(), "YEAR" | "MONTH" | "DAY" | "DAYOFMONTH")
     {
         return Ok(Value::Int(0));
@@ -12391,7 +12769,13 @@ pub(crate) fn string_extent_arg(value: &Value) -> i64 {
     use num_traits::ToPrimitive;
     match value {
         Value::UInt(value) => (*value).min(i64::MAX as u64) as i64,
-        Value::DecimalCompact(..) | Value::Decimal128(..) | Value::DecimalWide(..) => {
+        Value::DecimalCompact(magnitude, scale) => {
+            fixed_decimal_string_extent(i128::from(*magnitude), *scale, value)
+        }
+        Value::Decimal128(magnitude, scale) => {
+            fixed_decimal_string_extent(*magnitude, *scale, value)
+        }
+        Value::DecimalWide(..) => {
             use num_bigint::BigInt;
             use num_traits::ToPrimitive;
 
@@ -12466,6 +12850,26 @@ pub(crate) fn string_extent_arg(value: &Value) -> i64 {
     }
 }
 
+/// Downscaling a fixed-width coefficient cannot overflow. Keep ordinary
+/// string positions allocation-free while retaining the wide lane's warning
+/// and saturation policy after exact, half-away-from-zero rounding.
+fn fixed_decimal_string_extent(magnitude: i128, scale: u8, value: &Value) -> i64 {
+    let integer = crate::util::decimal::rescale_round_i128(magnitude, scale, 0)
+        .expect("downscaling a fixed-width decimal is representable");
+    if let Ok(integer) = i64::try_from(integer) {
+        return integer;
+    }
+    crate::engine::api::push_statement_warning(
+        crate::error::ConditionLevel::Warning,
+        crate::error::catalog::ER_TRUNCATED_WRONG_VALUE,
+        format!(
+            "Truncated incorrect DECIMAL value: '{}'",
+            value.to_display_string()
+        ),
+    );
+    integer.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
+}
+
 fn sleep_with_cancel(duration: Duration) -> Result<(), QueryError> {
     if duration.is_zero() {
         return crate::engine::cancel::check_cancelled();
@@ -12531,6 +12935,35 @@ pub(crate) fn mysql_substring_byte_bounds(
 pub(crate) fn mysql_substring_slice(input: &str, start: i64, len: Option<i64>) -> &str {
     if start == 0 || len.is_some_and(|len| len <= 0) {
         return "";
+    }
+    // ASCII character coordinates are byte coordinates. Inspect only the
+    // required prefix for positive starts: extracting a leading character
+    // must not scan an arbitrarily large trailing payload. An omitted length
+    // needs only the start boundary; the suffix may contain any UTF-8 text.
+    let ascii_end = if start > 0 {
+        let offset = (start - 1) as usize;
+        if offset >= input.len() {
+            return "";
+        }
+        len.map_or(offset, |count| {
+            offset.saturating_add(count as usize).min(input.len())
+        })
+    } else {
+        input.len()
+    };
+    if input.as_bytes()[..ascii_end].is_ascii() {
+        // Positive coordinates were already bounded above. Reuse the proven
+        // prefix boundary instead of resolving the same byte range again.
+        if start > 0 {
+            let end = if len.is_some() {
+                ascii_end
+            } else {
+                input.len()
+            };
+            return &input[(start - 1) as usize..end];
+        }
+        let (offset, count) = mysql_substring_byte_bounds(input.len(), start, len);
+        return &input[offset..offset + count];
     }
     // Resolve the 1-based MySQL position into a 0-based char index. For
     // a negative start we count from the right, which still requires
@@ -14160,12 +14593,7 @@ pub(crate) fn parse_datetime(value: &Value) -> Result<NaiveDateTime, QueryError>
     }
     let text = str_value(value);
     let trimmed = text.trim();
-    let bytes = trimmed.as_bytes();
-    if trimmed.starts_with('-')
-        && bytes.len() >= 11
-        && bytes.get(5) == Some(&b'-')
-        && bytes.get(8) == Some(&b'-')
-    {
+    if trimmed.starts_with('-') {
         // chrono accepts proleptic negative years, while MySQL's temporal
         // domain does not. Do not let a negative DATETIME-looking string
         // become a valid internal date (negative TIME values are parsed by
@@ -14282,7 +14710,12 @@ pub(crate) fn warn_superfluous_datetime_delimiter(text: &str) {
     crate::engine::api::push_statement_warning(
         crate::error::ConditionLevel::Warning,
         crate::error::catalog::ER_WARN_DEPRECATED_SUPERFLUOUS_DELIMITER,
-        format!("Delimiter '{}' in position {} in datetime value '{}' at row 1 is superfluous and is deprecated. Please remove.", char::from(delimiter), separator + 1, diagnostic_value(text)),
+        format!(
+            "Delimiter '{}' in position {} in datetime value '{}' at row 1 is superfluous and is deprecated. Please remove.",
+            char::from(delimiter),
+            separator + 1,
+            diagnostic_value(text)
+        ),
     );
 }
 
@@ -14781,7 +15214,11 @@ fn add_interval_value(
                     return Ok(dt.checked_add_signed(chrono::Duration::microseconds(signed_us)));
                 }
             }
-            let n = int_value(&round_or_truncate_value(amount, 0, true)?)?;
+            let n = if value_is_stringish(amount) {
+                int_value(amount)?
+            } else {
+                int_value(&round_or_truncate_value(amount, 0, true)?)?
+            };
             // Fold subtraction via checked negation so `n == i64::MIN` (whose
             // negation is not representable in i64) yields NULL rather than
             // overflowing.
@@ -20059,7 +20496,7 @@ pub(super) fn function_metadata_decimals(name: &str, args: &[Expr]) -> Option<u8
             Expr::Literal(Literal::Decimal(text) | Literal::String(text)) => text.as_str(),
             Expr::BoundValue(Value::Decimal(text) | Value::String(text)) => text.as_str(),
             Expr::BoundValue(Value::DecimalCompact(_, scale) | Value::Decimal128(_, scale)) => {
-                return Some((*scale).min(6))
+                return Some((*scale).min(6));
             }
             Expr::BoundValue(Value::DecimalWide(value)) => return Some(value.scale.min(6)),
             _ => return None,
@@ -21465,6 +21902,7 @@ pub(crate) fn eval_binary_legacy(
     } else {
         eval_expr_legacy(left, table, values)?
     };
+    let l = prepared_arithmetic_expr_value(left, l, op)?;
     let r = if comparison {
         exact_decimal_comparison_literal(right)
             .map(Ok)
@@ -21500,6 +21938,7 @@ pub(crate) fn eval_binary_legacy(
         coerce_year_equality_operands(left, right, op, table, &mut l, &mut r)?;
     }
 
+    let r = prepared_arithmetic_expr_value(right, r, op)?;
     match op {
         BinaryOp::Xor => eval_logical_xor(&l, &r),
         BinaryOp::Eq
@@ -23408,10 +23847,11 @@ pub(crate) fn validate_expr_temporal_literals_with_resolver<'a>(
         left: &Expr,
         right: &Expr,
         resolve: &TemporalLiteralColumnResolver<'a>,
+        allow_zero_date: bool,
     ) -> Result<(), QueryError> {
         if let (Expr::Tuple(left), Expr::Tuple(right)) = (left, right) {
             for (left, right) in left.iter().zip(right) {
-                validate_pair(left, right, resolve)?;
+                validate_pair(left, right, resolve, allow_zero_date)?;
             }
             return Ok(());
         }
@@ -23513,8 +23953,9 @@ pub(crate) fn validate_expr_temporal_literals_with_resolver<'a>(
                 |parts| {
                     let zero_date = parts.year == 0 && parts.month == 0 && parts.day == 0;
                     let zero_in_date = parts.month == 0 || parts.day == 0;
-                    if zero_date && bits & crate::engine::api::TEMPORAL_MODE_NO_ZERO_DATE != 0 {
-                        return false;
+                    if zero_date {
+                        return allow_zero_date
+                            || bits & crate::engine::api::TEMPORAL_MODE_NO_ZERO_DATE == 0;
                     }
                     if zero_in_date && bits & crate::engine::api::TEMPORAL_MODE_NO_ZERO_IN_DATE != 0
                     {
@@ -23576,7 +24017,7 @@ pub(crate) fn validate_expr_temporal_literals_with_resolver<'a>(
                         | BinaryOp::Gt
                         | BinaryOp::GtEq
                 ) {
-                    validate_pair(left, right, resolve)?;
+                    validate_pair(left, right, resolve, false)?;
                 }
                 visit(left, table, resolve)?;
                 visit(right, table, resolve)
@@ -23636,7 +24077,7 @@ pub(crate) fn validate_expr_temporal_literals_with_resolver<'a>(
                     );
                 }
                 for item in list {
-                    validate_pair(expr, item, resolve)?;
+                    validate_pair(expr, item, resolve, false)?;
                     visit(item, table, resolve)?;
                 }
                 visit(expr, table, resolve)
@@ -23652,8 +24093,8 @@ pub(crate) fn validate_expr_temporal_literals_with_resolver<'a>(
                     })
                 });
                 if domain != BetweenComparisonDomain::Numeric {
-                    validate_pair(expr, low, resolve)?;
-                    validate_pair(expr, high, resolve)?;
+                    validate_pair(expr, low, resolve, true)?;
+                    validate_pair(expr, high, resolve, true)?;
                 }
                 visit(expr, table, resolve)?;
                 visit(low, table, resolve)?;
@@ -23673,7 +24114,7 @@ pub(crate) fn validate_expr_temporal_literals_with_resolver<'a>(
                 visit(left, table, resolve)?;
                 if let QuantifiedComparisonRight::List(items) = right {
                     for item in items {
-                        validate_pair(left, item, resolve)?;
+                        validate_pair(left, item, resolve, false)?;
                         visit(item, table, resolve)?;
                     }
                 }
@@ -24813,14 +25254,14 @@ pub(crate) fn cast_to_integer(value: &Value, unsigned: bool) -> Result<Value, Qu
                 Value::UInt(*number as u64)
             } else {
                 Value::Int(*number)
-            })
+            });
         }
         Value::UInt(number) => {
             return Ok(if unsigned {
                 Value::UInt(*number)
             } else {
                 Value::Int(*number as i64)
-            })
+            });
         }
         _ => {}
     }
@@ -25548,7 +25989,7 @@ fn to_u64_bitwise_with_string_mode(
             return Err(error(
                 crate::error::catalog::ER_WRONG_ARGUMENTS,
                 "Incorrect arguments to bitwise operation",
-            ))
+            ));
         }
         Value::Int(v) => *v as u64,
         Value::UInt(v) => *v,

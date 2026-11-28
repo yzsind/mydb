@@ -632,23 +632,24 @@ fn online_primary_key_xa_resolution_and_existing_constraints() {
 }
 
 #[test]
-fn online_primary_key_rejects_unsupported_mixed_none() {
-    let dir = tempfile::tempdir().unwrap();
+fn online_primary_key_copy_accepts_mixed_none_and_rejects_instant() {
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
     let engine = open_test_engine(dir.path());
-    engine.execute("CREATE TABLE t(id INT, v INT)").unwrap();
-    engine.execute("INSERT INTO t VALUES(1,10)").unwrap();
     for sql in [
         "ALTER TABLE t ADD PRIMARY KEY(id), ADD COLUMN extra INT, LOCK=NONE",
-        "ALTER TABLE t ADD PRIMARY KEY(id), ALGORITHM=INSTANT",
         "ALTER TABLE t ADD PRIMARY KEY(id), ALGORITHM=COPY, LOCK=NONE",
     ] {
-        assert_eq!(engine.execute(sql).unwrap_err().code(), 1846, "{sql}");
-        assert!(engine
-            .database()
-            .table("test.t")
-            .unwrap()
-            .primary_key
-            .is_empty());
+        engine.execute("CREATE TABLE t(id INT, v INT)").unwrap();
+        engine.execute("INSERT INTO t VALUES(1,10)").unwrap();
+        engine
+            .execute("ALTER TABLE t ADD PRIMARY KEY(id), ALGORITHM=INSTANT")
+            .unwrap_err();
+        engine.execute(sql).unwrap();
+        assert_eq!(
+            engine.database().table("test.t").unwrap().primary_key,
+            vec!["id"]
+        );
+        engine.execute("DROP TABLE t").unwrap();
     }
 }
 
@@ -910,14 +911,13 @@ fn create_index_explicit_shared_and_exclusive_locks_are_honored() {
 }
 
 #[test]
-fn create_index_rejects_unsupported_algorithm_and_non_btree_lock_none() {
+fn create_index_rejects_unsupported_algorithm() {
     let dir = tempfile::tempdir().unwrap();
     let engine = open_test_engine(dir.path());
     engine.execute("CREATE TABLE t(id INT, s TEXT)").unwrap();
     for sql in [
         "CREATE INDEX idx ON t(id) ALGORITHM=INSTANT",
         "CREATE INDEX idx ON t(id) ALGORITHM=COPY LOCK=NONE",
-        "CREATE FULLTEXT INDEX idx ON t(s) LOCK=NONE",
     ] {
         assert_eq!(engine.execute(sql).unwrap_err().code(), 1846, "{sql}");
     }
@@ -3044,7 +3044,7 @@ fn cancel_ddl_job_aborts_before_final_swap_and_keeps_original_table() {
 }
 
 #[test]
-fn copy_lock_none_returns_1846() {
+fn memory_copy_lock_none_is_supported() {
     let dir = tempfile::tempdir().unwrap();
     let engine = open_test_engine(dir.path());
     let mut session = SessionContext::default();
@@ -3059,14 +3059,16 @@ fn copy_lock_none_returns_1846() {
         .execute_with_session(&mut session, "INSERT INTO t VALUES (1, 10)")
         .unwrap();
 
-    let err = engine
+    engine
         .execute_with_session(
             &mut session,
             "ALTER TABLE t LOCK=NONE, MODIFY COLUMN v BIGINT",
         )
-        .expect_err("LOCK=NONE COPY is unsupported");
-    assert_eq!(err.code(), 1846);
-    assert!(err.message().contains("LOCK=SHARED"));
+        .unwrap();
+    assert_eq!(
+        engine.database().table("test.t").unwrap().columns[1].data_type,
+        crate::storage::DataTypeKind::BigInt
+    );
 }
 
 /// Concurrent INSERT during ADD INDEX must end up in the resulting
@@ -3391,12 +3393,9 @@ fn inplace_lock_none_accepted_for_online_ddl_tooling() {
         .execute("ALTER TABLE t ADD INDEX idx_a (a), ALGORITHM=INPLACE, LOCK=NONE")
         .expect("ADD INDEX INPLACE/NONE must be accepted");
 
-    // But a type-changing COPY rewrite with LOCK=NONE and no async DDL still
-    // can't be honoured (kept behaviour).
-    let err = engine
+    engine
         .execute("ALTER TABLE t MODIFY a BIGINT, ALGORITHM=COPY, LOCK=NONE")
-        .expect_err("COPY LOCK=NONE without async DDL must still be rejected");
-    assert_eq!(err.code(), 1846);
+        .expect("Memory COPY also supports synchronous online execution");
 }
 
 #[test]

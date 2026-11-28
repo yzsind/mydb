@@ -746,6 +746,9 @@ impl Database {
         let _zone_map_role_transition = self.zone_map_gate.write();
         let role_changed = self.physical_replica_mode() != enabled;
         if role_changed {
+            // Neither role may inherit row locations maintained by the other
+            // write path. Replica DD reads bypass this process-local cache.
+            self.catalog.clear_dd_object_rows()?;
             self.sequences.role_epoch.fetch_add(1, Ordering::AcqRel);
         }
         if enabled && role_changed {
@@ -4410,7 +4413,8 @@ impl Database {
             let begin_lsn = self.temporal_history.checkpoint_barrier(|| {
                 self.append_wal(txn_id_for_ddl(), WalPayload::CheckpointBegin)
             })?;
-            let vector_redo_floor = self.vector_pending_wal.lock().values().copied().min();
+            let vector_redo_floor = self.vector_pending_wal.lock().values().copied().min()
+                .into_iter().chain(self.copy_publication_wal.lock().values().copied()).min();
             let vector_publish_floor = self.vector_pending_publication_floor();
             let dirty = self
                 .auto_increment_dirty

@@ -129,8 +129,8 @@ pub fn datetime_from_packed(mut tmp: i64) -> Value {
     )
 }
 
-pub fn my_timestamp_from_binary<T: io::Read>(mut input: T, dec: u8) -> io::Result<(i32, i32)> {
-    let sec = input.read_u32::<BE>()? as i32;
+pub fn my_timestamp_from_binary<T: io::Read>(mut input: T, dec: u8) -> io::Result<(u32, i32)> {
+    let sec = input.read_u32::<BE>()?;
     let usec = match dec {
         1 | 2 => input.read_i8()? as i32 * 10000,
         3 | 4 => input.read_i16::<BE>()? as i32 * 100,

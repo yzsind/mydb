@@ -184,10 +184,8 @@ pub fn load(data_dir: impl AsRef<Path>) -> IoResult<Option<RoleState>> {
 }
 
 pub fn save(data_dir: impl AsRef<Path>, state: &RoleState) -> IoResult<()> {
+    crate::replication::prepare_private_metadata_directory(data_dir.as_ref())?;
     let path = role_path(&data_dir);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
     let tmp = path.with_extension("json.tmp");
     let bytes = crate::storage::metadata::encode(
         crate::storage::metadata::ROLE,

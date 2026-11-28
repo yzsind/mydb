@@ -7398,3 +7398,38 @@ fn trigger_release_1123_trailing_comments_do_not_hide_delimiter() {
         assert_eq!(def.body.sql, body);
     }
 }
+
+#[test]
+fn charset_alter_preserves_compound_actions_lock_and_algorithm() {
+    for sql in [
+        "ALTER TABLE `test`.`t` CONVERT TO CHARACTER SET `utf8mb4` COLLATE `utf8mb4_unicode_ci`, MODIFY n BIGINT, ALGORITHM=COPY, LOCK=NONE",
+        "ALTER TABLE test.t LOCK=NONE, CONVERT /* codec */ TO CHARSET utf8mb4 COLLATE utf8mb4_unicode_ci, ALGORITHM=COPY, MODIFY n BIGINT",
+    ] {
+        let Statement::AlterTable(alter) = parse_statement(sql).unwrap() else {
+            panic!("ALTER")
+        };
+        assert_eq!(alter.table, "test.t");
+        assert_eq!(alter.lock, AlterLock::None);
+        assert_eq!(alter.algorithm, AlterAlgorithm::Copy);
+        assert_eq!(alter.actions.len(), 2);
+        assert!(matches!(
+            &alter.actions[0],
+            AlterAction::ConvertToCharset { charset, collation }
+                if charset == "utf8mb4"
+                    && collation.as_deref() == Some("utf8mb4_unicode_ci")
+        ));
+    }
+    for tail in [
+        "CONVERT TO CHARACTER SET",
+        "CONVERT TO CHARSET utf8mb4 COLLATE",
+        "CONVERT TO CHARSET utf8mb4 trailing",
+        "CONVERT TO CHARSET utf8mb4, LOCK=NONE, LOCK=SHARED",
+        "CONVERT TO CHARSET utf8mb4, ALGORITHM=COPY, ALGORITHM=INPLACE",
+        "CONVERT TO CHARSET utf8mb4, ADD COLUMN q INT trailing",
+    ] {
+        assert!(
+            parse_statement(&format!("ALTER TABLE t {tail}")).is_err(),
+            "{tail}"
+        );
+    }
+}

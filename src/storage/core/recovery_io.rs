@@ -386,6 +386,21 @@ impl RecoveryPageIo {
         context: RecoveryContext,
     ) -> Result<(), QueryError> {
         if !context.must_redo(lsn) && self.lsn(page_id)? >= lsn {
+            if page_id == 0 && self.relative.ends_with(".lob") {
+                let current = self.read(page_id)?;
+                if let Some(length) = redo_lob_allocation_length(&self.relative, page_id, &current)?
+                {
+                    if self.len < length {
+                        self.file
+                            .as_ref()
+                            .expect("existing recovery file")
+                            .set_len(length)
+                            .map_err(io_err)?;
+                        self.len = length;
+                        note_recovery_write(&self.root, self.root.join(&self.relative))?;
+                    }
+                }
+            }
             return Ok(());
         }
         if self.file.is_none() {
@@ -402,6 +417,16 @@ impl RecoveryPageIo {
                     .open(path)
                     .map_err(io_err)?,
             );
+        }
+        if let Some(length) = redo_lob_allocation_length(&self.relative, page_id, after)? {
+            if self.len < length {
+                self.file
+                    .as_ref()
+                    .expect("recovery file opened")
+                    .set_len(length)
+                    .map_err(io_err)?;
+                self.len = length;
+            }
         }
         let mut page = after.to_vec();
         page.resize(PAGE_SIZE, 0);

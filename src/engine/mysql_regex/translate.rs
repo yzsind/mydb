@@ -34,8 +34,95 @@ fn class_set(set: &mut ClassSet) {
         }
     }
 }
+const VERTICAL_SPACE: &str = r"[\n\r\x0b\x0c\x{85}\x{2028}\x{2029}]";
+
+fn is_vertical_escape(literal: &ast::Literal) -> bool {
+    matches!(
+        literal.kind,
+        ast::LiteralKind::Special(ast::SpecialLiteralKind::VerticalTab)
+    )
+}
+
+pub(crate) fn has_legacy_word_boundary(pattern: &str) -> bool {
+    if !pattern.contains("[[:<:]]") && !pattern.contains("[[:>:]]") {
+        return false;
+    }
+    let Ok(parsed) = ast::parse::Parser::new().parse(pattern) else {
+        return false;
+    };
+    struct Legacy<'a> {
+        pattern: &'a str,
+        found: bool,
+    }
+    impl Legacy<'_> {
+        fn check(&mut self, span: &ast::Span) {
+            self.found |= matches!(
+                &self.pattern[span.start.offset..span.end.offset],
+                "[[:<:]]" | "[[:>:]]"
+            );
+        }
+    }
+    impl ast::Visitor for Legacy<'_> {
+        type Output = bool;
+        type Err = std::convert::Infallible;
+        fn finish(self) -> Result<bool, Self::Err> {
+            Ok(self.found)
+        }
+        fn visit_pre(&mut self, node: &Ast) -> Result<(), Self::Err> {
+            if let Ast::ClassBracketed(class) = node {
+                self.check(&class.span);
+            }
+            Ok(())
+        }
+        fn visit_class_set_item_pre(&mut self, node: &ClassSetItem) -> Result<(), Self::Err> {
+            if let ClassSetItem::Bracketed(class) = node {
+                self.check(&class.span);
+            }
+            Ok(())
+        }
+    }
+    ast::visit(
+        &parsed,
+        Legacy {
+            pattern,
+            found: false,
+        },
+    )
+    .unwrap_or(false)
+}
+
+pub(crate) fn has_unsupported_vertical_range(pattern: &str) -> bool {
+    if !pattern.contains(r"\v") {
+        return false;
+    }
+    let Ok(parsed) = ast::parse::Parser::new().parse(pattern) else {
+        return false;
+    };
+    struct Ranges(bool);
+    impl ast::Visitor for Ranges {
+        type Output = bool;
+        type Err = std::convert::Infallible;
+        fn finish(self) -> Result<bool, Self::Err> {
+            Ok(self.0)
+        }
+        fn visit_class_set_item_pre(&mut self, node: &ClassSetItem) -> Result<(), Self::Err> {
+            if let ClassSetItem::Range(range) = node {
+                self.0 |= is_vertical_escape(&range.start) || is_vertical_escape(&range.end);
+            }
+            Ok(())
+        }
+    }
+    ast::visit(&parsed, Ranges(false)).unwrap_or(false)
+}
+
 fn class_item(item: &mut ClassSetItem) {
     match item {
+        ClassSetItem::Literal(literal) if is_vertical_escape(literal) => {
+            let Ast::ClassBracketed(ref class) = parse(VERTICAL_SPACE) else {
+                unreachable!()
+            };
+            *item = ClassSetItem::Bracketed(class.clone());
+        }
         ClassSetItem::Ascii(class) => {
             if let Some(property) = property(&class.kind) {
                 let replacement = parse(&format!(
@@ -59,6 +146,7 @@ fn class_item(item: &mut ClassSetItem) {
 }
 fn rewrite(ast: &mut Ast, dotall: &mut bool, unix: bool, nfa: bool, anchors: &mut bool) {
     match ast {
+        Ast::Literal(literal) if is_vertical_escape(literal) => *ast = parse(VERTICAL_SPACE),
         Ast::Flags(flags) => {
             if let Some(state) = flags.flags.flag_state(Flag::DotMatchesNewLine) {
                 *dotall = state;
@@ -119,7 +207,11 @@ fn rewrite(ast: &mut Ast, dotall: &mut bool, unix: bool, nfa: bool, anchors: &mu
 pub(crate) fn translate(pattern: &str, dotall: bool, unix: bool) -> (String, String, bool) {
     // These patterns need no syntax rewrite. Keep cold literal/anchor
     // compilation inexpensive; extra boundary programs are initialized lazily.
-    if !pattern.contains('.') && !pattern.contains("[:") && !pattern.contains(r"\z") {
+    if !pattern.contains('.')
+        && !pattern.contains("[:")
+        && !pattern.contains(r"\z")
+        && !pattern.contains(r"\v")
+    {
         return (
             pattern.to_owned(),
             pattern.to_owned(),

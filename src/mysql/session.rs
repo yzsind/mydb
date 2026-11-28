@@ -749,6 +749,7 @@ impl<E: QueryEngine> Drop for Session<E> {
 
 #[derive(Debug)]
 struct PreparedStatement {
+    numeric_context: Option<crate::engine::api::PreparedNumericContext>,
     /// Client text retained only for general/slow logging.
     original_sql: Arc<str>,
     /// Redaction verdict for `original_sql`, which every EXECUTE publishes to
@@ -3667,6 +3668,9 @@ where
         let replacement = async {
             if let Some(notify) = replaced {
                 notify.notified().await;
+                // Give the dump a chance to send a fatal ERR at a packet boundary.
+                // A backpressured partial write still has a bounded cancellation path.
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             } else {
                 std::future::pending::<()>().await;
             }
@@ -3765,6 +3769,16 @@ where
         let mut ack_buf: Vec<u8> = Vec::with_capacity(MAX_SEMI_SYNC_ACK_FRAME);
         let mut ack_read_tmp = [0u8; 512];
         loop {
+            if self
+                .registered_replica_guard
+                .as_ref()
+                .is_some_and(|guard| guard.is_replaced())
+            {
+                let err = crate::error::catalog::ER_SOURCE_FATAL_ERROR_READING_BINLOG
+                    .error("A replica with the same server_id has connected to the source; use unique replica server_id values");
+                self.write_error_packet(sequence_id, &err).await?;
+                return Ok(());
+            }
             if let Err(err) = crate::repl::ensure_logical_source_supported() {
                 self.write_error_packet(sequence_id, &err).await?;
                 return Ok(());
@@ -3804,6 +3818,16 @@ where
                 }
                 let last = events.len().saturating_sub(1);
                 for (idx, event) in events.into_iter().enumerate() {
+                    if self
+                        .registered_replica_guard
+                        .as_ref()
+                        .is_some_and(|guard| guard.is_replaced())
+                    {
+                        let err = crate::error::catalog::ER_SOURCE_FATAL_ERROR_READING_BINLOG
+                            .error("A replica with the same server_id has connected to the source; use unique replica server_id values");
+                        self.write_error_packet(sequence_id, &err).await?;
+                        return Ok(());
+                    }
                     // One ACK per batch covers every earlier commit. The
                     // receiver resets its packet counter while sending that
                     // ACK; reset the outgoing counter at this event boundary,
@@ -3891,7 +3915,7 @@ where
                 }
                 _ = &mut notified => {}
                 _ = tokio::time::sleep(heartbeat_interval) => {
-                    match manager.heartbeat_event() {
+                    match manager.heartbeat_event(&file, position) {
                         Ok(heartbeat) => {
                             if let Some(handle) = &self.handle {
                                 handle.set_base_state(ProcessState::SendingBinlogEventToReplica);
@@ -5220,6 +5244,17 @@ where
                 .await?;
             return Ok(());
         }
+        let numeric_context = match self
+            .engine
+            .prepare_numeric_context(&self.context, parsed.as_deref())
+        {
+            Ok(context) => context,
+            Err(err) => {
+                self.write_error_packet(self.command_response_sequence, &err)
+                    .await?;
+                return Ok(());
+            }
+        };
         let normalized_sql: Arc<str> = Arc::from(
             crate::engine::system::normalize_sql_with_mode(&effective_sql, lex_mode).as_str(),
         );
@@ -5262,6 +5297,7 @@ where
             statement_contains_fusion(statement) || statement_contains_blocking_function(statement)
         });
         let mut prepared = PreparedStatement {
+            numeric_context,
             original_sql_sensitivity: crate::engine::http::SensitivityMemo::new(&sql),
             original_sql: Arc::from(sql.as_str()),
             sql: crate::engine::perf_events::prepared_statement_sql(&perf_texts),
@@ -5430,7 +5466,11 @@ where
     }
 
     async fn handle_stmt_execute(&mut self, payload: &[u8]) -> io::Result<()> {
+        let saved_precision = self.context.prepared_div_precision_increment;
+        let saved_parameter_types = self.context.prepared_numeric_parameter_types.take();
         let result = self.handle_stmt_execute_inner(payload).await;
+        self.context.prepared_div_precision_increment = saved_precision;
+        self.context.prepared_numeric_parameter_types = saved_parameter_types;
         if result.is_ok() && !self.kill_flag.load(Ordering::Acquire) {
             if let Some(id) = payload
                 .get(..4)
@@ -5468,6 +5508,7 @@ where
         // per-execute `param_types` / `long_data` Vec clones (paid on every
         // COM_STMT_EXECUTE just to satisfy the borrow checker) are gone —
         // `parse_stmt_execute_params` is synchronous and only reads them.
+        let supports_query_attributes = self.client_capabilities() & CLIENT_QUERY_ATTRIBUTES != 0;
         let (
             sql,
             original_sql,
@@ -5483,7 +5524,7 @@ where
             original_sql_sensitive,
             parse_result,
         ) = {
-            let Some(prepared) = self.prepared.get(&statement_id) else {
+            let Some(prepared) = self.prepared.get_mut(&statement_id) else {
                 let err = command_err_packet_for_spec(
                     crate::mysql::errors::ER_UNKNOWN_STMT_HANDLER,
                     "unknown prepared statement handler",
@@ -5493,6 +5534,19 @@ where
                     .await?;
                 return Ok(());
             };
+            let precision = self.engine.refresh_prepared_numeric_context(
+                &self.context,
+                prepared.parsed.as_deref(),
+                &mut prepared.numeric_context,
+            );
+            match precision {
+                Ok(value) => self.context.prepared_div_precision_increment = value,
+                Err(err) => {
+                    self.write_error_packet(self.command_response_sequence, &err)
+                        .await?;
+                    return Ok(());
+                }
+            }
             if self.context.auth_sandbox
                 && !is_password_change_statement(&prepared.sql, &self.context)
             {
@@ -5518,7 +5572,7 @@ where
                 prepared.param_count,
                 prepared.param_types.as_deref(),
                 Some(prepared.long_data.as_slice()),
-                self.client_capabilities() & CLIENT_QUERY_ATTRIBUTES != 0,
+                supports_query_attributes,
             );
             (
                 prepared.sql.clone(),
@@ -5648,6 +5702,20 @@ where
                         return Ok(());
                     }
                 }
+            }
+
+            if let Some(context) = self
+                .prepared
+                .get_mut(&statement_id)
+                .and_then(|entry| entry.numeric_context.as_mut())
+            {
+                if let Err(err) = context.bind_parameters(&self.context, &mut values) {
+                    self.write_error_packet(self.command_response_sequence, &err)
+                        .await?;
+                    return Ok(());
+                }
+                self.context.prepared_div_precision_increment = Some(context.precision);
+                self.context.prepared_numeric_parameter_types = context.parameters.clone();
             }
 
             if let Some(entry) = self.prepared.get_mut(&statement_id) {
@@ -10786,7 +10854,7 @@ fn query_requires_multi_statements(sql: &str, sql_mode_bits: u16) -> Result<bool
     let _mode = crate::parser::ParserSqlModeGuard::activate(sql_mode_bits);
     crate::parser::parse_statements(sql)
         .map(|statements| statements.len() > 1)
-        .map_err(|err| error(crate::error::catalog::ER_PARSE_ERROR, err.to_string()))
+        .map_err(|err| err.spec.error(err.to_string()))
 }
 
 /// Run server-supplied SQL through the ordinary executor as the login user.
@@ -12588,6 +12656,7 @@ mod tests {
 
     fn empty_prepared_statement() -> PreparedStatement {
         PreparedStatement {
+            numeric_context: None,
             original_sql_sensitivity: crate::engine::http::SensitivityMemo::new("SELECT ?"),
             original_sql: Arc::from("SELECT ?"),
             sql: Arc::from("SELECT ?"),
@@ -16065,6 +16134,22 @@ mod tests {
 #[cfg(test)]
 mod routine_query_capability_tests {
     use super::query_requires_multi_statements;
+
+    #[test]
+    fn audit1125_compound_classifier_preserves_semantic_error_codes() {
+        let error = query_requires_multi_statements(
+            "CREATE PROCEDURE p() BEGIN DECLARE x INT; SELECT 1 INTO x UNION SELECT 2; END",
+            0,
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), 3954);
+        assert_eq!(
+            query_requires_multi_statements("CREATE PROCEDURE p() BEGIN SET x=; END", 0)
+                .unwrap_err()
+                .code(),
+            1064
+        );
+    }
 
     #[test]
     fn compound_routine_is_one_protocol_statement() {

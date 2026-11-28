@@ -849,7 +849,11 @@ fn add_ddl_table_mdl_targets(
                     let (schema, name) = crate::storage::split_table_name(&schema, table);
                     add(
                         &crate::storage::table_key(&schema, &name),
-                        MdlLockType::Exclusive,
+                        if stmt.lock == AlterLock::Exclusive {
+                            MdlLockType::Exclusive
+                        } else {
+                            MdlLockType::SharedUpgradable
+                        },
                     );
                 }
             }
@@ -922,12 +926,12 @@ fn add_ddl_table_mdl_targets(
             &stmt.table,
             match stmt.lock {
                 AlterLock::Exclusive => MdlLockType::Exclusive,
-                AlterLock::Shared if stmt.index_type.eq_ignore_ascii_case("BTREE") => {
+                AlterLock::Shared if Database::online_index_type_supported(&stmt.index_type) => {
                     MdlLockType::SharedUpgradable
                 }
                 AlterLock::Shared => MdlLockType::SharedNoWrite,
                 AlterLock::None | AlterLock::Default
-                    if stmt.index_type.eq_ignore_ascii_case("BTREE") =>
+                    if Database::online_index_type_supported(&stmt.index_type) =>
                 {
                     MdlLockType::SharedUpgradable
                 }

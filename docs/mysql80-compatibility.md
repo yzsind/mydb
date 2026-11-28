@@ -134,13 +134,13 @@ results or affected-row counts with MySQL:
 - **INSTANT DROP and LOB space**: dropping a column preserves old row layouts and their LOB data without rewriting the heap. OPTIMIZE TABLE or a physical COPY rebuild removes the dropped values and reclaims their LOB space; the instantaneous drop itself does not promise immediate disk reclamation.
 - **Metadata differences**: SHOW FULL TABLES has seven columns, as documented in [SHOW TABLES](statement/metadata/show-tables.md). UPDATE_TIME tracks committed local INSERT/UPDATE/DELETE operations; uncommitted changes and rollback do not publish timestamps. This runtime statistic may be NULL after restart or TRUNCATE. User-view CREATE_TIME is persisted at creation and does not change merely because the server restarts.
 - **Expression defaults during ALTER**: column-dependent defaults are evaluated for existing rows during COPY, including partitioned tables and concurrent-write replay. RENAME COLUMN and CHANGE COLUMN rewrite dependent DEFAULT expressions along with generated expressions. A DEFAULT expression that references an AUTO_INCREMENT column is rejected with error 3768.
-- **Adding AUTO_INCREMENT columns**: a compound ALTER can add the column and its key together, assigning values to existing rows and preserving the session increment/offset. This requires COPY with writes blocked; explicit `LOCK=NONE` is rejected.
+- **Adding AUTO_INCREMENT columns**: a compound ALTER can add the column and its key together, assigning values to existing rows and preserving the session increment/offset. Supported COPY plans allow concurrent writes, including `LOCK=NONE`, on Strict, Relaxed and Memory storage. Existing-row assignments survive replay, and publication advances the allocator highwater. Initial numbering follows the physical scan order.
 - **CHECK constraints**: ✅ all actions
 - **Foreign keys (FK)**: ✅ all four referential actions, including cascades
 - **Online CHECK / FK ALTER**: ➕ constraint-only ALTERs allow concurrent reads and writes by default, including CHECK add/enable/disable, FK add and DROP+ADD replacement, and atomic publication of multiple constraints. Preparation and publication use short write barriers; `LOCK=SHARED` allows reads and blocks writes, `LOCK=EXCLUSIVE` retains exclusive semantics. Enabling a not-yet-enabled CHECK, disabling, and dropping constraints do not scan existing data; weak lock requests in mixed column/index/partition actions fail explicitly.
   See [ALTER TABLE](statement/ddl/alter-table.md) for supported syntax and boundaries.
 - **`ALTER TABLE ALGORITHM={INSTANT|INPLACE|COPY|DEFAULT}`**: ✅
-  ➕ Column type changes within the supported range are online by default and also accept `COPY, LOCK=NONE`; strict mode covers LOBs, partitioning, and vector indexes under on-disk storage — see [Online Column Type Change](online-column-type-change.md).
+  ➕ Column type changes within the supported range are online by default and also accept `COPY, LOCK=NONE`; supported plans cover strict/non-strict conversion, Memory storage, LOBs, partitioning, existing vector indexes, FULLTEXT and SPATIAL indexes — see [Online Column Type Change](online-column-type-change.md).
   Algorithms are validated against the actual work: adding generated columns or columns with enforced CHECKs requires COPY, and dropping a column whose index rebuilds cascade requires INPLACE; encoding-compatible constraint tightening only scans for validation under strict mode. Composite actions that cannot yet be published atomically return 1846 before modification. See [ALTER TABLE](statement/ddl/alter-table.md) for supported combinations.
 - **Partial indexes**: ➕ `WHERE` predicates on CREATE INDEX, inline CREATE TABLE keys and ALTER TABLE ADD INDEX, including UNIQUE BTREE, FULLTEXT, SPATIAL, HNSW and IVF. The optimizer requires a conservative implication proof; primary keys and foreign-key backing indexes must remain complete. See [partial indexes](partial-indexes.md).
 - **Online BTREE `ADD/CREATE INDEX` and `ADD PRIMARY KEY`**: ✅ Ordinary, unique, and primary key indexes allow concurrent DML during the Building phase by default, retaining sorted/bulk-load plus incremental catch-up; preparation and publication use read-compatible write barriers.
@@ -150,6 +150,8 @@ results or affected-row counts with MySQL:
   when NULL/duplicate keys cause creation to fail, already committed business data is retained. mydb keeps the heap and does not rebuild a clustered table,
   and never converts NULL to a default value regardless of SQL mode. Old snapshots hide new indexes that do not yet cover themselves, uniqueness,
   and NOT NULL optimizer facts, and keep reading old data; other DDL boundaries such as physical generation switches may still return 1412.
+- **Online FULLTEXT / SPATIAL creation**: ➕ standalone CREATE INDEX and index-only ALTERs allow concurrent DML by default and with `LOCK=NONE`, including atomic BTREE/FULLTEXT/SPATIAL additions. FULLTEXT builds its corpus baseline outside the write barrier; old snapshots use the heap when postings do not cover their view. SPATIAL builds partition-local R-trees. Explicit SHARED/EXCLUSIVE lock contracts are retained.
+- **Online vector index creation**: ➕ HNSW and IVF CREATE INDEX and index-only ALTERs allow concurrent writes by default and with `LOCK=NONE`, including partition-local, typed, quantized and partial indexes. ANN graphs remain private until the committed tail and row registries are complete. Initial graph images are logged outside writer exclusion; candidate tails and Public catalog metadata share one commit decision. Construction or capture-budget failure aborts the DDL while retaining committed business data. `LOCK=SHARED` blocks writers and allows readers; `LOCK=EXCLUSIVE` retains exclusive access. Vector columns still require a declared dimension and NOT NULL.
 - **DDL read concurrency**: ➕ ADD COLUMN without heap rewrite, encoding-compatible MODIFY, same-name
   CHANGE, and NOT NULL changes that only scan for validation under strict mode can run in parallel with existing ordinary reads and not-yet-consumed
   streaming cursors; FIRST/AFTER within the supported range and column changes are published atomically.
@@ -236,7 +238,7 @@ the table after the switch and should reopen the transaction. Disk sync
 duration is not covered by a hard cap in the replay time budget.
 
 Online optimization is currently unsupported for Memory durability,
-temporary tables, system tables, and partitioned tables with FULLTEXT indexes;
+temporary tables, and system tables;
 it reports a clear error instead of degrading into a fully blocking offline
 rebuild. Empty tables still retain the necessary page/index metadata, so space
 does not drop all the way to zero. Optimization needs extra disk space for the
@@ -257,7 +259,11 @@ for syntax and operational limits.
 - RANGE / RANGE COLUMNS write routing uses binary search over ordered boundaries; equality, NULL-safe equality, IN, range, AND/OR, and contradictory predicates share the pruning path, and an empty partition set opens no heap. A parent partition and its HASH/KEY subpartition can be pruned simultaneously down to one physical leaf under a full equality key. Integer `DIV` is allowed in partition expressions; `/`, bitwise operators, and LIST `DEFAULT` are explicitly rejected.
 - Repartitioning DDL is **crash safe**: streaming build-then-swap (COALESCE / REORGANIZE / REPARTITION / REMOVE PARTITIONING / ADD PARTITIONS), with the persistence phase fixed at `INTENT / SNAPSHOT_BUILD / CATCH_UP / QUIESCE / SWAPPED / CLEANUP / DONE|FAILED`; startup recovery idempotently rolls forward or back according to the physical generation in the catalog. `CANCEL DDL JOB <job_id>` is accepted only before the swap; status and progress are in `information_schema.MYDB_DDL_JOBS`.
 - `REBUILD PARTITION` rewrites only the target physical leaves into a new storage generation, compacting heap/LOB and rebuilding local indexes in bulk; `OPTIMIZE PARTITION` additionally analyzes only the target leaves — unselected leaves are not scanned; `CHECK PARTITION` validates row-routing membership and heap/B-tree equivalence.
+- Supported REBUILD/OPTIMIZE/REPAIR/TRUNCATE and row-moving partition operations with BTREE, FULLTEXT, vector or SPATIAL indexes admit concurrent writes by default and with `LOCK=NONE`; private preparation precedes short exclusive prepare/publication barriers. TRUNCATE removes selected-leaf rows at publication, including concurrent commits; retained-leaf writes survive. Other moving operations replay committed changes. Explicit `LOCK=SHARED/EXCLUSIVE` preserves the requested blocking behavior. CHECK PARTITION with supported BTREE/FULLTEXT/SPATIAL indexes validates outside the write barrier, retrying changed inputs before publishing its check status.
+- EXCHANGE with or without validation admits writes on both participants during snapshot validation by default and with `LOCK=NONE` for supported BTREE/FULLTEXT/SPATIAL shapes. It retries on concurrent changes before a short dual-table exclusive publication. Heap, LOB and Zone Map physical identities remain unchanged; unrelated dirty files are not flushed. FULLTEXT counter families are prepared in unreachable namespaces and commit with the ownership swap. Vector ownership transfer, mismatched physical index identities and different physical generations fail explicitly before publication.
+- `CHECK TABLE` validates B-tree and SPATIAL structure without a full-scan exclusive handle or topology latch. Concurrent mutations invalidate the scan and trigger bounded retries; persistent write pressure reports an explicit CHECK error. LOB structure is checked in bounded page batches, with snapshot-pinned row/chain validation.
 - `ANALYZE PARTITION` persists per-leaf row counts, heap pages, column/index sketches, and check status; the CBO merges costs over the pruned leaf set. Partition-wise hash join is enabled when the topology is identical and the equality join covers the full partition key, and partition-wise aggregate when `GROUP BY` covers the full partition key.
+- `ALTER TABLE ... ANALYZE PARTITION` permits writes during its pinned statistics scan by default and with `LOCK=NONE`. Aligned global deltas refresh the population baseline without combining leaf counts from different snapshots; busy scans preserve their baseline and live deltas.
 - Partition bulk DML, physical DDL, and statistics builds are charged to the unified governor categories `PartitionDmlBatch`, `PartitionDdl`, and `PartitionStats` respectively; current values and rejection counts are exposed via `SHOW STATUS`, `information_schema.MYDB_MEMORY_ADVISOR`, and the memory summary views.
 - Per-partition physical options: `ENGINE` accepts only the `mydb`/`InnoDB` current-engine aliases and is not persisted; `DATA/INDEX DIRECTORY`, `TABLESPACE`, `MAX_ROWS`, `MIN_ROWS`, and `NODEGROUP` return explicit not-supported errors and are never silently ignored.
 - FULLTEXT, SPATIAL, HNSW, and IVF can be used on partitioned tables; this is a mydb extension enabled by default that no longer requires a runtime switch.
@@ -684,6 +690,26 @@ pages for supported arguments, return types, and limitations.
 
 The LIKE ESCAPE may be a literal, placeholder, or scalar expression; single-character
 validation happens at execution time and charset/collation semantics are preserved.
+Regular expressions use a linear-time engine. Backreferences, lookaround,
+`\Q...\E`, `\Z`, `\h`, `\H`, and `\V` are not
+supported and return explicit errors. Legacy `[[:<:]]` / `[[:>:]]` boundary
+classes are rejected rather than interpreted as ordinary characters. `\v` matches ICU's seven vertical whitespace characters; using that class as a range endpoint
+is rejected explicitly. Patterns
+are limited to 8192 bytes and compilation/search memory is governed.
+
+Stored-routine LIMIT clauses currently accept literals and prepared parameters;
+local variable LIMIT bounds return an explicit unsupported-feature error.
+Stored functions may share a name with a built-in; use a schema-qualified name
+to select the stored function, while an unqualified call selects the built-in.
+`lc_time_names` currently supports en_US, de_DE, fr_FR, es_ES, it_IT, pt_BR,
+zh_CN, ja_JP and ko_KR; other locales return an explicit error.
+ALLOW_INVALID_DATES permits storing invalid date components. Calendar arithmetic
+on a nonexistent date returns NULL with a conversion warning, rather than
+normalizing it into another month or propagating an invalid calendar result.
+
+Typed CTE column declarations are rejected; use CAST in the anchor query to
+control the recursive result type and width.
+
 `REGEXP NULL` returns NULL. `NAME_CONST` accepts only the literal forms MySQL
 allows; complex expressions return 1210.
 
@@ -1379,6 +1405,18 @@ The following expression differences are retained:
   or `2` modes. `CREATE DATABASE MyCaseDb` shows up as `mycasedb` in SHOW and information_schema.
   This policy is retained for cross-platform consistency and differs from MySQL's Linux default configuration; see the
   [MySQL system variable documentation](https://dev.mysql.com/doc/refman/8.0/en/server-system-variables.html#sysvar_lower_case_table_names).
+  Migration tools must normalize database/table names with this target policy before comparing source object lists
+  against SHOW or information_schema output, including uppercase names from Oracle-style sources.
+  Setting `lower_case_table_names=0` is not a supported workaround.
+- Cross-dialect schema migration must translate source expressions into supported target SQL and enforce the
+  64-character constraint-name limit before submitting DDL. For example, translate an array membership CHECK
+  into `CHECK (gender IN ('M', 'F'))`; malformed `ANY (ARRAY...)` expressions are rejected, never ignored.
+  A naming generator can shorten long names and append a stable hash, checking for collisions in the target namespace.
+  PostgreSQL partition children are separate source relations; mydb partitions are listed in
+  `information_schema.PARTITIONS`, not exposed as independent tables. A migration tool must map that object model
+  explicitly rather than verify source child-relation names as target tables.
+  Preserve native vector dimensions in target DDL and verify `SHOW CREATE TABLE` or `information_schema.COLUMNS.COLUMN_TYPE`
+  before loading data; a vector dimension mismatch is an error, not an implicit resize.
 - After a table or view that a view depends on is dropped, mydb keeps an explicit invalidation marker and queries report 1356.
   Recreating a same-named table does not automatically restore the view; `CREATE OR REPLACE VIEW` must rebind explicitly.
   This policy prevents a new object with different semantics from taking over an old view merely because the name matches; the cost is incompatibility with MySQL's

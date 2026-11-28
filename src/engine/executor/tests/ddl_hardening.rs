@@ -496,7 +496,7 @@ fn explicit_copy_cannot_bypass_lock_capability_validation() {
         .unwrap();
     engine.execute("INSERT INTO t VALUES(1)").unwrap();
     let err = engine
-        .execute("ALTER TABLE t ADD COLUMN c INT, ALGORITHM=COPY, LOCK=NONE")
+        .execute("ALTER TABLE t ADD COLUMN c TEXT, ADD FULLTEXT f(c), ADD CONSTRAINT c_ok CHECK(c IS NULL), ALGORITHM=COPY, LOCK=NONE")
         .unwrap_err();
     assert_eq!(err.code(), 1846);
     assert!(engine

@@ -1913,6 +1913,7 @@ impl HashJoinBatchOperator<'_> {
             0
         };
         let schema = Arc::clone(&self.schema);
+        let scalar_pairs = program.scalar_pairs_eligible(&schema);
         let build_cols_first = self.build_is_left;
         let probe_keys = self.probe_keys.clone();
         let null_safe = self.null_safe.clone();
@@ -1941,16 +1942,33 @@ impl HashJoinBatchOperator<'_> {
             if pair_build.is_empty() {
                 return Ok(());
             }
-            let candidates = vec_hash_join::gather_residual_pairs_batch(
-                &state.payload.columns,
-                &batch,
-                pair_build,
-                pair_probe,
-                build_cols_first,
-                &schema,
-                &referenced,
-            );
-            let accepted = program.eval_predicate_bitmap(&candidates)?;
+            let direct = if scalar_pairs {
+                program.eval_scalar_pairs(
+                    &state.payload.columns,
+                    &batch,
+                    pair_build,
+                    pair_probe,
+                    build_cols_first,
+                    &schema,
+                )?
+            } else {
+                None
+            };
+            let accepted = match direct {
+                Some(accepted) => accepted,
+                None => {
+                    let candidates = vec_hash_join::gather_residual_pairs_batch(
+                        &state.payload.columns,
+                        &batch,
+                        pair_build,
+                        pair_probe,
+                        build_cols_first,
+                        &schema,
+                        &referenced,
+                    );
+                    program.eval_predicate_bitmap(&candidates)?
+                }
+            };
             for (position, &probe_row) in pair_probe.iter().enumerate() {
                 if accepted.get(position) {
                     matched_probe.set_true(probe_row as usize);

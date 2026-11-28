@@ -260,8 +260,16 @@ fn recover_from_wal_with_options(
     // a shared, internally locked LogManager. Records for one index stay on
     // one worker in LSN order; distinct index files are physically independent
     // and can therefore replay concurrently after the heap pass.
+    let published = crate::wal::PublishedReplay::new(&scan.records, |txn| committed.contains(&txn))?;
+    // Bulk-built B-trees are derived, without a physical redo baseline. An
+    // undecided data-sync suffix must not leave a valid but stale tree warm.
+    for path in published.indexes_requiring_rebuild(physical_replica || context.continuation_base.is_some()) {
+        let path = data_dir.join(path);
+        if let Some(parent) = path.parent() { fs::create_dir_all(parent).map_err(io_err)?; }
+        IndexFile::persist_planned_rebuild_marker(&path)?;
+    }
     let (heap_partitions, index_partitions) = plan_redo_file_partitions_with_context(
-        &scan.records,
+        &published,
         &redoable,
         &committed,
         redo_cutoff,
@@ -291,7 +299,7 @@ fn recover_from_wal_with_options(
         for &rec_idx in heap_partitions.values().flatten() {
             apply_redo_record(
                 data_dir,
-                scan.records.record(rec_idx)?.as_ref(),
+                published.record(rec_idx)?.as_ref(),
                 &redoable,
                 redo_cutoff,
                 physical_replica,
@@ -305,7 +313,7 @@ fn recover_from_wal_with_options(
         // a few large files don't idle the rest.
         let work: Vec<&Vec<usize>> = heap_partitions.values().collect();
         let next = std::sync::atomic::AtomicUsize::new(0);
-        let records = &scan.records;
+        let records = &published;
         let redoable_ref = &redoable;
         let first_err: std::sync::Mutex<Option<QueryError>> = std::sync::Mutex::new(None);
         let redone_total = std::sync::atomic::AtomicUsize::new(0);
@@ -382,14 +390,14 @@ fn recover_from_wal_with_options(
             let mut state = RedoState::with_context(Some(log), context);
             if precheck_indexes {
                 for partition in index_partitions.values() {
-                    precheck_recovery_index(data_dir, &scan.records, partition, &mut state)?;
+                    precheck_recovery_index(data_dir, &published, partition, &mut state)?;
                 }
             }
             for &rec_idx in index_partitions.values().flatten() {
-                if skip_prechecked_index_record(&scan.records, rec_idx, &mut state)? {
+                if skip_prechecked_index_record(&published, rec_idx, &mut state)? {
                     continue;
                 }
-                let record = scan.records.record(rec_idx)?;
+                let record = published.record(rec_idx)?;
                 apply_redo_record(
                     data_dir,
                     &record,
@@ -417,7 +425,7 @@ fn recover_from_wal_with_options(
             let first_err = std::sync::Mutex::new(None::<QueryError>);
             let redone_total = std::sync::atomic::AtomicUsize::new(0);
             let skipped_total = std::sync::atomic::AtomicUsize::new(0);
-            let records = &scan.records;
+            let records = &published;
             let redoable_ref = &redoable;
             crate::util::thread_spawn::scope(|scope| {
                 for _ in 0..worker_count {
@@ -1002,6 +1010,30 @@ fn recover_from_wal_with_options(
         // One barrier covers the entire compensation suffix and all endings.
         if end_lsn != 0 {
             LogManager::sync_durable_to(&log, end_lsn)?;
+        }
+    }
+    if !physical_replica {
+        // A replica may have prepared a fresh binding before receiving the
+        // source decision. Promotion/local loser recovery removes only the
+        // last undecided incarnation, never a later committed reuse.
+        let mut last = BTreeMap::<String, u64>::new();
+        for i in 0..scan.records.len() {
+            if scan.records.header(i)?.record_type == crate::wal::WalRecordType::FilePublish {
+                let record = scan.records.record(i)?;
+                if let WalPayload::FilePublish { target, .. } = &record.payload {
+                    last.insert(target.clone(), record.txn_id);
+                }
+            }
+        }
+        for (target, txn) in last {
+            if !committed.contains(&txn) && !prepared.contains(&txn) {
+                invalidate_recovery_page_io(data_dir, &target);
+                match fs::remove_file(data_dir.join(&target)) {
+                    Ok(()) => { retire_page_owner_proof(&data_dir.join(&target)); }
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(err) => return Err(io_err(err)),
+                }
+            }
         }
     }
     if wal_modified {
@@ -1809,6 +1841,14 @@ fn redo_page_delta(data_dir: &Path, record: &WalRecord) -> Result<(), QueryError
     file.read_exact(&mut before).map_err(io_err)?;
     validate(&before)?;
     let current_lsn = page_lsn(&before);
+    if current_lsn >= record.lsn {
+        if let Some(length) = redo_lob_allocation_length(relative, *page_id, &before)? {
+            if file.metadata().map_err(io_err)?.len() < length {
+                file.set_len(length).map_err(io_err)?;
+                note_recovery_write(data_dir, data_dir.join(relative))?;
+            }
+        }
+    }
     if current_lsn > record.lsn {
         return Ok(());
     }
@@ -1841,6 +1881,11 @@ fn redo_page_delta(data_dir: &Path, record: &WalRecord) -> Result<(), QueryError
         ));
     }
     validate(&after)?;
+    if let Some(length) = redo_lob_allocation_length(relative, *page_id, &after)? {
+        if file.metadata().map_err(io_err)?.len() < length {
+            file.set_len(length).map_err(io_err)?;
+        }
+    }
     if page_lsn(&after) == 0 {
         set_page_lsn_if_formatted(&mut after, record.lsn);
     }
@@ -1939,19 +1984,66 @@ fn redo_page_update_with_context(
                 && zone_identity
                     .is_none_or(|identity| zone_map_page::View::open(&current, identity).is_ok());
         if valid_identity && !context.must_redo(lsn) && page_lsn(&current) >= lsn {
+            if let Some(length) = redo_lob_allocation_length(relative, page_id, &current)? {
+                if len < length {
+                    file.set_len(length).map_err(io_err)?;
+                    note_recovery_write(data_dir, data_dir.join(relative))?;
+                }
+            }
             return Ok(());
         }
     }
+    let allocation_length = redo_lob_allocation_length(relative, page_id, after)?;
     let mut page = after.to_vec();
     page.resize(PAGE_SIZE, 0);
     stamp_page_owner(&mut page, &page_owner(&data_dir.join(relative)), page_id);
     set_page_lsn_if_formatted(&mut page, lsn);
-    file.set_len(len.max(offset + PAGE_SIZE as u64))
-        .map_err(io_err)?;
+    let required_length = (offset + PAGE_SIZE as u64).max(allocation_length.unwrap_or(0));
+    // Re-truncating an already allocated file is expensive on copy-on-write
+    // filesystems and adds no redo effect. Never shrink newer extents.
+    if len < required_length {
+        file.set_len(required_length).map_err(io_err)?;
+    }
     file.seek(SeekFrom::Start(offset)).map_err(io_err)?;
     file.write_all(&page).map_err(io_err)?;
     note_recovery_write(data_dir, data_dir.join(relative))?;
     file.flush().map_err(io_err)
+}
+
+/// LOB reservations publish their allocation metadata before chain pages.
+/// Recreate that source extent before making the metadata readable, including
+/// at a crash/stream prefix ending between reservation and the first page.
+/// Unreferenced reserved pages may be zero until subsequent redo arrives.
+fn redo_lob_allocation_length(
+    relative: &str,
+    page_id: u64,
+    image: &[u8],
+) -> Result<Option<u64>, QueryError> {
+    if page_id != 0 || !relative.ends_with(".lob") {
+        return Ok(None);
+    }
+    if image.len() != PAGE_SIZE
+        || read_u32(image, OVFL_OFF_MAGIC) != OVFL_MAGIC
+        || read_u16(image, OVFL_OFF_VERSION) != OVFL_VERSION
+        || read_u32(image, 16) != page_checksum(image, 16)
+    {
+        return Err(error(
+            crate::error::catalog::ER_GET_ERRNO,
+            "invalid LOB allocation redo image",
+        ));
+    }
+    let pages = read_u64(image, OVFL_META_PAGE_COUNT);
+    if pages == 0
+        || pages > u64::from(u32::MAX) + 1
+        || read_u64(image, OVFL_META_FREE_HEAD) >= pages
+        || read_u64(image, OVFL_META_NEXT_GENERATION) == 0
+    {
+        return Err(error(
+            crate::error::catalog::ER_GET_ERRNO,
+            "invalid LOB allocation redo bounds",
+        ));
+    }
+    Ok(Some(pages * PAGE_SIZE as u64))
 }
 
 fn redo_heap_insert(

@@ -652,13 +652,26 @@ impl Database {
         action: &crate::parser_partition::PartitionAction,
     ) -> Result<bool, QueryError> {
         use crate::parser_partition::PartitionAction as A;
-        if matches!(action, A::AddPartitions(_)) {
+        if let A::ExchangePartition { table, .. } = action {
+            let source = self.table(table_name)?;
+            let (database, name) = split_table_name(&source.database, table);
+            let other = self.table(&table_key(&database, &name))?;
+            return Ok(self.exchange_online_supported(&source, &other));
+        }
+        if matches!(action, A::CheckPartitions(_)) {
+            return Ok(self.table(table_name)?.indexes.iter().all(|index|
+                index.state == IndexState::Public && (index.index_type.eq_ignore_ascii_case("BTREE")
+                    || index.is_fulltext() || index.is_spatial())));
+        }
+        if matches!(action, A::AddPartitions(_) | A::AnalyzePartitions(_)) {
             return Ok(true);
         }
         let moving = matches!(
             action,
             A::RebuildPartitions(_)
                 | A::OptimizePartitions(_)
+                | A::RepairPartitions(_)
+                | A::TruncatePartitions(_)
                 | A::CoalescePartitions(_)
                 | A::ReorganizePartitions { .. }
                 | A::PartitionBy(_)
@@ -671,7 +684,12 @@ impl Database {
                 .table(table_name)?
                 .indexes
                 .iter()
-                .all(|index| index.index_type.eq_ignore_ascii_case("BTREE") || index.is_vector()))
+                .all(|index| {
+                    index.index_type.eq_ignore_ascii_case("BTREE")
+                        || index.is_vector()
+                        || index.is_spatial()
+                        || index.is_fulltext()
+                }))
     }
 
     pub(crate) fn partition_action_shared_build_supported(
@@ -686,7 +704,8 @@ impl Database {
             | A::TruncatePartitions(_)
             | A::AnalyzePartitions(_)
             | A::CheckPartitions(_)
-            | A::RepairPartitions(_) => true,
+            | A::RepairPartitions(_)
+            | A::ExchangePartition { .. } => true,
             A::CoalescePartitions(_)
             | A::ReorganizePartitions { .. }
             | A::PartitionBy(_)
@@ -1472,6 +1491,8 @@ impl Database {
             })?;
             let table_mut = Arc::make_mut(table_arc);
             table_mut.partitioning = candidate.partitioning.clone();
+            table_mut.indexes = candidate.indexes.clone();
+            table_mut.next_index_id = candidate.next_index_id;
             table_mut.stats.partition_stats = shadow_stats;
             table_mut.stats.row_count = table_row_count;
             table_mut.stats.heap_page_count = table_page_count;

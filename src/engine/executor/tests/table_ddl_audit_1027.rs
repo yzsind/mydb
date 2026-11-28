@@ -192,7 +192,7 @@ fn ddl_1027_auto_increment_partition_shared_step_and_restart() {
 }
 
 #[test]
-fn ddl_1027_auto_increment_overflow_and_unsupported_online_are_atomic() {
+fn ddl_1027_auto_increment_overflow_and_online_copy_are_atomic() {
     let dir = fixture();
     let engine = open_relaxed_test_engine(dir.path());
     engine.execute("CREATE TABLE t(b INT)").unwrap();
@@ -203,15 +203,8 @@ fn ddl_1027_auto_increment_overflow_and_unsupported_online_are_atomic() {
     engine
         .execute(&format!("INSERT INTO t VALUES{input}"))
         .unwrap();
-    assert_eq!(
-        engine
-            .execute("ALTER TABLE t ADD id INT AUTO_INCREMENT, ADD PRIMARY KEY(id), LOCK=NONE")
-            .unwrap_err()
-            .code(),
-        1846
-    );
     assert!(engine
-        .execute("ALTER TABLE t ADD id TINYINT AUTO_INCREMENT, ADD PRIMARY KEY(id)")
+        .execute("ALTER TABLE t ADD id TINYINT AUTO_INCREMENT, ADD PRIMARY KEY(id), LOCK=NONE")
         .is_err());
     assert_eq!(
         engine
@@ -226,7 +219,7 @@ fn ddl_1027_auto_increment_overflow_and_unsupported_online_are_atomic() {
         vec![vec![Value::Int(128)]]
     );
     engine
-        .execute("ALTER TABLE t ADD id INT UNSIGNED AUTO_INCREMENT, ADD PRIMARY KEY(id)")
+        .execute("ALTER TABLE t ADD id INT UNSIGNED AUTO_INCREMENT, ADD PRIMARY KEY(id), LOCK=NONE")
         .unwrap();
     assert_eq!(
         rows(&engine, "SELECT COUNT(DISTINCT id),MIN(id),MAX(id) FROM t"),
@@ -267,6 +260,10 @@ fn ddl_1027_drop_removes_empty_object_directories() {
     engine.execute("INSERT INTO t VALUES(1)").unwrap();
     let id = engine.database().table("test.t").unwrap().id;
     engine.execute("DROP TABLE t").unwrap();
+    engine
+        .database()
+        .maintain_catalog_retirements_until(|| false)
+        .unwrap();
     assert!(!dir
         .path()
         .join("objects/tables")
@@ -304,6 +301,10 @@ fn ddl_1027_copy_and_drop_remove_empty_shadow_directories() {
             .is_err());
         assert_eq!(objects(), vec![id]);
         engine.execute("DROP TABLE t").unwrap();
+        engine
+            .database()
+            .maintain_catalog_retirements_until(|| false)
+            .unwrap();
         assert!(objects().is_empty());
         assert!(std::fs::read_dir(dir.path().join("objects/indexes"))
             .unwrap()

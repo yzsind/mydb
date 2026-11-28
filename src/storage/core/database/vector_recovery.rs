@@ -129,7 +129,9 @@ impl Database {
             let table = self
                 .table_by_id(table_id)
                 .ok_or_else(vector::persistence::corrupt)?;
-            for index in table.indexes.iter().filter(|index| index.is_vector()) {
+            // Building candidates have their own DDL journal. Business/XA
+            // recovery must never depend on an intent that restart scrubs.
+            for index in table.indexes.iter().filter(|index| index.is_vector() && index.state == IndexState::Public) {
                 let col = table.column_index(&index.columns[0])?;
                 let member = values.as_ref().map(|v| table.index_contains_row(index, v)).transpose()?.unwrap_or(false);
                 let value = match values.as_ref().filter(|_| member).and_then(|values| values.get(col)) {
@@ -263,6 +265,14 @@ impl Database {
         records: &(impl crate::wal::WalRecordSource + ?Sized),
     ) -> Result<(), QueryError> {
         if self.durability_mode() == DurabilityMode::Memory || self.is_snapshot_read_only() {
+            return Ok(());
+        }
+        // A replica may stop at any source WAL prefix, including halfway
+        // through a paged graph mutation whose completion record has not
+        // arrived. Its intermediate node counters/links are not a loadable
+        // graph yet. Physical REDO already restored this prefix; the separate
+        // completion tracker fences vector readers until the source finishes.
+        if vector_storage_paged() && self.physical_replica_mode() {
             return Ok(());
         }
         let mut committed = HashMap::new();
@@ -543,7 +553,7 @@ impl Database {
             .collect::<Result<Vec<_>, QueryError>>()?;
         let bytes = VectorRecoveryMutation::encode_batch(&entries)?;
         if published.id != target.id {
-            self.vector_copy_publications.lock().insert(txn_id);
+            self.vector_ddl_publications.lock().insert(txn_id);
         }
         self.vector_pending_wal
             .lock()

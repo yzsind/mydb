@@ -1,0 +1,448 @@
+{
+  "repository": "yzsind/mydb",
+  "initial_head": "6bebbc50",
+  "date": "2026-11-27",
+  "issues": [
+    {
+      "number": 123,
+      "title": "[Incremental Capture] MyDB-as-source incremental replication never converges: syncDelay stays above 30000ms until the 30-minute timeout",
+      "url": "https://github.com/yzsind/mydb/issues/123"
+    },
+    {
+      "number": 122,
+      "title": "[Full Copy] VECTOR column dimension declaration is not carried through from mysql-95 source; target write fails with VECTOR dimension mismatch",
+      "url": "https://github.com/yzsind/mydb/issues/122"
+    },
+    {
+      "number": 121,
+      "title": "[Schema Replication + Compare] Partition child tables of tdsqlpostgresql source are never created on the target; compare stage reports notfound",
+      "url": "https://github.com/yzsind/mydb/issues/121"
+    },
+    {
+      "number": 120,
+      "title": "[Schema Replication] Engine-assembled constraint identifier exceeds 64 characters; doris/starrocks/selectdb → MyDB table creation always fails",
+      "url": "https://github.com/yzsind/mydb/issues/120"
+    },
+    {
+      "number": 119,
+      "title": "[Schema Replication] CHECK expression from vastbaseoracle/vastbasepostgresql sources dumps to \"unsupported binary operator\" on the target",
+      "url": "https://github.com/yzsind/mydb/issues/119"
+    },
+    {
+      "number": 118,
+      "title": "[Schema Replication] CHECK constraint from polardboracle source is dumped as malformed ANY(ARRAY) SQL and always fails to parse on the target",
+      "url": "https://github.com/yzsind/mydb/issues/118"
+    },
+    {
+      "number": 110,
+      "title": "[Medium] lower_case_table_names=1 folds replicated uppercase identifiers and breaks exact-name schema verification for Oracle-lineage sources",
+      "url": "https://github.com/yzsind/mydb/issues/110"
+    },
+    {
+      "number": 109,
+      "title": "[Low] NUMERIC(p,s) UNSIGNED ZEROFILL rejected with error 1064 while identical DECIMAL form is accepted",
+      "url": "https://github.com/yzsind/mydb/issues/109"
+    },
+    {
+      "number": 108,
+      "title": "[Low] CREATE TABLE with charset-introduced DEFAULT literal rejected with error 1067 while MySQL accepts it",
+      "url": "https://github.com/yzsind/mydb/issues/108"
+    }
+  ],
+  "before_integration": [
+    {
+      "label": "start",
+      "root": "/tmp/mydb/issues-108-123-e4fyl37d",
+      "binary": "/Volumes/data/mydb-target/release/mydb",
+      "sha256": "232f00dbc341860856013107e2e6d6331fe0edac7c4310ebfa6dc03ce000c852"
+    },
+    {
+      "label": "108-introduced-defaults",
+      "status": "FAIL",
+      "error": "AssertionError({'port': 15837, 'ok': False, 'code': 1067, 'message': 'only literal column default values are supported'})"
+    },
+    {
+      "label": "109-decimal-aliases",
+      "status": "FAIL",
+      "error": "AssertionError({'port': 15837, 'ok': False, 'code': 1064, 'message': 'unexpected column type suffix at line 1, column 1'})"
+    },
+    {
+      "label": "110-case-insensitive-contract",
+      "status": "PASS"
+    },
+    {
+      "label": "118-119-check-dialect-and-enforcement",
+      "status": "PASS"
+    },
+    {
+      "label": "120-identifier-limit",
+      "status": "PASS"
+    },
+    {
+      "label": "121-mysql-partition-object-model",
+      "status": "PASS"
+    },
+    {
+      "label": "122-local-vector-dimension-roundtrip",
+      "status": "PASS"
+    },
+    {
+      "label": "123-caught-up",
+      "seconds": 0.015,
+      "Seconds_Behind_Source": 0,
+      "Last_IO_Errno": 0,
+      "Last_SQL_Errno": 0,
+      "Source_Log_File": "mydb-bin.000002",
+      "Read_Source_Log_Pos": 7605,
+      "Relay_Source_Log_File": "mydb-bin.000002",
+      "Exec_Source_Log_Pos": 197
+    },
+    {
+      "label": "123-caught-up",
+      "seconds": 0.012,
+      "Seconds_Behind_Source": 0,
+      "Last_IO_Errno": 0,
+      "Last_SQL_Errno": 0,
+      "Source_Log_File": "mydb-bin.000003",
+      "Read_Source_Log_Pos": 197,
+      "Relay_Source_Log_File": "mydb-bin.000003",
+      "Exec_Source_Log_Pos": 197
+    },
+    {
+      "label": "123-data-match",
+      "phase": 0,
+      "tables": 28
+    },
+    {
+      "label": "123-caught-up",
+      "seconds": 0.011,
+      "Seconds_Behind_Source": 0,
+      "Last_IO_Errno": 0,
+      "Last_SQL_Errno": 0,
+      "Source_Log_File": "mydb-bin.000003",
+      "Read_Source_Log_Pos": 197,
+      "Relay_Source_Log_File": "mydb-bin.000003",
+      "Exec_Source_Log_Pos": 197
+    },
+    {
+      "label": "123-row-full-mysql-replica-convergence",
+      "status": "FAIL",
+      "error": "OperationalError(2013, 'Lost connection to MySQL server during query (The read operation timed out)')"
+    },
+    {
+      "label": "finished",
+      "failures": [
+        "108-introduced-defaults",
+        "109-decimal-aliases",
+        "123-row-full-mysql-replica-convergence"
+      ],
+      "baseline": true
+    }
+  ],
+  "before_raw_protocol": [
+    {
+      "label": "start",
+      "root": "/tmp/mydb/issues-108-123-fuwj8035",
+      "binary": "/private/tmp/mydb/issue-audit-20261127/mydb-before",
+      "sha256": "232f00dbc341860856013107e2e6d6331fe0edac7c4310ebfa6dc03ce000c852"
+    },
+    {
+      "label": "123-raw-heartbeat-cursor-under-write-rotate",
+      "status": "FAIL",
+      "error": "AssertionError({'consumed': ('mydb-bin.000001', 1148), 'heartbeat': ('mydb-bin.000002', 197), 'events': 10})"
+    },
+    {
+      "label": "finished",
+      "failures": [
+        "123-raw-heartbeat-cursor-under-write-rotate"
+      ],
+      "baseline": true
+    }
+  ],
+  "after_integration": [
+    {
+      "label": "start",
+      "root": "/tmp/mydb/issues-108-123-u2akievk",
+      "binary": "/Volumes/data/mydb-target/release/mydb",
+      "sha256": "81f583a93e52bddc7d626aa40f2134c98d494b9ff884a07138ad8a351b725e11"
+    },
+    {
+      "label": "108-introduced-defaults",
+      "status": "PASS"
+    },
+    {
+      "label": "109-decimal-aliases",
+      "status": "PASS"
+    },
+    {
+      "label": "110-case-insensitive-contract",
+      "status": "PASS"
+    },
+    {
+      "label": "118-119-check-dialect-and-enforcement",
+      "status": "PASS"
+    },
+    {
+      "label": "120-identifier-limit",
+      "status": "PASS"
+    },
+    {
+      "label": "121-mysql-partition-object-model",
+      "status": "PASS"
+    },
+    {
+      "label": "122-local-vector-dimension-roundtrip",
+      "status": "PASS"
+    },
+    {
+      "label": "123-raw-dump-race",
+      "events": 6195,
+      "heartbeats": 593,
+      "cursor": [
+        "mydb-bin.000201",
+        1925
+      ],
+      "inserts": 1000,
+      "rotations": 200
+    },
+    {
+      "label": "123-raw-heartbeat-cursor-under-write-rotate",
+      "status": "PASS"
+    },
+    {
+      "label": "123-caught-up",
+      "seconds": 0.011,
+      "Seconds_Behind_Source": 0,
+      "Last_IO_Errno": 0,
+      "Last_SQL_Errno": 0,
+      "Source_Log_File": "mydb-bin.000202",
+      "Read_Source_Log_Pos": 7605,
+      "Relay_Source_Log_File": "mydb-bin.000202",
+      "Exec_Source_Log_Pos": 197
+    },
+    {
+      "label": "123-caught-up",
+      "seconds": 0.009,
+      "Seconds_Behind_Source": 0,
+      "Last_IO_Errno": 0,
+      "Last_SQL_Errno": 0,
+      "Source_Log_File": "mydb-bin.000202",
+      "Read_Source_Log_Pos": 4658174,
+      "Relay_Source_Log_File": "mydb-bin.000202",
+      "Exec_Source_Log_Pos": 4645859
+    },
+    {
+      "label": "123-data-match",
+      "phase": 0,
+      "tables": 28
+    },
+    {
+      "label": "123-caught-up",
+      "seconds": 0.01,
+      "Seconds_Behind_Source": 0,
+      "Last_IO_Errno": 0,
+      "Last_SQL_Errno": 0,
+      "Source_Log_File": "mydb-bin.000203",
+      "Read_Source_Log_Pos": 197,
+      "Relay_Source_Log_File": "mydb-bin.000203",
+      "Exec_Source_Log_Pos": 197
+    },
+    {
+      "label": "123-caught-up",
+      "seconds": 0.008,
+      "Seconds_Behind_Source": 0,
+      "Last_IO_Errno": 0,
+      "Last_SQL_Errno": 0,
+      "Source_Log_File": "mydb-bin.000203",
+      "Read_Source_Log_Pos": 5396221,
+      "Relay_Source_Log_File": "mydb-bin.000203",
+      "Exec_Source_Log_Pos": 5379381
+    },
+    {
+      "label": "123-data-match",
+      "phase": 1,
+      "tables": 28
+    },
+    {
+      "label": "123-caught-up",
+      "seconds": 0.012,
+      "Seconds_Behind_Source": 0,
+      "Last_IO_Errno": 0,
+      "Last_SQL_Errno": 0,
+      "Source_Log_File": "mydb-bin.000204",
+      "Read_Source_Log_Pos": 197,
+      "Relay_Source_Log_File": "mydb-bin.000204",
+      "Exec_Source_Log_Pos": 197
+    },
+    {
+      "label": "123-caught-up",
+      "seconds": 0.012,
+      "Seconds_Behind_Source": 0,
+      "Last_IO_Errno": 0,
+      "Last_SQL_Errno": 0,
+      "Source_Log_File": "mydb-bin.000205",
+      "Read_Source_Log_Pos": 197,
+      "Relay_Source_Log_File": "mydb-bin.000205",
+      "Exec_Source_Log_Pos": 197
+    },
+    {
+      "label": "123-data-match",
+      "phase": 2,
+      "tables": 28
+    },
+    {
+      "label": "123-caught-up",
+      "seconds": 0.012,
+      "Seconds_Behind_Source": 0,
+      "Last_IO_Errno": 0,
+      "Last_SQL_Errno": 0,
+      "Source_Log_File": "mydb-bin.000205",
+      "Read_Source_Log_Pos": 197,
+      "Relay_Source_Log_File": "mydb-bin.000205",
+      "Exec_Source_Log_Pos": 197
+    },
+    {
+      "label": "123-idle-heartbeats",
+      "seconds": 35,
+      "received": 173
+    },
+    {
+      "label": "123-caught-up",
+      "seconds": 0.026,
+      "Seconds_Behind_Source": 0,
+      "Last_IO_Errno": 0,
+      "Last_SQL_Errno": 0,
+      "Source_Log_File": "mydb-bin.000205",
+      "Read_Source_Log_Pos": 486,
+      "Relay_Source_Log_File": "mydb-bin.000205",
+      "Exec_Source_Log_Pos": 197
+    },
+    {
+      "label": "123-row-full-mysql-replica-convergence",
+      "status": "PASS"
+    },
+    {
+      "label": "finished",
+      "failures": [],
+      "baseline": false
+    }
+  ],
+  "nextest": "Summary [ 238.005s] 12856 tests run: 12856 passed, 64 skipped",
+  "build_debug": "Compiling mydb v1.0.3 (/Users/william/prog/mydb)\n    Finished `dev` profile [unoptimized + debuginfo] target(s) in 41.45s",
+  "build_release": "Compiling mydb v1.0.3 (/Users/william/prog/mydb)\n    Finished `release` profile [optimized] target(s) in 3m 36s",
+  "raw_logs_root": "/tmp/mydb/issue-audit-20261127",
+  "performance": [
+    {
+      "label": "before",
+      "sample": {
+        "point_select_ms": 48.08470799999998,
+        "range_aggregate_ms": 48.674416,
+        "update_ms": 20.36062499999991,
+        "create_table_ms": 19.85466700000005
+      }
+    },
+    {
+      "label": "after",
+      "sample": {
+        "point_select_ms": 45.301625000000016,
+        "range_aggregate_ms": 34.64079200000003,
+        "update_ms": 17.896874999999923,
+        "create_table_ms": 20.10337499999992
+      }
+    },
+    {
+      "label": "after",
+      "sample": {
+        "point_select_ms": 45.86141700000024,
+        "range_aggregate_ms": 33.14033400000005,
+        "update_ms": 17.21016600000036,
+        "create_table_ms": 19.862459000000054
+      }
+    },
+    {
+      "label": "before",
+      "sample": {
+        "point_select_ms": 44.91383400000038,
+        "range_aggregate_ms": 33.37650000000014,
+        "update_ms": 17.224083999999973,
+        "create_table_ms": 19.606749999999895
+      }
+    },
+    {
+      "label": "before",
+      "sample": {
+        "point_select_ms": 45.27929200000003,
+        "range_aggregate_ms": 33.162791000000084,
+        "update_ms": 16.941875000000106,
+        "create_table_ms": 19.732834000000032
+      }
+    },
+    {
+      "label": "after",
+      "sample": {
+        "point_select_ms": 44.726500000000335,
+        "range_aggregate_ms": 32.934583000000295,
+        "update_ms": 17.389666999999775,
+        "create_table_ms": 19.77445800000055
+      }
+    },
+    {
+      "label": "after",
+      "sample": {
+        "point_select_ms": 45.20891599999999,
+        "range_aggregate_ms": 33.6289169999997,
+        "update_ms": 17.159916999999858,
+        "create_table_ms": 19.870082999999816
+      }
+    },
+    {
+      "label": "before",
+      "sample": {
+        "point_select_ms": 45.78899999999919,
+        "range_aggregate_ms": 33.391874999999516,
+        "update_ms": 17.266000000000226,
+        "create_table_ms": 19.74779099999946
+      }
+    },
+    {
+      "label": "before",
+      "sample": {
+        "point_select_ms": 44.537833999999776,
+        "range_aggregate_ms": 33.37679200000032,
+        "update_ms": 17.08812499999901,
+        "create_table_ms": 19.69295800000026
+      }
+    },
+    {
+      "label": "after",
+      "sample": {
+        "point_select_ms": 43.96883399999929,
+        "range_aggregate_ms": 33.44099999999983,
+        "update_ms": 17.792583000000306,
+        "create_table_ms": 25.656500000000193
+      }
+    },
+    {
+      "medians": {
+        "before": {
+          "point_select_ms": 45.27929200000003,
+          "range_aggregate_ms": 33.37679200000032,
+          "update_ms": 17.224083999999973,
+          "create_table_ms": 19.732834000000032
+        },
+        "after": {
+          "point_select_ms": 45.20891599999999,
+          "range_aggregate_ms": 33.44099999999983,
+          "update_ms": 17.389666999999775,
+          "create_table_ms": 19.870082999999816
+        }
+      },
+      "after_over_before": {
+        "point_select_ms": 0.9984457354147667,
+        "range_aggregate_ms": 1.0019237319152634,
+        "update_ms": 1.0096134575284121,
+        "create_table_ms": 1.006955361809651
+      }
+    }
+  ]
+}

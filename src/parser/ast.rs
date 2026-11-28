@@ -3035,6 +3035,9 @@ pub struct WindowSpec {
     pub order_by: Vec<OrderBy>,
     pub frame: Option<WindowFrame>,
     pub inherits: Option<String>,
+    /// `OVER name` may use the named frame; `OVER (name ...)` may not.
+    #[serde(default)]
+    pub direct_reference: bool,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -3954,6 +3957,9 @@ fn sqlparser_error_location(message: &str) -> Option<(u64, u64)> {
 
 impl fmt::Display for ParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.spec == crate::error::catalog::ER_WRONG_PARAMCOUNT_TO_NATIVE_FCT {
+            return f.write_str(&self.message);
+        }
         write!(
             f,
             "{} at line {}, column {}",

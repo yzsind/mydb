@@ -223,7 +223,7 @@ fn validate_row_domain_constraints(table: &TableSchema, values: &[Value]) -> Res
 
 fn validate_cosine_index_rows(table: &TableSchema, values: &[Value], generated_ready: bool) -> Result<(), QueryError> {
     for index in table.indexes.iter().filter(|index| {
-        index.is_vector()
+        index.is_vector() && index.state == crate::storage::IndexState::Public
             && index.vector_meta().metric_enum() == crate::engine::vector::Metric::Cosine
     }) {
         if let Some(predicate) = &index.predicate {
@@ -1416,7 +1416,10 @@ fn coerce_column_value_for_schema(
             .default
             .as_ref()
             .is_some_and(|default| matches!(default, Value::Bytes(bytes) if bytes.is_empty()));
-        if already_stored_sentinel || schema_default_sentinel {
+        if already_stored_sentinel
+            || schema_default_sentinel
+            || crate::replication::replication_applier_active()
+        {
             return Ok(enum_zero_value());
         }
     }
@@ -4941,6 +4944,16 @@ fn literal_default_value(expr: &Expr) -> Result<Value, QueryError> {
         Expr::Literal(Literal::BitBytes(value)) | Expr::Literal(Literal::HexBytes(value)) => {
             Ok(Value::Bytes(value.clone()))
         }
+        // Charset introducers (including N'...') are literals. Preserve the
+        // parser's provenance marker and use the shared charset kernel so
+        // raw bytes, client encoding and invalid sequences follow SELECT.
+        Expr::Function { name, args, distinct: false }
+            if name.eq_ignore_ascii_case("CONVERT_USING")
+                && matches!(args.as_slice(), [
+                    Expr::Literal(Literal::String(_) | Literal::HexBytes(_) | Literal::BitBytes(_)),
+                    Expr::Literal(Literal::String(_)),
+                    Expr::Literal(Literal::Bool(true)),
+                ]) => crate::engine::expr::eval_const(expr),
         Expr::Unary {
             op: UnaryOp::Neg,
             expr,

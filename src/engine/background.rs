@@ -109,6 +109,10 @@ impl BackgroundWorker {
         &self.shutdown
     }
 
+    pub(crate) fn weak_signal(&self) -> std::sync::Weak<BackgroundShutdown> {
+        Arc::downgrade(&self.shutdown)
+    }
+
     pub(crate) fn shutdown(&self) {
         self.shutdown.request_shutdown();
         if let Some(worker) = self.worker.lock().unwrap_or_else(|e| e.into_inner()).take() {

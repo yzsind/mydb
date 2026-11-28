@@ -244,6 +244,13 @@ impl VectorGraph {
             || matches!(self, Self::NativeIvf(g) if g.file().is_some())
     }
 
+    pub(crate) fn revoke(&self) {
+        match self {
+            Self::Paged(graph) => graph.revoke(),
+            _ => self.invalidate(),
+        }
+    }
+
     pub(crate) fn invalidate(&self) {
         match self {
             Self::NativeHnsw(g) => g.invalidate(),

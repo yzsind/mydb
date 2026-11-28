@@ -1,0 +1,2 @@
+DROP returned OK
+warnings (('Warning', 1026, 'Error writing file'),)

@@ -25,6 +25,7 @@ Configures a MySQL→mydb row replica channel; CHANGE MASTER TO is a deprecated 
 - CHANGE is an incremental modification: fields that do not appear keep the channel's current configuration. STOP REPLICA should be issued before configuring.
 - A new file/position channel with no SOURCE_LOG_FILE starts at the source's first available binary log; SOURCE_LOG_POS defaults to 4. Reconnects resume at the last committed transaction boundary. This does not create a snapshot of data whose binary logs have already been purged.
 - SOURCE_SSL_MODE supports DISABLED, REQUIRED, VERIFY_CA, and VERIFY_IDENTITY; filter options support do/ignore db/table/wild table.
+- TCP connection attempts use the configured retry interval, bounded to 100 ms through 5 seconds; transport reads and writes time out after 5 seconds. Reconnect backoff still follows SOURCE_CONNECT_RETRY[_MS]. Replicas must use distinct SOURCE_SERVER_ID values; a replaced duplicate registration receives a fatal error.
 - A few MySQL transport/retry/compression advisory options are accepted for compatibility and produce warning 1287; they are never silently invalidated.
 
 ## Source Options

@@ -135,12 +135,13 @@ pub(super) fn evaluate(name: &str, values: &[Value]) -> Result<Value, QueryError
     }
     if name == "REGEXP_SUBSTR" {
         return Ok(re
-            .find_iter(&input.text)
-            .filter(|m| m.start() >= start)
+            .find_iter(&input.text[start..])
             .nth(occurrence.max(1) as usize - 1)
             .map(|m| {
                 Value::Bytes(
-                    subject[input.byte_offset(m.start())..input.byte_offset(m.end())].to_vec(),
+                    subject
+                        [input.byte_offset(start + m.start())..input.byte_offset(start + m.end())]
+                        .to_vec(),
                 )
             })
             .unwrap_or(Value::Null));

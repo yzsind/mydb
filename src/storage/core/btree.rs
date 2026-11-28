@@ -3152,9 +3152,9 @@ impl IndexFile {
         Ok(())
     }
 
-    /// Caller holds the index handle exclusively, preventing concurrent splits.
-    /// Read through the buffer pool so dirty pages and memory-only databases
-    /// receive the same structural checks as persisted indexes.
+    /// Read through the buffer pool so dirty and memory-only pages are checked.
+    /// Callers must exclude mutations or prove an unchanged mutation generation.
+    #[cfg(test)]
     fn validate_structure(&self) -> Result<(), QueryError> {
         if let Some(spatial) = &self.spatial {
             return spatial.validate();
@@ -3164,6 +3164,38 @@ impl IndexFile {
             self.read_page_with_intent(id, AccessIntent::Scan)
                 .map(|page| page.as_ref().clone())
         })
+    }
+
+    /// Discard observations spanning a mutation, including transient structural
+    /// errors. This uses the same generation that protects optimistic cursors.
+    fn validate_structure_online(&self, mut on_attempt: impl FnMut()) -> Result<(), QueryError> {
+        for _ in 0..8 {
+            crate::engine::cancel::check_cancelled()?;
+            self.ensure_healthy()?;
+            let Some(generation) = self.stable_generation() else {
+                std::thread::yield_now();
+                continue;
+            };
+            on_attempt();
+            let result = if let Some(spatial) = &self.spatial {
+                spatial.validate_optimistic()
+            } else {
+                let meta = self.meta_state.lock().meta.clone();
+                validate_index_tree(meta.root_page, meta.next_page_id, &mut |id| {
+                    crate::engine::cancel::check_cancelled()?;
+                    self.read_page_with_intent(id, AccessIntent::Scan)
+                        .map(|page| page.as_ref().clone())
+                })
+            };
+            crate::engine::cancel::check_cancelled()?;
+            if self.stable_generation() == Some(generation) {
+                return result;
+            }
+        }
+        Err(error(
+            crate::error::catalog::ER_LOCK_WAIT_TIMEOUT,
+            "CHECK could not obtain a stable index view; retry when writes subside",
+        ))
     }
 
     fn quick_validate(path: PathBuf) -> Result<(), QueryError> {
@@ -3196,7 +3228,6 @@ impl IndexFile {
         log: Arc<crate::wal::LogMutex>,
         rec_lsn: u64,
     ) -> Result<Self, QueryError> {
-        Self::check_rebuild_marker(&path)?;
         // Each replay partition has one owner and already supplies file-level
         // parallelism. Use synchronous eviction without speculative readers:
         // background workers can retain this private pool after IndexFile drops,
@@ -3210,6 +3241,16 @@ impl IndexFile {
             0,
         );
         buffer_pool.shutdown_flusher();
+        Self::open_for_recovery_with_buffer_pool(path, log, rec_lsn, buffer_pool)
+    }
+
+    fn open_for_recovery_with_buffer_pool(
+        path: PathBuf,
+        log: Arc<crate::wal::LogMutex>,
+        rec_lsn: u64,
+        buffer_pool: Arc<BufferPool>,
+    ) -> Result<Self, QueryError> {
+        Self::check_rebuild_marker(&path)?;
         let mut file = crate::storage::image_io::open_data_file(&path).map_err(io_err)?;
         let len = file.metadata().map_err(io_err)?.len();
         if len > 0 && len < PAGE_SIZE as u64 {
@@ -3827,6 +3868,15 @@ impl IndexFile {
         wal_owner: Option<&Database>,
     ) -> Result<(), QueryError> {
         if let Some(spatial) = &self.spatial {
+            if let Some(log) = &self.online_build_log {
+                log.record(std::iter::once(IndexBatchEntry {
+                    kind: WalIndexOpKind::Insert,
+                    key,
+                    row_id,
+                }));
+                return Ok(());
+            }
+            let _mutation = self.begin_mutation();
             return spatial.apply(
                 txn_id,
                 [IndexBatchEntry {
@@ -3877,6 +3927,15 @@ impl IndexFile {
         wal_owner: Option<&Database>,
     ) -> Result<(), QueryError> {
         if let Some(spatial) = &self.spatial {
+            if let Some(log) = &self.online_build_log {
+                log.record(entries.into_iter().map(|(key, row_id)| IndexBatchEntry {
+                    kind: WalIndexOpKind::Insert,
+                    key,
+                    row_id,
+                }));
+                return Ok(());
+            }
+            let _mutation = self.begin_mutation();
             return spatial.insert_many(txn_id, entries);
         }
         if entries.is_empty() {
@@ -3926,6 +3985,11 @@ impl IndexFile {
         wal_owner: Option<&Database>,
     ) -> Result<(), QueryError> {
         if let Some(spatial) = &self.spatial {
+            if let Some(log) = &self.online_build_log {
+                log.record(entries);
+                return Ok(());
+            }
+            let _mutation = self.begin_mutation();
             return spatial.apply(txn_id, entries);
         }
         if let Some(log) = &self.online_build_log {
@@ -3948,6 +4012,11 @@ impl IndexFile {
         wal_owner: Option<&Database>,
     ) -> Result<(), QueryError> {
         if let Some(spatial) = &self.spatial {
+            if let Some(log) = &self.online_build_log {
+                log.record(entries);
+                return Ok(());
+            }
+            let _mutation = self.begin_mutation();
             return spatial.apply(txn_id, entries);
         }
         if let Some(log) = &self.online_build_log {
@@ -7459,6 +7528,15 @@ impl IndexFile {
         wal_owner: Option<&Database>,
     ) -> Result<(), QueryError> {
         if let Some(spatial) = &self.spatial {
+            if let Some(log) = &self.online_build_log {
+                log.record(std::iter::once(IndexBatchEntry {
+                    kind: WalIndexOpKind::Delete,
+                    key,
+                    row_id,
+                }));
+                return Ok(());
+            }
+            let _mutation = self.begin_mutation();
             return spatial.apply(
                 txn_id,
                 [IndexBatchEntry {
@@ -9621,9 +9699,13 @@ impl IndexFile {
         }
     }
 
-    fn flush(&self) -> Result<(), QueryError> {
+    fn flush(&self) -> Result<(), QueryError> { self.flush_with_sync(true) }
+
+    fn flush_without_sync(&self) -> Result<(), QueryError> { self.flush_with_sync(false) }
+
+    fn flush_with_sync(&self, sync: bool) -> Result<(), QueryError> {
         if let Some(spatial) = &self.spatial {
-            return spatial.flush();
+            return if sync { spatial.flush() } else { spatial.flush_without_sync() };
         }
         #[cfg(test)]
         INDEX_FLUSH_TEST_HOOK.with(|hook| {
@@ -9666,11 +9748,11 @@ impl IndexFile {
         file.set_len(next_page_id * PAGE_SIZE as u64)
             .map_err(io_err)?;
         file.flush().map_err(io_err)?;
-        self.buffer_pool.sync_cached_and_direct_file(
-            &self.file_key,
-            file,
-            self.durability == DurabilityMode::Strict,
-        )?;
+        if sync {
+            self.buffer_pool.sync_cached_and_direct_file(
+                &self.file_key, file, self.durability == DurabilityMode::Strict,
+            )?;
+        }
         self.dirty_meta.store(false, Ordering::Release);
         self.dirty.store(false, Ordering::Release);
         Ok(())
@@ -11006,7 +11088,11 @@ impl IndexFile {
 
     fn is_empty(&self) -> Result<bool, QueryError> {
         if let Some(spatial) = &self.spatial {
-            return spatial.is_empty();
+            return if self.online_build_log.is_some() {
+                Ok(false)
+            } else {
+                spatial.is_empty()
+            };
         }
         if self.online_build_log.is_some() {
             // LOAD DATA must use its incremental writer, never replace the
@@ -22044,11 +22130,17 @@ fn validate_index_tree(
     page_count: u64,
     read_page: &mut impl FnMut(u64) -> Result<IndexPage, QueryError>,
 ) -> Result<(), QueryError> {
+    let mut charge = crate::engine::executor::mem_budget::ControlledMemoryCharge::try_new(
+        crate::engine::executor::mem_budget::ControlledMemoryCategory::StorageScratch,
+        PAGE_SIZE * 4,
+    )?;
     let mut visited = HashSet::new();
     let mut leaves_via_tree = HashMap::new();
     let mut stack: Vec<(u64, Option<IndexEntry>, Option<IndexEntry>)> =
         vec![(root_page, None, None)];
     while let Some((page_id, low, high)) = stack.pop() {
+        crate::engine::cancel::check_cancelled()?;
+        charge.try_grow(256)?;
         if page_id == INDEX_META_PAGE || page_id >= page_count {
             return Err(error(
                 crate::error::catalog::ER_GET_ERRNO,
@@ -22093,6 +22185,13 @@ fn validate_index_tree(
                         "corrupt index: unordered separators",
                     ));
                 }
+                let bound_bytes = page.keys.iter().fold(0usize, |total, entry| {
+                    entry.key.0.iter().fold(total.saturating_add(
+                        entry.key.0.capacity().saturating_mul(std::mem::size_of::<KeyPart>())
+                    ), |bytes, part| bytes.saturating_add(range_order_key_part_capacity_bytes(part)))
+                });
+                charge.try_grow(bound_bytes.saturating_mul(4)
+                    .saturating_add(page.children.len().saturating_mul(256)))?;
                 for (ordinal, child) in page.children.into_iter().enumerate() {
                     let child_low = ordinal
                         .checked_sub(1)

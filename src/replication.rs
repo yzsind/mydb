@@ -39,6 +39,7 @@ use crate::util::logging::log_message;
 mod private_metadata;
 use private_metadata::ChannelDirectory;
 
+const SOURCE_RECEIVE_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_CHANNEL: &str = "default";
 const DEFAULT_REPL_PORT: u16 = 3306;
 const DEFAULT_REPL_SERVER_ID: u32 = 9001;
@@ -202,7 +203,15 @@ impl ReplicationStatus {
             source_uuid: String::new(),
             count_received_heartbeats: 0,
             last_heartbeat_at_unix_secs: 0,
+            last_source_activity: None,
         }
+    }
+
+    pub(crate) fn io_connected(&self) -> bool {
+        self.running
+            && self
+                .last_source_activity
+                .is_some_and(|seen| seen.elapsed() < SOURCE_RECEIVE_TIMEOUT)
     }
 
     /// MySQL 8.0 `SHOW REPLICA STATUS` column layout — 60 fields in the
@@ -283,7 +292,11 @@ impl ReplicationStatus {
             Value::String(self.relay_log_file.clone()), // 8  Relay_Log_File
             Value::UInt(self.relay_log_pos),         // 9  Relay_Log_Pos
             Value::String(self.exec_source_log_file.clone()), // 10 Relay_Source_Log_File
-            yes_no(self.running),                    // 11 Replica_IO_Running
+            if self.running && !self.io_connected() {
+                Value::String("Connecting".into())
+            } else {
+                yes_no(self.running)
+            }, // 11 Replica_IO_Running
             yes_no(self.sql_running),                // 12 Replica_SQL_Running
             csv(&cfg.do_databases),                  // 13 Replicate_Do_DB
             csv(&cfg.ignore_databases),              // 14 Replicate_Ignore_DB
@@ -310,7 +323,7 @@ impl ReplicationStatus {
             Value::String(cfg.ssl_key.clone().unwrap_or_default()), // 32 Source_SSL_Key
             // MySQL reports NULL while the SQL (applier) thread is not running
             // — there is no meaningful "behind" measure without an applier.
-            if self.sql_running {
+            if self.sql_running && self.io_connected() {
                 if self.running
                     && !self.source_log_file.is_empty()
                     && self.exec_source_log_file == self.source_log_file
@@ -524,6 +537,7 @@ struct ChannelRuntime {
     /// admin. The SQL thread consults this after each transaction commit
     /// (DDL or XID) and stops itself when the condition fires.
     until: Mutex<Option<UntilCondition>>,
+    until_completed: AtomicBool,
     flush_policy: ReplicationFlushPolicy,
     /// Cached relay-log writer. We keep the file open across events to
     /// avoid the open/close syscall pair per record (TPC-C TM = ~32k
@@ -903,13 +917,26 @@ impl ReplicationManager {
         if let Ok(channels) = self.channels.lock() {
             if let Some(runtime) = channels.get(channel) {
                 if let Ok(cfg) = runtime.config.lock() {
-                    return cfg.clone();
+                    let mut base = cfg.clone();
+                    if !base.auto_position {
+                        if let Ok(status) = runtime.status.lock() {
+                            base.source_log_file
+                                .clone_from(&status.exec_source_log_file);
+                            base.source_log_pos = status.exec_source_log_pos;
+                        }
+                    }
+                    return base;
                 }
             }
         }
         if let Ok(persisted) = self.load_channel(channel) {
             if persisted.config.is_configured() {
-                return persisted.config;
+                let mut base = persisted.config;
+                if !base.auto_position {
+                    base.source_log_file = persisted.status.exec_source_log_file;
+                    base.source_log_pos = persisted.status.exec_source_log_pos;
+                }
+                return base;
             }
         }
         ReplicationChannelConfig {
@@ -948,6 +975,7 @@ impl ReplicationManager {
                         io_join: Mutex::new(None),
                         sql_join: Mutex::new(None),
                         until: Mutex::new(None),
+                        until_completed: AtomicBool::new(false),
                         flush_policy: ReplicationFlushPolicy::from_env(),
                         relay_writer: Mutex::new(None),
                         relay_sync: Mutex::new(RelaySyncState::default()),
@@ -1099,12 +1127,15 @@ impl ReplicationManager {
         }
         // Install the UNTIL condition before the SQL thread spins up; it reads
         // it on each commit and self-stops when matched.
+        if !matches!(sel, ReplThreadSel::Io)
+            && (until.is_some() || runtime.until_completed.load(Ordering::Acquire))
         {
             let mut slot = runtime
                 .until
                 .lock()
                 .map_err(|_| poisoned_lock("replication until lock poisoned"))?;
             *slot = until;
+            runtime.until_completed.store(false, Ordering::Release);
         }
         let cfg = runtime
             .config
@@ -1410,6 +1441,7 @@ impl ReplicationManager {
         runtime.relay_cond.notify_all();
         let _ = fs::remove_file(relay_log_path(&self.data_dir, channel));
         *runtime.until.lock().map_err(|_| relay_lock_error())? = None;
+        runtime.until_completed.store(false, Ordering::Release);
         self.persist_runtime(&runtime)
     }
 
@@ -1594,6 +1626,7 @@ impl ReplicationManager {
             io_join: Mutex::new(None),
             sql_join: Mutex::new(None),
             until: Mutex::new(None),
+            until_completed: AtomicBool::new(false),
             flush_policy: ReplicationFlushPolicy::from_env(),
             relay_writer: Mutex::new(None),
             relay_sync: Mutex::new(RelaySyncState::default()),
@@ -1674,6 +1707,24 @@ struct ChannelRunner {
     engine: Arc<StorageQueryEngine>,
     runtime: Arc<ChannelRuntime>,
     process_handle: Option<Arc<crate::engine::session_registry::SessionHandle>>,
+}
+
+fn source_connection_options(cfg: &ReplicationChannelConfig) -> mysql::OptsBuilder {
+    mysql::OptsBuilder::new()
+        .ip_or_hostname(Some(cfg.source_host.clone()))
+        .tcp_port(cfg.source_port)
+        .user(Some(cfg.source_user.clone()))
+        .pass(Some(cfg.source_password.clone()))
+        .prefer_socket(false)
+        // FULL UPDATE events contain both images and can exceed the source's
+        // SQL max_allowed_packet. The client protocol supports up to 1 GiB.
+        .max_allowed_packet(Some(crate::binlog::MAX_REPLICATION_PACKET_BYTES))
+        .tcp_connect_timeout(Some(Duration::from_millis(
+            cfg.connect_retry_ms.clamp(100, 5_000),
+        )))
+        .read_timeout(Some(SOURCE_RECEIVE_TIMEOUT))
+        .write_timeout(Some(SOURCE_RECEIVE_TIMEOUT))
+        .tcp_keepalive_time_ms(Some(10_000))
 }
 
 impl ChannelRunner {
@@ -1859,6 +1910,11 @@ impl ChannelRunner {
             status.sql_running = true;
             status.sql_state = "recovering relay log".to_string();
         });
+        if self.until_should_stop_after("", 0, None) {
+            self.stop_on_until();
+            self.mark_sql_stopped("stopped on UNTIL condition");
+            return;
+        }
         // Crash recovery: drain relay records left on disk from a prior run
         // before tailing live IO writes. An error here stops the SQL thread.
         if let Err(err) = self.replay_relay_tail() {
@@ -2585,7 +2641,7 @@ impl ChannelRunner {
                 return Err(err);
             }
         } else {
-            self.persist_runtime_maybe();
+            self.persist_runtime_maybe(true);
         }
         Ok(())
     }
@@ -2602,7 +2658,7 @@ impl ChannelRunner {
         if let Ok(mut committed) = self.runtime.io_committed_pos.lock() {
             *committed = Some((file.to_string(), pos));
         }
-        self.persist_runtime_maybe();
+        self.persist_runtime_maybe(true);
     }
 
     /// IO thread commit boundary (XID or `COMMIT` query). Durably writes a
@@ -2630,11 +2686,16 @@ impl ChannelRunner {
         Ok(())
     }
 
-    fn persist_runtime_maybe(&self) {
+    fn persist_runtime_maybe(&self, changed: bool) {
         let Ok(mut progress) = self.runtime.progress_persist.lock() else {
             return;
         };
-        progress.pending_updates = progress.pending_updates.saturating_add(1);
+        if changed {
+            progress.pending_updates = progress.pending_updates.saturating_add(1);
+        }
+        if progress.pending_updates == 0 {
+            return;
+        }
         if progress.pending_updates < self.runtime.flush_policy.progress_sync_txns
             && progress.last_sync.elapsed() < self.runtime.flush_policy.progress_sync_interval
         {
@@ -2673,6 +2734,7 @@ impl ChannelRunner {
     /// Common `START REPLICA UNTIL` self-stop: set the master stop so both
     /// threads wind down after the matching transaction.
     fn stop_on_until(&self) {
+        self.runtime.until_completed.store(true, Ordering::Release);
         self.update_status(|status| {
             status.running = false;
             status.io_state = "stopped on UNTIL condition".to_string();
@@ -2686,22 +2748,15 @@ impl ChannelRunner {
         self.update_status(|status| {
             status.running = true;
             status.io_state = format!("connecting to {}", cfg.source_label());
+            status.last_source_activity = None;
         });
         // Read/keepalive timeouts protect the IO thread from silent TCP
         // half-open (NAT idle, firewall DROP, source crash without RST). The
-        // source binlog dump requests a sub-second heartbeat below, so any
-        // multi-second silence is real trouble — 30s read_timeout remains a
-        // generous transport-failure bound. Without this, `stream.next()` would block
+        // source binlog dump requests a sub-second heartbeat below, so five
+        // seconds of silence bounds failure detection. Without this, `stream.next()` would block
         // until the OS TCP keepalive (Linux default ~2h) and `SHOW REPLICA
         // STATUS` would keep reporting IO=Yes indefinitely.
-        let mut opts = mysql::OptsBuilder::new()
-            .ip_or_hostname(Some(cfg.source_host.clone()))
-            .tcp_port(cfg.source_port)
-            .user(Some(cfg.source_user.clone()))
-            .pass(Some(cfg.source_password.clone()))
-            .prefer_socket(false)
-            .read_timeout(Some(std::time::Duration::from_secs(30)))
-            .tcp_keepalive_time_ms(Some(10_000));
+        let mut opts = source_connection_options(cfg);
         if !cfg.ssl_mode.requires_tls() && require_secure_transport_for_replication() {
             mark_io_error_fatal();
             return Err(error(
@@ -2864,6 +2919,10 @@ impl ChannelRunner {
             let event_ts = header.timestamp() as u64;
             let checksum_ok = verify_binlog_event_crc32(&event);
             self.update_status(|status| {
+                status.last_source_activity = Some(Instant::now());
+                if status.last_io_error.take().is_some() && status.last_sql_error.is_none() {
+                    status.last_error = None;
+                }
                 status.received_events = status.received_events.saturating_add(1);
                 status.source_log_file = current_file.clone();
                 if next_pos != 0 {
@@ -2950,7 +3009,7 @@ impl ChannelRunner {
                 // and also gives throttled channel metadata a periodic flush
                 // opportunity.
                 self.sync_pending_relay(false)?;
-                self.persist_runtime_maybe();
+                self.persist_runtime_maybe(false);
                 // Heartbeat events do not advance any position — they only
                 // prove the source-to-replica IO pipe is alive. Track count
                 // and last-seen so `SHOW REPLICA STATUS` /
@@ -3381,6 +3440,16 @@ impl ChannelRunner {
                     format!("invalid source column type: {err}"),
                 )
             })?;
+            if matches!(
+                ty,
+                Some(
+                    mysql_common::constants::ColumnType::MYSQL_TYPE_TIMESTAMP
+                        | mysql_common::constants::ColumnType::MYSQL_TYPE_TIME
+                )
+            ) {
+                return Err(error(crate::error::catalog::ER_NOT_SUPPORTED_YET,
+                    "legacy pre-MySQL-5.6 TIMESTAMP/TIME row encodings are unsupported; rebuild source temporal columns with a modern format"));
+            }
             if ty.is_some_and(|ty| ty.is_numeric_type()) {
                 if let Some(unsigned) = signedness.next() {
                     if target.columns[target_index].unsigned != unsigned {
@@ -3418,6 +3487,7 @@ impl ChannelRunner {
                 ),
             ));
         }
+        validate_enum_set_metadata(table_map, &target, &column_indices)?;
         if let Some(bitmap) = rows.columns_before_image() {
             if bitmap.count_ones() != col_count {
                 return Err(error(crate::error::catalog::ER_NOT_SUPPORTED_YET,
@@ -3591,7 +3661,19 @@ impl ChannelRunner {
             return false;
         };
         match until {
-            UntilCondition::Position { file: f, pos: p } => file == f && pos >= p,
+            UntilCondition::Position { file: f, pos: p } => {
+                let status;
+                let (file, pos) = if file.is_empty() {
+                    status = self.status_snapshot();
+                    (
+                        status.exec_source_log_file.as_str(),
+                        status.exec_source_log_pos,
+                    )
+                } else {
+                    (file, pos)
+                };
+                !file.is_empty() && crate::binlog::binlog_pos_ge((file, pos), (&f, p))
+            }
             UntilCondition::SqlAfterGtids(set) => {
                 let executed = self.status_snapshot().executed_gtid_set;
                 crate::binlog::gtid_subset(&set, &executed)
@@ -4134,6 +4216,7 @@ impl ChannelRunner {
         self.update_status(|status| {
             status.last_error = Some(err.message().to_string());
             status.io_state = "retrying after error".to_string();
+            status.last_source_activity = None;
             status.last_io_error = Some(thread_error);
         });
     }
@@ -4263,7 +4346,7 @@ fn apply_write_rows(
         // Retry rows individually so new rows in a mixed replay batch survive.
         Err(err) if err.is(crate::error::catalog::ER_DUP_ENTRY) && apply_is_idempotent() => {
             for row in rows {
-                match db.insert_row(txn, &table_name, row.clone()) {
+                match db.insert_rows_detailed(txn, &table_name, vec![row.clone()]) {
                     Ok(_) => {}
                     Err(e) if e.is(crate::error::catalog::ER_DUP_ENTRY) => {
                         continue;
@@ -4292,6 +4375,10 @@ fn apply_update_rows(
 ) -> Result<(), QueryError> {
     let table_name = crate::storage::table_key(database, table);
     let schema = db.table(&table_name)?;
+    let materialize_identity = schema
+        .columns
+        .iter()
+        .any(|column| column.generated_expr.is_some() && !column.generated_stored);
     // HASH_SCAN for keyless tables: build a one-shot row index so each
     // before-image is an O(1) lookup instead of a full-table rescan.
     let mut keyless = keyless_matcher(
@@ -4301,10 +4388,12 @@ fn apply_update_rows(
         rows.iter().map(|row| row.before.as_slice()),
     )?;
     for update in rows {
-        let _partition = replication_partition_guard(&schema, &update.before)?;
+        let before =
+            materialize_replication_identity(db, &schema, &update.before, materialize_identity)?;
+        let _partition = replication_partition_guard(&schema, &before)?;
         let before_match = match keyless.as_mut() {
-            Some(m) => m.take_match(&update.before),
-            None => find_matching_row(db, txn, &schema, &update.before)?,
+            Some(m) => m.take_match(&before),
+            None => find_matching_row(db, txn, &schema, &before)?,
         };
         if let Some(row_id) = before_match {
             let after = update.after.clone();
@@ -4353,12 +4442,17 @@ fn apply_delete_rows(
 ) -> Result<(), QueryError> {
     let table_name = crate::storage::table_key(database, table);
     let schema = db.table(&table_name)?;
+    let materialize_identity = schema
+        .columns
+        .iter()
+        .any(|column| column.generated_expr.is_some() && !column.generated_stored);
     let mut keyless = keyless_matcher(db, txn, &schema, rows.iter().map(Vec::as_slice))?;
     for row in rows {
-        let _partition = replication_partition_guard(&schema, row)?;
+        let row = materialize_replication_identity(db, &schema, row, materialize_identity)?;
+        let _partition = replication_partition_guard(&schema, &row)?;
         let matched = match keyless.as_mut() {
-            Some(m) => m.take_match(row),
-            None => find_matching_row(db, txn, &schema, row)?,
+            Some(m) => m.take_match(&row),
+            None => find_matching_row(db, txn, &schema, &row)?,
         };
         if let Some(row_id) = matched {
             db.delete_row_by_id(txn, &schema, row_id)?;
@@ -4382,6 +4476,21 @@ fn apply_delete_rows(
         }
     }
     Ok(())
+}
+
+/// Recompute replica-local virtual values before index probes or partition routing.
+fn materialize_replication_identity<'a>(
+    db: &Database,
+    table: &TableSchema,
+    image: &'a [Value],
+    needs_materialization: bool,
+) -> Result<std::borrow::Cow<'a, [Value]>, QueryError> {
+    if !needs_materialization {
+        return Ok(std::borrow::Cow::Borrowed(image));
+    }
+    let mut values = image.to_vec();
+    db.materialize_generated_columns_for_insert(table, &mut values)?;
+    Ok(std::borrow::Cow::Owned(values))
 }
 
 // FULL row images carry every partition key. Keep the identity probe and
@@ -4453,8 +4562,48 @@ fn find_matching_row(
 
 fn row_values_match(table: &TableSchema, left: &[Value], right: &[Value]) -> bool {
     left.len() == right.len()
-        && replicated_image_indices(table)
-            .all(|idx| value_to_string(&left[idx]) == value_to_string(&right[idx]))
+        && replicated_image_indices(table).all(|idx| {
+            image_match_value(
+                &left[idx],
+                matches!(table.columns[idx].data_type, DataTypeKind::Char { .. }),
+            ) == image_match_value(
+                &right[idx],
+                matches!(table.columns[idx].data_type, DataTypeKind::Char { .. }),
+            )
+        })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum ImageMatchValue {
+    Binary(Vec<u8>),
+    Geometry(Vec<u8>),
+    Text(String),
+}
+
+impl ImageMatchValue {
+    fn capacity(&self) -> usize {
+        match self {
+            Self::Binary(bytes) | Self::Geometry(bytes) => bytes.capacity(),
+            Self::Text(text) => text.capacity(),
+        }
+    }
+}
+
+fn image_match_value(value: &Value, trim_char: bool) -> Option<ImageMatchValue> {
+    match value {
+        Value::Null => None,
+        Value::Bytes(bytes) => Some(ImageMatchValue::Binary(bytes.clone())),
+        Value::Geometry(bytes) => Some(ImageMatchValue::Geometry(bytes.clone())),
+        _ => {
+            let mut text = value_to_string(value);
+            if trim_char {
+                text.truncate(crate::util::pad_space::trim_trailing_spaces_len(
+                    text.as_bytes(),
+                ));
+            }
+            Some(ImageMatchValue::Text(text))
+        }
+    }
 }
 
 /// Only source-authoritative values identify a FULL row image. Tombstones
@@ -4504,8 +4653,8 @@ fn has_usable_unique_index(table: &TableSchema) -> bool {
 /// `HASH_SCAN`). Matched row-ids are consumed so duplicate keyless rows and
 /// repeated images in one event map to distinct physical rows.
 struct KeylessRowIndex {
-    indices: Vec<usize>,
-    map: std::collections::HashMap<Vec<String>, Vec<RowId>>,
+    indices: Vec<(usize, bool)>,
+    map: std::collections::HashMap<Vec<Option<ImageMatchValue>>, Vec<RowId>>,
     _charge: crate::engine::executor::mem_budget::ControlledMemoryCharge,
 }
 
@@ -4519,21 +4668,31 @@ impl KeylessRowIndex {
         use crate::engine::executor::mem_budget::{
             ControlledMemoryCategory, ControlledMemoryCharge,
         };
-        let indices = replicated_image_indices(table).collect::<Vec<_>>();
+        let indices = replicated_image_indices(table)
+            .map(|idx| {
+                (
+                    idx,
+                    matches!(table.columns[idx].data_type, DataTypeKind::Char { .. }),
+                )
+            })
+            .collect::<Vec<_>>();
         let mut charge =
             ControlledMemoryCharge::try_new(ControlledMemoryCategory::BinlogTransient, 0)?;
-        let mut wanted: HashMap<Vec<String>, usize> = HashMap::new();
+        let mut wanted: HashMap<Vec<Option<ImageMatchValue>>, usize> = HashMap::new();
         for image in images {
             let key = Self::image_key(&indices, image);
             charge.try_grow(
                 key.iter()
-                    .map(|s| s.capacity() + std::mem::size_of::<String>())
+                    .map(|s| {
+                        s.as_ref().map_or(0, ImageMatchValue::capacity)
+                            + std::mem::size_of::<Option<ImageMatchValue>>()
+                    })
                     .sum::<usize>()
                     .saturating_add(128 + 2 * std::mem::size_of::<RowId>()),
             )?;
             *wanted.entry(key).or_default() += 1;
         }
-        let mut map = HashMap::<Vec<String>, Vec<RowId>>::new();
+        let mut map = HashMap::<Vec<Option<ImageMatchValue>>, Vec<RowId>>::new();
         let mut remaining = wanted.values().copied().sum::<usize>();
         if remaining != 0 {
             db.dml_candidate_rows_with_origin_streaming_until(table, txn, |row| {
@@ -4555,10 +4714,10 @@ impl KeylessRowIndex {
         })
     }
 
-    fn image_key(indices: &[usize], image: &[Value]) -> Vec<String> {
+    fn image_key(indices: &[(usize, bool)], image: &[Value]) -> Vec<Option<ImageMatchValue>> {
         indices
             .iter()
-            .map(|&idx| value_to_string(&image[idx]))
+            .map(|&(idx, trim_char)| image_match_value(&image[idx], trim_char))
             .collect()
     }
 
@@ -4633,6 +4792,84 @@ fn decode_replicated_string(
         })?
     };
     Ok(Value::String(text))
+}
+
+fn validate_enum_set_metadata(
+    table_map: &mysql_common::binlog::events::TableMapEvent<'_>,
+    target: &TableSchema,
+    columns: &[usize],
+) -> Result<(), QueryError> {
+    use mysql_common::binlog::events::OptionalMetadataField;
+    for field in table_map.iter_optional_meta() {
+        let field = field.map_err(|err| io_error("decode source ENUM/SET metadata", err))?;
+        let (source, enum_type): (Vec<Vec<Vec<u8>>>, bool) = match field {
+            OptionalMetadataField::EnumStrValue(values) => (
+                values
+                    .iter_values()
+                    .map(|v| v.map(|v| v.values().iter().map(|v| v.value_raw().to_vec()).collect()))
+                    .collect::<Result<_, _>>()
+                    .map_err(|e| io_error("decode source ENUM members", e))?,
+                true,
+            ),
+            OptionalMetadataField::SetStrValue(values) => (
+                values
+                    .iter_values()
+                    .map(|v| v.map(|v| v.values().iter().map(|v| v.value_raw().to_vec()).collect()))
+                    .collect::<Result<_, _>>()
+                    .map_err(|e| io_error("decode source SET members", e))?,
+                false,
+            ),
+            _ => continue,
+        };
+        let mut source = source.into_iter();
+        for (wire, &index) in columns.iter().enumerate() {
+            let ty = table_map.get_column_type(wire).map_err(|e| {
+                error(
+                    crate::error::catalog::ER_NOT_SUPPORTED_YET,
+                    format!("invalid source member type: {e}"),
+                )
+            })?;
+            let expected = if enum_type {
+                mysql_common::constants::ColumnType::MYSQL_TYPE_ENUM
+            } else {
+                mysql_common::constants::ColumnType::MYSQL_TYPE_SET
+            };
+            if ty != Some(expected) {
+                continue;
+            }
+            let column = &target.columns[index];
+            let values = match (&column.data_type, enum_type) {
+                (DataTypeKind::Enum { values }, true) | (DataTypeKind::Set { values }, false) => {
+                    Some(values)
+                }
+                _ => None,
+            };
+            let members = source.next().ok_or_else(|| {
+                error(
+                    crate::error::catalog::ER_NOT_SUPPORTED_YET,
+                    "source ENUM/SET member metadata is incomplete",
+                )
+            })?;
+            let decoded = members
+                .iter()
+                .map(|v| {
+                    decode_replicated_string(v, column.charset.as_deref())
+                        .map(|v| value_to_string(&v))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            if values != Some(&decoded) {
+                return Err(error(crate::error::catalog::ER_NOT_SUPPORTED_YET,format!(
+                    "schema mismatch for replicated column {}.{}: source and target ENUM/SET members differ; align schemas before restarting replication",target.qualified_name(),column.name)));
+            }
+        }
+        if source.next().is_some() {
+            return Err(error(
+                crate::error::catalog::ER_NOT_SUPPORTED_YET,
+                "source ENUM/SET member metadata has excess columns",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn convert_binlog_row(
@@ -5069,7 +5306,7 @@ fn mysql_value_to_mydb(
         };
         if let Some(ordinal) = ordinal {
             return if ordinal == 0 {
-                Ok(Value::String(String::new()))
+                Ok(Value::Bytes(Vec::new()))
             } else {
                 usize::try_from(ordinal - 1)
                     .ok()
@@ -5136,9 +5373,17 @@ fn mysql_value_to_mydb(
         mysql::Value::Float(v) => Value::Float(*v),
         mysql::Value::Double(v) => Value::Double(*v),
         mysql::Value::Bytes(bytes) => match target {
-            DataTypeKind::Blob { .. }
-            | DataTypeKind::Binary { .. }
-            | DataTypeKind::VarBinary { .. } => Value::Bytes(bytes.clone()),
+            DataTypeKind::Binary { len } => {
+                // MySQL STRING row framing omits trailing zero padding from
+                // BINARY values. Identity probes need the same fixed-width
+                // bytes that insert coercion writes to the heap.
+                let mut padded = bytes.clone();
+                padded.resize(padded.len().max(len.unwrap_or(1)), 0);
+                Value::Bytes(padded)
+            }
+            DataTypeKind::Blob { .. } | DataTypeKind::VarBinary { .. } => {
+                Value::Bytes(bytes.clone())
+            }
             // SET column: source ROW image is the raw little-endian bit
             // mask (1–8 bytes depending on `set_max_len`). Translate
             // bit positions into the comma-separated member list mydb
@@ -5216,6 +5461,23 @@ fn mysql_value_to_mydb(
                     *datatype,
                     *dim,
                 )?)
+            }
+            DataTypeKind::Char { .. } => {
+                // MySQL FULL images include CHAR padding; heap storage compacts
+                // it. Normalize before-images as well as inserted after-images.
+                let mut value = decode_replicated_string(bytes, target_charset)?;
+                match &mut value {
+                    Value::String(text) => {
+                        let len = crate::util::pad_space::trim_trailing_spaces_len(text.as_bytes());
+                        text.truncate(len);
+                    }
+                    Value::Bytes(bytes) => {
+                        let len = crate::util::pad_space::trim_trailing_spaces_len(bytes);
+                        bytes.truncate(len);
+                    }
+                    _ => {}
+                }
+                value
             }
             _ => decode_replicated_string(bytes, target_charset)?,
         },
@@ -5726,6 +5988,9 @@ fn parse_change_source_onto(
         cfg.channel = unquote_sql_value(body[pos + " FOR CHANNEL ".len()..].trim());
         body = body[..pos].trim();
     }
+    let mut endpoint_specified = false;
+    let mut file_specified = false;
+    let mut pos_specified = false;
     for part in split_top_level_commas(body) {
         let Some((raw_key, raw_value)) = part.split_once('=') else {
             return Err(error(
@@ -5736,8 +6001,12 @@ fn parse_change_source_onto(
         let key = raw_key.trim().to_ascii_uppercase();
         let value = unquote_sql_value(raw_value.trim());
         match key.as_str() {
-            "SOURCE_HOST" | "MASTER_HOST" => cfg.source_host = value,
+            "SOURCE_HOST" | "MASTER_HOST" => {
+                endpoint_specified = true;
+                cfg.source_host = value;
+            }
             "SOURCE_PORT" | "MASTER_PORT" => {
+                endpoint_specified = true;
                 cfg.source_port = value.parse().map_err(|_| {
                     error(
                         crate::error::catalog::ER_PARSE_ERROR,
@@ -5747,8 +6016,12 @@ fn parse_change_source_onto(
             }
             "SOURCE_USER" | "MASTER_USER" => cfg.source_user = value,
             "SOURCE_PASSWORD" | "MASTER_PASSWORD" => cfg.source_password = value,
-            "SOURCE_LOG_FILE" | "MASTER_LOG_FILE" => cfg.source_log_file = value,
+            "SOURCE_LOG_FILE" | "MASTER_LOG_FILE" => {
+                file_specified = true;
+                cfg.source_log_file = value;
+            }
             "SOURCE_LOG_POS" | "MASTER_LOG_POS" => {
+                pos_specified = true;
                 cfg.source_log_pos = value.parse().map_err(|_| {
                     error(
                         crate::error::catalog::ER_PARSE_ERROR,
@@ -5927,6 +6200,14 @@ fn parse_change_source_onto(
         }
     }
     validate_channel_name(&cfg.channel)?;
+    // Explicit endpoint changes discard coordinates from the previous source,
+    // as MySQL does even when the specified host/port has the same value.
+    if endpoint_specified && !file_specified {
+        cfg.source_log_file.clear();
+    }
+    if (endpoint_specified || file_specified) && !pos_specified {
+        cfg.source_log_pos = 4;
+    }
     Ok(cfg)
 }
 
@@ -6371,13 +6652,19 @@ fn io_error_is_fatal(error: &QueryError, marked_fatal: bool) -> bool {
 }
 
 fn source_error_message(err: &mysql::Error) -> String {
-    std::error::Error::source(err)
-        .map(ToString::to_string)
-        .unwrap_or_else(|| "Source protocol or value conversion failed".to_string())
+    err.to_string()
 }
 
 fn source_io_error(action: &str, err: mysql::Error) -> QueryError {
     match err {
+        mysql::Error::CodecError(
+            mysql_common::proto::codec::error::PacketCodecError::PacketTooLarge,
+        )
+        | mysql::Error::DriverError(mysql::DriverError::PacketTooLarge) => {
+            mark_io_error_fatal();
+            error(crate::error::catalog::ER_SOURCE_FATAL_ERROR_READING_BINLOG,
+                format!("{action} from source failed: binlog packet exceeds the 1 GiB replication protocol limit; reduce the source row image size"))
+        }
         mysql::Error::MySqlError(err) => {
             // A source ERR packet rejects this dump, rather than indicating a
             // transient socket failure. Preserve its diagnostics and stop IO.
@@ -6389,7 +6676,12 @@ fn source_io_error(action: &str, err: mysql::Error) -> QueryError {
                 )
             })
         }
-        mysql::Error::IoError(err) => error(
+        mysql::Error::DriverError(mysql::DriverError::Timeout) => error(
+            crate::error::catalog::CR_SERVER_LOST,
+            format!("{action} from source failed: operation timed out"),
+        ),
+        mysql::Error::CodecError(mysql_common::proto::codec::error::PacketCodecError::Io(err))
+        | mysql::Error::IoError(err) => error(
             crate::error::catalog::CR_SERVER_LOST,
             format!("{action} from source failed: {err}"),
         ),
@@ -6574,23 +6866,72 @@ fn strip_ctas_start_txn(sql: &str) -> Option<String> {
     Some(head)
 }
 
-fn strip_quotes(s: &str) -> &str {
-    s.trim_matches(|c: char| c == '`' || c == '"' || c == '\'')
-}
-
 fn split_qualified(token: &str, default_db: &str) -> (String, String) {
-    let token = strip_quotes(token);
-    if let Some((db, tbl)) = token.split_once('.') {
-        (
-            crate::storage::normalize_name(strip_quotes(db)),
-            crate::storage::normalize_name(strip_quotes(tbl)),
-        )
-    } else {
-        (
+    let mut cursor = crate::sql_lex::SqlTokenCursor::new(
+        token,
+        crate::sql_lex::SqlLexMode::default(),
+        crate::parser::MYSQL_VERSION_ID,
+    );
+    let mut parts = Vec::new();
+    while let Ok(Some(t)) = cursor.next() {
+        if matches!(t.kind, crate::sql_lex::SqlTokenKind::Symbol(b'.')) {
+            continue;
+        }
+        parts.push(
+            cursor
+                .decoded_quoted_text(&t)
+                .unwrap_or_else(|| cursor.token_text(&t).to_string()),
+        );
+    }
+    match parts.as_slice() {
+        [database, table] => (
+            crate::storage::normalize_name(database),
+            crate::storage::normalize_name(table),
+        ),
+        [table] => (
+            crate::storage::normalize_name(default_db),
+            crate::storage::normalize_name(table),
+        ),
+        _ => (
             crate::storage::normalize_name(default_db),
             crate::storage::normalize_name(token),
-        )
+        ),
     }
+}
+
+// Tokenize delimiters only outside quoted identifiers, preserving qualified
+// names even when whitespace surrounds the dot or a name contains punctuation.
+fn ddl_filter_tokens(sql: &str) -> Vec<String> {
+    let mut cursor = crate::sql_lex::SqlTokenCursor::new(
+        sql,
+        crate::sql_lex::SqlLexMode::default(),
+        crate::parser::MYSQL_VERSION_ID,
+    );
+    let mut tokens: Vec<String> = Vec::new();
+    let mut qualified = false;
+    while let Ok(Some(token)) = cursor.next() {
+        match token.kind {
+            crate::sql_lex::SqlTokenKind::Symbol(b'(' | b';' | b',') => {
+                qualified = false;
+            }
+            crate::sql_lex::SqlTokenKind::Symbol(b'.') => {
+                if let Some(last) = tokens.last_mut() {
+                    last.push('.');
+                    qualified = true;
+                }
+            }
+            _ => {
+                let text = cursor.token_text(&token);
+                if qualified {
+                    tokens.last_mut().unwrap().push_str(text);
+                    qualified = false;
+                } else {
+                    tokens.push(text.to_string());
+                }
+            }
+        }
+    }
+    tokens
 }
 
 /// Return every table target of a multi-target DDL — `DROP TABLE a, b, c`
@@ -6602,10 +6943,8 @@ fn split_qualified(token: &str, default_db: &str) -> (String, String) {
 /// applying the statement unconditionally rather than filtering it).
 fn extract_ddl_target_tables(sql: &str, default_db: &str) -> Vec<(String, String)> {
     let stripped = strip_leading_sql_comments(sql);
-    let tokens: Vec<&str> = stripped
-        .split(|c: char| c.is_whitespace() || c == '(' || c == ';' || c == ',')
-        .filter(|w| !w.is_empty())
-        .collect();
+    let owned_tokens = ddl_filter_tokens(&stripped);
+    let tokens: Vec<&str> = owned_tokens.iter().map(String::as_str).collect();
     if tokens.len() < 2 {
         return Vec::new();
     }
@@ -6672,10 +7011,8 @@ fn extract_ddl_target_tables(sql: &str, default_db: &str) -> Vec<(String, String
 
 fn extract_ddl_target_table(sql: &str, default_db: &str) -> Option<(String, String)> {
     let sql = strip_leading_sql_comments(sql);
-    let tokens: Vec<&str> = sql
-        .split(|c: char| c.is_whitespace() || c == '(' || c == ';' || c == ',')
-        .filter(|w| !w.is_empty())
-        .collect();
+    let owned_tokens = ddl_filter_tokens(&sql);
+    let tokens: Vec<&str> = owned_tokens.iter().map(String::as_str).collect();
     if tokens.len() < 2 {
         return None;
     }
@@ -6825,11 +7162,9 @@ fn decode_query_event_sql(
 /// Apply a `DdlSessionState` to the synthesized replica session so the
 /// downstream DDL sees the same effective session as the source.
 fn apply_ddl_session_state(session: &mut SessionContext, state: &DdlSessionState) {
-    if state.sql_mode != 0 {
-        session.sql_mode = crate::binlog::sql_mode_bits_to_str(state.sql_mode);
-        session.temporal_sql_mode_bits =
-            crate::engine::api::parse_temporal_sql_mode_bits(&session.sql_mode);
-    }
+    session.sql_mode = crate::binlog::sql_mode_bits_to_str(state.sql_mode);
+    session.temporal_sql_mode_bits =
+        crate::engine::api::parse_temporal_sql_mode_bits(&session.sql_mode);
     session.foreign_key_checks = state.foreign_key_checks;
     session.sysvars.unique_checks = state.unique_checks;
     if let Some(tz) = &state.time_zone {
@@ -6956,6 +7291,13 @@ fn env_csv(name: &str) -> Vec<String> {
 
 fn replication_dir(data_dir: &Path) -> PathBuf {
     crate::storage::naming::system_replication_dir(data_dir)
+}
+
+/// Native bootstrap can create this shared directory before Database::open.
+/// Use the same no-follow, server-owner and private-mode policy as channels.
+pub(crate) fn prepare_private_metadata_directory(data_dir: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(data_dir)?;
+    private_metadata::ChannelDirectory::prepare_replication(data_dir)
 }
 
 fn channel_tombstone(data_dir: &Path, channel: &str) -> PathBuf {
@@ -8003,6 +8345,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut status = ReplicationStatus::from_config(&cfg, tmp.path());
         status.running = true;
+        status.last_source_activity = Some(Instant::now());
         status.sql_running = true;
         status.source_log_file = "binlog.000001".into();
         status.exec_source_log_file = status.source_log_file.clone();
@@ -9534,6 +9877,7 @@ mod tests {
             io_join: Mutex::new(None),
             sql_join: Mutex::new(None),
             until: Mutex::new(None),
+            until_completed: AtomicBool::new(false),
             flush_policy: ReplicationFlushPolicy {
                 relay_sync_txns: 1,
                 ..ReplicationFlushPolicy::default()
@@ -9884,6 +10228,261 @@ mod tests {
         assert!(take_io_error_fatal());
     }
 
+    #[test]
+    fn audit1127_incremental_change_uses_executed_not_initial_or_read_ahead_position() {
+        let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let engine = Arc::new(StorageQueryEngine::open(dir.path()).unwrap());
+        let manager = ReplicationManager {
+            data_dir: dir.path().into(),
+            engine,
+            channels: Mutex::new(HashMap::new()),
+            retired_gtids: Mutex::new(None),
+        };
+        manager.change_source(parse_change_source("CHANGE REPLICATION SOURCE TO SOURCE_HOST='127.0.0.1',SOURCE_USER='r',SOURCE_LOG_FILE='bin.000001',SOURCE_LOG_POS=4").unwrap()).unwrap();
+        let runtime = manager.ensure_channel(DEFAULT_CHANNEL).unwrap();
+        {
+            let mut status = runtime.status.lock().unwrap();
+            status.exec_source_log_file = "bin.000002".into();
+            status.exec_source_log_pos = 500;
+            status.source_log_pos = 1000;
+        }
+        let base = manager.base_config_for_change(DEFAULT_CHANNEL);
+        let next = parse_change_source_onto(
+            "CHANGE REPLICATION SOURCE TO SOURCE_CONNECT_RETRY=2",
+            base.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            (&next.source_log_file, next.source_log_pos),
+            (&"bin.000002".into(), 500)
+        );
+        manager.change_source(next).unwrap();
+        assert_eq!(runtime.status.lock().unwrap().exec_source_log_pos, 500);
+        let endpoint = parse_change_source_onto(
+            "CHANGE REPLICATION SOURCE TO SOURCE_HOST='127.0.0.1'",
+            base.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            (endpoint.source_log_file, endpoint.source_log_pos),
+            (String::new(), 4)
+        );
+        let file = parse_change_source_onto(
+            "CHANGE REPLICATION SOURCE TO SOURCE_LOG_FILE='bin.000003'",
+            base,
+        )
+        .unwrap();
+        assert_eq!(file.source_log_pos, 4);
+    }
+
+    #[test]
+    fn audit1127_quoted_ddl_targets_are_not_split_at_identifier_punctuation() {
+        assert_eq!(
+            extract_ddl_target_tables("DROP TABLE `d.b` . `a,b`, `d b`.`a b`", "test"),
+            vec![("d.b".into(), "a,b".into()), ("d b".into(), "a b".into())]
+        );
+        assert_eq!(
+            extract_ddl_target_tables("RENAME TABLE `d`.`a,b` TO `d`.`a`` b`", "test"),
+            vec![("d".into(), "a,b".into()), ("d".into(), "a` b".into())]
+        );
+    }
+
+    #[test]
+    fn audit1127_legacy_temporal_rows_fail_before_lossy_value_conversion() {
+        for (wire_type, sql_type, raw_value) in [
+            (7u8, "TIMESTAMP", 1700000000u32.to_le_bytes().to_vec()),
+            (11u8, "TIME", vec![0x40, 0x9a, 0x4c]),
+        ] {
+            let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+            let engine = Arc::new(StorageQueryEngine::open(dir.path()).unwrap());
+            engine
+                .execute(&format!("CREATE TABLE legacy(v {sql_type})"))
+                .unwrap();
+            let (_, runner) = make_split_runner(dir.path(), engine);
+            let mut map_body = 1u64.to_le_bytes()[..6].to_vec();
+            map_body.extend_from_slice(&[0, 0, 4]);
+            map_body.extend_from_slice(b"test\0");
+            map_body.extend_from_slice(&[6]);
+            map_body.extend_from_slice(b"legacy\0");
+            map_body.extend_from_slice(&[1, wire_type, 0, 1]);
+            let mut reader = EventStreamReader::new(BinlogVersion::Version4);
+            let map_event = reader
+                .read(&test_event_bytes(EventType::TABLE_MAP_EVENT, 80, map_body)[..])
+                .unwrap()
+                .unwrap();
+            let mysql::binlog::events::EventData::TableMapEvent(map) =
+                map_event.read_data().unwrap().unwrap()
+            else {
+                panic!("table map")
+            };
+            let mut row_body = 1u64.to_le_bytes()[..6].to_vec();
+            row_body.extend_from_slice(&[1, 0, 2, 0, 1, 1, 0]);
+            row_body.extend_from_slice(&raw_value);
+            let row_event = reader
+                .read(&test_event_bytes(EventType::WRITE_ROWS_EVENT, 100, row_body)[..])
+                .unwrap()
+                .unwrap();
+            let mysql::binlog::events::EventData::RowsEvent(rows) =
+                row_event.read_data().unwrap().unwrap()
+            else {
+                panic!("rows")
+            };
+            let err = runner.convert_rows_event(rows, &map).unwrap_err();
+            assert_eq!(err.code(), 1235);
+            assert!(err.message().contains("legacy pre-MySQL-5.6"));
+        }
+    }
+
+    #[test]
+    fn audit1127_full_enum_set_metadata_rejects_member_reordering() {
+        let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let engine = StorageQueryEngine::open(dir.path()).unwrap();
+        engine
+            .execute("CREATE TABLE enums(e ENUM('a','b'),s SET('x','y'))")
+            .unwrap();
+        let db = engine.database_for_replication();
+        let target = db.table("test.enums").unwrap();
+        let mut body = 1u64.to_le_bytes()[..6].to_vec();
+        body.extend_from_slice(&[0, 0, 4]);
+        body.extend_from_slice(b"test\0");
+        body.extend_from_slice(&[1, b't', 0, 2, 254, 254, 4, 247, 1, 248, 1, 0]);
+        body.extend_from_slice(&[6, 5, 2, 1, b'a', 1, b'b', 5, 5, 2, 1, b'x', 1, b'y']);
+        let bytes = test_event_bytes(EventType::TABLE_MAP_EVENT, 80, body);
+        let mut reader = EventStreamReader::new(BinlogVersion::Version4);
+        let event = reader.read(&bytes[..]).unwrap().unwrap();
+        let mysql::binlog::events::EventData::TableMapEvent(map) =
+            event.read_data().unwrap().unwrap()
+        else {
+            panic!("table map")
+        };
+        validate_enum_set_metadata(&map, &target, &[0, 1]).unwrap();
+        let mut drift = (*target).clone();
+        drift.columns[0].data_type = DataTypeKind::Enum {
+            values: vec!["b".into(), "a".into()],
+        };
+        assert!(validate_enum_set_metadata(&map, &drift, &[0, 1])
+            .unwrap_err()
+            .message()
+            .contains("members differ"));
+    }
+
+    #[test]
+    fn audit1127_keyless_char_binary_images_match_hash_and_scan() {
+        let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let engine = StorageQueryEngine::open(dir.path()).unwrap();
+        engine
+            .execute("CREATE TABLE keyless(a CHAR(5),b BINARY(4),c INT)")
+            .unwrap();
+        let db = engine.database_for_replication();
+        let schema = db.table("test.keyless").unwrap();
+        let padded = vec![
+            Value::String("abc  ".into()),
+            Value::Bytes(b"AB\0\0".to_vec()),
+            Value::Int(1),
+        ];
+        let txn = db.begin_txn().unwrap();
+        apply_write_rows(
+            db,
+            txn,
+            "test",
+            "keyless",
+            &[padded.clone(), padded.clone()],
+        )
+        .unwrap();
+        db.commit_txn(txn.txn_id).unwrap();
+        let mut wire_before = padded.clone();
+        wire_before[1] = mysql_value_to_mydb(
+            &mysql::Value::Bytes(b"AB".to_vec()),
+            &DataTypeKind::Binary { len: Some(4) },
+            false,
+            None,
+        )
+        .unwrap();
+        let txn = db.begin_txn().unwrap();
+        assert!(find_matching_row(db, txn, &schema, &wire_before)
+            .unwrap()
+            .is_some());
+        let mut hash =
+            KeylessRowIndex::build(db, txn, &schema, [padded.as_slice(), padded.as_slice()])
+                .unwrap();
+        let first = hash.take_match(&padded).unwrap();
+        let second = hash.take_match(&padded).unwrap();
+        assert_ne!(first, second);
+        assert!(hash.take_match(&padded).is_none());
+        apply_delete_rows(db, txn, "test", "keyless", &[padded.clone(), padded]).unwrap();
+        db.commit_txn(txn.txn_id).unwrap();
+    }
+
+    #[test]
+    fn audit1127_until_stops_at_or_beyond_numeric_file_position() {
+        let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let engine = Arc::new(StorageQueryEngine::open(dir.path()).unwrap());
+        let (runtime, runner) = make_split_runner(dir.path(), engine);
+        *runtime.until.lock().unwrap() = Some(UntilCondition::Position {
+            file: "bin.999999".into(),
+            pos: 500,
+        });
+        assert!(!runner.until_should_stop_after("bin.999999", 499, None));
+        assert!(runner.until_should_stop_after("bin.999999", 500, None));
+        assert!(runner.until_should_stop_after("bin.1000000", 4, None));
+        {
+            let mut status = runtime.status.lock().unwrap();
+            status.exec_source_log_file = "bin.1000000".into();
+            status.exec_source_log_pos = 4;
+        }
+        runner.sql_apply_available(0).unwrap();
+        assert!(runtime.stop.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn audit1127_packet_too_large_is_fatal_and_actionable() {
+        take_io_error_fatal();
+        let err = source_io_error(
+            "read binlog event",
+            mysql::Error::CodecError(
+                mysql_common::proto::codec::error::PacketCodecError::PacketTooLarge,
+            ),
+        );
+        assert_eq!(err.code(), 1236);
+        assert!(err.message().contains("1 GiB"));
+        assert!(take_io_error_fatal());
+    }
+
+    #[test]
+    fn audit1127_char_images_are_compacted_without_changing_binary_padding() {
+        let c = mysql_value_to_mydb(
+            &mysql::Value::Bytes(b"abc  ".to_vec()),
+            &DataTypeKind::Char { len: Some(5) },
+            false,
+            Some("utf8mb4"),
+        )
+        .unwrap();
+        assert_eq!(c, Value::String("abc".into()));
+        let b = mysql_value_to_mydb(
+            &mysql::Value::Bytes(vec![0, 255, 0, 0]),
+            &DataTypeKind::Binary { len: Some(4) },
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(b, Value::Bytes(vec![0, 255, 0, 0]));
+        assert_eq!(
+            mysql_value_to_mydb(
+                &mysql::Value::Bytes(b"AB".to_vec()),
+                &DataTypeKind::Binary { len: Some(4) },
+                false,
+                None
+            )
+            .unwrap(),
+            Value::Bytes(b"AB\0\0".to_vec())
+        );
+
+        assert_ne!(
+            image_match_value(&Value::Null, false),
+            image_match_value(&Value::String("NULL".into()), false)
+        );
+    }
+
     fn make_split_runner_with_policy(
         dir: &Path,
         engine: Arc<StorageQueryEngine>,
@@ -9901,6 +10500,7 @@ mod tests {
             io_join: Mutex::new(None),
             sql_join: Mutex::new(None),
             until: Mutex::new(None),
+            until_completed: AtomicBool::new(false),
             flush_policy,
             relay_writer: Mutex::new(None),
             relay_sync: Mutex::new(RelaySyncState::default()),
@@ -10707,6 +11307,7 @@ mod tests {
             io_join: Mutex::new(None),
             sql_join: Mutex::new(None),
             until: Mutex::new(None),
+            until_completed: AtomicBool::new(false),
             flush_policy: ReplicationFlushPolicy {
                 relay_sync_txns: 1,
                 ..ReplicationFlushPolicy::default()
@@ -10844,6 +11445,7 @@ mod tests {
         out
     }
     include!("replication_audit_1028_tests.rs");
+    include!("replication_audit_1128_tests.rs");
 }
 
 fn poisoned_lock(message: &str) -> QueryError {

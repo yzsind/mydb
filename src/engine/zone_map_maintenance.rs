@@ -10,6 +10,7 @@ use crate::storage::Database;
 pub struct ZoneMapMaintenanceHandle {
     worker: BackgroundWorker,
     recyclebin_worker: BackgroundWorker,
+    retirement_worker: BackgroundWorker,
 }
 
 impl ZoneMapMaintenanceHandle {
@@ -17,6 +18,7 @@ impl ZoneMapMaintenanceHandle {
         Self {
             worker: BackgroundWorker::disabled(),
             recyclebin_worker: BackgroundWorker::disabled(),
+            retirement_worker: BackgroundWorker::disabled(),
         }
     }
 
@@ -41,6 +43,34 @@ impl ZoneMapMaintenanceHandle {
                 });
             }
         });
+        let retirement_db = Arc::clone(&db);
+        let retirement_worker = BackgroundWorker::spawn("mydb-ddl-retirement", move |shutdown| {
+            crate::util::thread_priority::lower_current_thread_priority();
+            let _reclaim = super::executor::mem_budget::ReclaimDatabaseScope::enter(&retirement_db);
+            while !shutdown.wait_timeout(Duration::from_secs(10)) {
+                let Some(_write) = crate::repl::background_write_permit() else {
+                    continue;
+                };
+                let deadline = std::time::Instant::now() + Duration::from_millis(50);
+                run_maintenance_task("catalog retirement cleanup", || {
+                    let completed = retirement_db.maintain_catalog_retirements_until(|| {
+                        shutdown.is_requested() || std::time::Instant::now() >= deadline
+                    })?;
+                    // Drain a large backlog in bounded passes without waiting
+                    // for the idle retry interval between full batches.
+                    if completed >= 64 || std::time::Instant::now() >= deadline {
+                        shutdown.request_wake();
+                    }
+                    Ok(completed)
+                });
+            }
+        });
+        let retirement_signal = retirement_worker.weak_signal();
+        db.set_catalog_retirement_waker(move || {
+            if let Some(signal) = retirement_signal.upgrade() {
+                signal.request_wake();
+            }
+        });
         let worker = BackgroundWorker::spawn("mydb-zone-map", move |worker_shutdown| {
             // Rebuilds rescan whole zones. After a bulk load that backlog can
             // keep this thread busy for minutes; it must not take CPU from
@@ -58,9 +88,6 @@ impl ZoneMapMaintenanceHandle {
                 run_maintenance_task("partition cleanup", || {
                     db.maintain_partition_cleanup_until(|| worker_shutdown.is_requested())
                 });
-                run_maintenance_task("catalog retirement cleanup", || {
-                    db.maintain_catalog_retirements_until(|| worker_shutdown.is_requested())
-                });
                 run_maintenance_task("zone-map maintenance", || {
                     db.maintain_zone_maps_round_until(|| worker_shutdown.is_requested())
                 });
@@ -69,11 +96,13 @@ impl ZoneMapMaintenanceHandle {
         Self {
             worker,
             recyclebin_worker,
+            retirement_worker,
         }
     }
 
     pub fn shutdown(&self) {
         self.recyclebin_worker.shutdown();
+        self.retirement_worker.shutdown();
         self.worker.shutdown();
     }
 }

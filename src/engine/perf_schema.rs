@@ -1997,9 +1997,9 @@ fn replication_connection_status_rows() -> Vec<Vec<Value>> {
     };
     let mut rows = Vec::new();
     for (_cfg, st) in mgr.snapshot_all_channels() {
-        let service_state = if st.running {
+        let service_state = if st.io_connected() {
             "ON"
-        } else if st.configured {
+        } else if st.running {
             "CONNECTING"
         } else {
             "OFF"

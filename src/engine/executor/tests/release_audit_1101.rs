@@ -455,7 +455,7 @@ fn regex_preserves_binary_and_matches_sql_search_regions() {
     }
     assert_eq!(
         rows(&engine, "SELECT REGEXP_SUBSTR('abc','^b',2)")[0][0],
-        Value::Null
+        Value::String("b".into())
     );
     assert_eq!(
         rows(&engine, "SELECT REGEXP_SUBSTR('abc','$',4)")[0][0],
@@ -684,7 +684,7 @@ fn fulltext_backfill_preserves_the_same_word_positions_as_dml() {
 }
 
 #[test]
-fn partitioned_spatial_add_rejects_unsupported_backend_and_preserves_copy() {
+fn partitioned_spatial_add_builds_leaf_indexes_and_preserves_copy() {
     let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
     let engine = open_test_engine(dir.path());
     engine.execute("CREATE TABLE pg(id INT PRIMARY KEY,g GEOMETRY NOT NULL) PARTITION BY HASH(id) PARTITIONS 2").unwrap();
@@ -695,10 +695,15 @@ fn partitioned_spatial_add_rejects_unsupported_backend_and_preserves_copy() {
         "CREATE SPATIAL INDEX s ON pg(g)",
         "ALTER TABLE pg ADD SPATIAL INDEX s(g)",
     ] {
-        assert_eq!(engine.execute(sql).unwrap_err().code(), 1235);
+        engine.execute(sql).unwrap();
         let schema = engine.db_handle().table("test.pg").unwrap();
-        assert!(!schema.indexes.iter().any(|i| i.name == "s"));
+        assert!(schema
+            .indexes
+            .iter()
+            .any(|i| i.name == "s" && i.is_spatial()));
         assert!(schema.column_index("extra").is_err());
+        assert_eq!(rows(&engine,"SELECT id FROM pg WHERE MBRContains(ST_GeomFromText('POLYGON((0 0,3 0,3 3,0 3,0 0))'),g) ORDER BY id"),vec![vec![Value::Int(1)],vec![Value::Int(2)]]);
+        engine.execute("DROP INDEX s ON pg").unwrap();
     }
     // COPY constructs fresh partition-local files through the inline path;
     // it already supports this shape and must not be rejected globally.

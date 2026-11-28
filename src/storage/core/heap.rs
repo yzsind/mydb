@@ -6103,6 +6103,7 @@ impl HeapFile {
         Ok(true)
     }
 
+    #[cfg(test)]
     fn flush_dirty_pages(&self) -> Result<(), QueryError> {
         if self.durability() == DurabilityMode::Memory {
             return Ok(());

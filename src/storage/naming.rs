@@ -59,21 +59,36 @@ pub fn table_key(database: &str, table: &str) -> String {
     }
 }
 
+// Encode component boundaries for all schema object namespaces. The common
+// delimiter-free case retains its compact representation.
+fn object_key(parts: &[&str]) -> String {
+    if parts.iter().any(|part| part.contains(':')) {
+        let mut key = String::from("\0");
+        for part in parts {
+            let part = normalize_name(part);
+            use std::fmt::Write;
+            write!(&mut key, "{}:{part}", part.len()).unwrap();
+        }
+        key
+    } else {
+        parts
+            .iter()
+            .map(|part| normalize_name(part))
+            .collect::<Vec<_>>()
+            .join(":")
+    }
+}
+
 pub fn routine_key(database: &str, kind: &str, name: &str) -> String {
-    format!(
-        "{}:{}:{}",
-        normalize_name(database),
-        kind.to_ascii_lowercase(),
-        normalize_name(name)
-    )
+    object_key(&[database, kind, name])
 }
 
 pub fn trigger_key(database: &str, name: &str) -> String {
-    format!("{}:{}", normalize_name(database), normalize_name(name))
+    object_key(&[database, name])
 }
 
 pub fn event_key(database: &str, name: &str) -> String {
-    format!("{}:{}", normalize_name(database), normalize_name(name))
+    object_key(&[database, name])
 }
 
 pub(crate) fn normalize_table_key(current_database: &str, name: &str) -> String {
@@ -598,4 +613,16 @@ mod report1107_tests {
         }
         assert_ne!(table_key("d.e", "f"), table_key("d", "e.f"));
     }
+}
+
+#[cfg(test)]
+#[test]
+fn audit1127_object_key_boundaries_are_injective() {
+    assert_ne!(trigger_key("x:a", "b"), trigger_key("x", "a:b"));
+    assert_ne!(event_key("x:a", "b"), event_key("x", "a:b"));
+    assert_ne!(
+        routine_key("x:procedure", "procedure", "b"),
+        routine_key("x", "procedure", "procedure:b")
+    );
+    assert_eq!(trigger_key("X:A", "B"), trigger_key("x:a", "b"));
 }

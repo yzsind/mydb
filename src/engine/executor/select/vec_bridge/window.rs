@@ -312,6 +312,7 @@ impl BatchOperator for WindowBatchOperator<'_> {
                             order_by: window.order_by.clone(),
                             frame: window.frame.clone(),
                             inherits: None,
+                            direct_reference: false,
                         }),
                     };
                     window_values[window_index] = evaluate_window_with_partitions(

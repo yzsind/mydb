@@ -29,7 +29,7 @@ filter = 'test(quantized_hnsw_parallel_paged_image_survives_restart_and_dml)'
 test-group = 'parallel-vector-builds'
 
 [[profile.default.overrides]]
-filter = 'test(/engine::executor::tests::(vector_datatypes|vector_quantization)::/)'
+filter = 'test(/engine::executor::tests::(vector_datatypes|vector_quantization|vector_online_ddl|copy_file_publication)::/)'
 test-group = 'persistence'
 
 # Overlap the multilevel directory fixture with final archive cleanup.

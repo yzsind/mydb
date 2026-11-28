@@ -16,6 +16,7 @@ Shows the thread, source, position, GTID, filter, and error state of a MySQL→m
 - When the manager is not initialized, a canonical empty result set is returned, matching a fresh-server probe.
 - The legacy spelling uses Slave_*/Master_* column names and produces a deprecation warning.
 - The replica receiver is included in every build.
+- `Replica_IO_Running` reports `Connecting` while the IO thread is reconnecting or source activity is stale. `Seconds_Behind_Source` is NULL when the connection cannot establish current lag or the SQL thread is stopped. A successful stream reconnect clears the previous IO error; SQL errors remain independent.
 
 ## Privileges, Results, and Operational Details
 

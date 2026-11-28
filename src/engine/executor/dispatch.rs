@@ -3557,18 +3557,6 @@ pub(super) fn execute_statement_with_qualification(
     }
 }
 
-/// Public re-exportable wrapper used by the event scheduler so it can
-/// drive the full dispatch pipeline without exposing the inner module
-/// as `pub`.
-pub(super) fn dispatch_execute_statement(
-    db: &Arc<Database>,
-    session: &mut SessionContext,
-    statement: Statement,
-    registry: &SessionRegistry,
-) -> Result<QueryResponse, QueryError> {
-    execute_statement(db, session, statement, registry)
-}
-
 pub(super) fn account_key(account: &AccountIdent) -> AccountKey {
     AccountKey::new(account.user.clone(), account.host.clone())
 }
@@ -6110,6 +6098,7 @@ fn execute_table_maintenance_status(
                 if op == "check" {
                     let mut problems = db.check_table_lob_integrity(&schema);
                     problems.extend(db.check_table_index_integrity(&schema));
+                    crate::engine::cancel::check_cancelled()?;
                     if problems.is_empty() {
                         rows.push(vec![
                             Value::String(qualified),
@@ -7733,37 +7722,44 @@ pub(super) fn execute_sql_prepare(
     if let Statement::Select(select) = &validation_statement {
         crate::engine::executor::select::warn_prepared_select_temporal_constants(db, select);
     }
-    let result_columns: Arc<[crate::types::Column]> =
-        crate::engine::executor::select::aggregate::with_group_concat_max_len(
-            session.group_concat_max_len,
-            || {
-                crate::engine::expr::with_session_expr_info(session, || {
-                    // The new statement's placeholders must not see parameters
-                    // belonging to the surrounding PREPARE command.
-                    crate::engine::params::with_params(Vec::new(), || {
-                        let mut columns = super::select::describe_statement_columns(
-                            db,
-                            session,
-                            &validation_statement,
-                        )?;
-                        if let Statement::Select(select) = &validation_statement {
-                            if select.projection.len() == columns.len() {
-                                for (item, column) in select.projection.iter().zip(&mut columns) {
-                                    if let crate::parser::SelectItem::Expr { expr, .. } = item {
-                                        column.source.dynamic_parameter |=
-                                            crate::engine::expr::xml::parameter_dependent_result(
-                                                expr,
-                                            );
-                                    }
+    let numeric_context = super::prepared_numeric::bind(db, session, &statement)?;
+    let saved_precision = session.prepared_div_precision_increment;
+    let saved_types = session.prepared_numeric_parameter_types.take();
+    session.prepared_div_precision_increment =
+        numeric_context.as_ref().map(|context| context.precision);
+    session.prepared_numeric_parameter_types = numeric_context
+        .as_ref()
+        .and_then(|context| context.parameters.clone());
+    let result_columns = crate::engine::executor::select::aggregate::with_group_concat_max_len(
+        session.group_concat_max_len,
+        || {
+            crate::engine::expr::with_session_expr_info(session, || {
+                // The new statement's placeholders must not see parameters
+                // belonging to the surrounding PREPARE command.
+                crate::engine::params::with_params(Vec::new(), || {
+                    let mut columns = super::select::describe_statement_columns(
+                        db,
+                        session,
+                        &validation_statement,
+                    )?;
+                    if let Statement::Select(select) = &validation_statement {
+                        if select.projection.len() == columns.len() {
+                            for (item, column) in select.projection.iter().zip(&mut columns) {
+                                if let crate::parser::SelectItem::Expr { expr, .. } = item {
+                                    column.source.dynamic_parameter |=
+                                        crate::engine::expr::xml::parameter_dependent_result(expr);
                                 }
                             }
                         }
-                        Ok(columns)
-                    })
+                    }
+                    Ok(columns)
                 })
-            },
-        )?
-        .into();
+            })
+        },
+    );
+    session.prepared_div_precision_increment = saved_precision;
+    session.prepared_numeric_parameter_types = saved_types;
+    let result_columns: Arc<[crate::types::Column]> = result_columns?.into();
     let result_column_bytes = result_columns.iter().fold(0usize, |total, column| {
         total
             .saturating_add(std::mem::size_of::<crate::types::Column>())
@@ -7795,6 +7791,7 @@ pub(super) fn execute_sql_prepare(
     session.insert_sql_prepared_statement(
         key,
         crate::engine::api::SessionSqlPreparedStatement {
+            numeric_context,
             xml_parameter_types: crate::engine::expr::xml::parameter_history(
                 &sql,
                 parameter_count,
@@ -7823,7 +7820,7 @@ fn execute_sql_prepared(
     name: &str,
     using: &[String],
 ) -> Result<QueryResponse, QueryError> {
-    let prepared = session
+    let mut prepared = session
         .sql_prepared_statements
         .get(&name.to_ascii_lowercase())
         .cloned()
@@ -7845,7 +7842,7 @@ fn execute_sql_prepared(
             "Incorrect arguments to EXECUTE",
         ));
     }
-    let params = using
+    let mut params = using
         .iter()
         .map(|name| session.user_variable(name).cloned().unwrap_or(Value::Null))
         .collect::<Vec<_>>();
@@ -7873,18 +7870,50 @@ fn execute_sql_prepared(
             }
         }
     }
-    let mut response = crate::engine::params::with_params(params, || {
-        let execute = || execute_statement(db, session, statement, registry);
-        match int_div_context {
-            Some(context) => crate::engine::expr::with_integer_overflow_context(context, execute),
-            None => execute(),
+    let saved_precision = session.prepared_div_precision_increment;
+    let saved_parameter_types = session.prepared_numeric_parameter_types.take();
+    let mut response = (|| {
+        session.prepared_div_precision_increment = super::prepared_numeric::refresh(
+            db,
+            session,
+            &prepared.statement,
+            &mut prepared.numeric_context,
+        )?;
+        if let Some(context) = prepared.numeric_context.as_mut() {
+            context.bind_parameters(session, &mut params)?;
+            session.prepared_div_precision_increment = Some(context.precision);
+            session.prepared_numeric_parameter_types = context.parameters.clone();
         }
-    });
+        crate::engine::params::with_params(params, || {
+            let execute = || {
+                super::execute_child_statement(
+                    db,
+                    session,
+                    statement,
+                    registry,
+                    &prepared.original_sql,
+                )
+            };
+            match int_div_context {
+                Some(context) => {
+                    crate::engine::expr::with_integer_overflow_context(context, execute)
+                }
+                None => execute(),
+            }
+        })
+    })();
+    session.prepared_div_precision_increment = saved_precision;
+    session.prepared_numeric_parameter_types = saved_parameter_types;
+    session.update_sql_prepared_numeric_context(name, prepared.numeric_context.clone());
     session.current_database = saved_database;
     session.xml_parameter_types = saved_xml_types;
     session.xml_parameter_binding = saved_xml_binding;
     if let Ok(result) = &mut response {
         if !prepared.routine_result_metadata
+            && !prepared
+                .numeric_context
+                .as_ref()
+                .is_some_and(|context| context.parameter_reprepared)
             && prepared.result_catalog_epoch == db.catalog_publication_epoch()
         {
             apply_sql_prepared_result_columns(result, &prepared.result_columns);
@@ -8730,7 +8759,7 @@ pub(super) fn execute_qualified_statement(
             let online_index_only = stmt.partition_actions.is_empty()
                 && stmt.algorithm != AlterAlgorithm::Copy
                 && matches!(stmt.lock, AlterLock::None | AlterLock::Default)
-                && stmt.actions.iter().all(|a| matches!(a, AlterAction::AddIndex(i) if i.index_type.eq_ignore_ascii_case("BTREE")));
+                && stmt.actions.iter().all(|a| matches!(a, AlterAction::AddIndex(i) if Database::online_index_type_supported(&i.index_type)));
             if !has_copy_required_action
                 && !online_index_only
                 && stmt.actions.len() + stmt.partition_actions.len() > 1
@@ -8782,7 +8811,7 @@ pub(super) fn execute_qualified_statement(
                     .actions
                     .iter()
                     .all(|a| matches!(a, AlterAction::AddIndex(_)));
-            if stmt.lock == AlterLock::None && (!all_add_index || stmt.actions.iter().any(|a| matches!(
+            if stmt.lock == AlterLock::None && !online_type_copy && (!all_add_index || stmt.actions.iter().any(|a| matches!(
                 a, AlterAction::AddIndex(i) if !i.index_type.eq_ignore_ascii_case("BTREE")
             ))) && stmt.actions.iter().any(|a| matches!(
                 a, AlterAction::AddIndex(i) if i.name.as_deref().is_some_and(|n| n.eq_ignore_ascii_case("PRIMARY"))
@@ -8864,6 +8893,16 @@ pub(super) fn execute_qualified_statement(
             } else if fused_physical_copy {
                 // One candidate schema, one source scan, one index fan-out and
                 // one generation publish already completed above.
+            } else if alter_plan.online_drop_column {
+                let [AlterAction::DropColumn(column)] = stmt.actions.as_slice() else {
+                    unreachable!("online DROP COLUMN has one action")
+                };
+                db.drop_column_online(
+                    &table_name,
+                    column,
+                    session.connection_id as u64,
+                    stmt.lock,
+                )?;
             } else if all_add_index {
                 let mut indexes = Vec::with_capacity(stmt.actions.len());
                 for action in stmt.actions {
@@ -9475,22 +9514,17 @@ pub(super) fn execute_qualified_statement(
                         .map(|name| {
                             let (d, t) =
                                 crate::storage::split_table_name(&session.current_database, name);
-                            format!("`{d}`.`{t}`")
+                            format!("`{}`.`{}`", d.replace('`', "``"), t.replace('`', "``"))
                         })
                         .collect::<Vec<_>>()
                         .join(", ");
                     let sql = format!("DROP TABLE {if_exists_clause}{list}");
                     let ctx = super::binlog_ctx_from_session(session);
-                    if let Err(err) = crate::binlog::record_ddl_autocommit_with(
+                    crate::binlog::record_ddl_autocommit_with(
                         &session.current_database,
                         &sql,
                         &ctx,
-                    ) {
-                        crate::engine::api::push_statement_condition(
-                            crate::error::ConditionLevel::Warning,
-                            &err,
-                        );
-                    }
+                    )?;
                 }
             }
             if !temp_names.is_empty() {
@@ -9551,11 +9585,11 @@ pub(super) fn execute_qualified_statement(
                 ));
             }
             if matches!(stmt.lock, AlterLock::None | AlterLock::Shared)
-                && !stmt.index_type.eq_ignore_ascii_case("BTREE")
+                && !Database::online_index_type_supported(&stmt.index_type)
             {
                 return Err(error(
                     crate::error::catalog::ER_ALTER_OPERATION_NOT_SUPPORTED_REASON,
-                    "LOCK=NONE/SHARED requires a BTREE index",
+                    "LOCK=NONE/SHARED requires a BTREE, FULLTEXT, SPATIAL, HNSW or IVF index",
                 ));
             }
             if is_session_temp_table_ref(session, &stmt.table) {
@@ -10683,9 +10717,7 @@ pub(super) fn execute_qualified_statement(
         Statement::FlushLogs { kind } => {
             implicit_commit_for_ddl(db, session)?;
             if kind == crate::engine::logging::FlushLogKind::All {
-                if let Some(manager) = crate::binlog::manager() {
-                    manager.rotate()?;
-                }
+                crate::binlog::rotate_binary_logs_if_enabled()?;
             }
             if let Some(service) = crate::engine::logging::active_service() {
                 service.flush(kind)?;
@@ -11403,6 +11435,7 @@ mod window_cancellation_tests {
                 order_by: vec![],
                 frame: None,
                 inherits: None,
+                direct_reference: false,
             }),
         };
         let rows = vec![vec![Value::Int(1)]; 1024];
