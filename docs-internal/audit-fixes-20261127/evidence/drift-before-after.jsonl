@@ -1,2 +1,0 @@
-{"port": 14980, "rows": [{"e": "b", "s": "y"}], "error": "", "errno": 0}
-{"port": 14992, "rows": [], "error": "schema mismatch for replicated column drift1127new.t.s: source and target ENUM/SET members differ; align schemas before restarting replication", "errno": 1235}

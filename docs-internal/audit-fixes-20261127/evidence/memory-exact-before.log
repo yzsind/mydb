@@ -1,4 +1,0 @@
-0 (1037, 'process memory pressure limit exceeded: tried to allocate 196 bytes, used 16499654136 / 13743895347; reclaim before 1037 released cache=0 buffer=0 allocator=0 bytes, controlled=4334590 / sql_hard_limit=13743895347; reservation site=src/engine/executor/spill_quota/manifest.rs:72') 32.671538041
-recovered ((8000,),)
-1 (1317, 'Query execution was interrupted') 33.89692204200001
-recovered ((8000,),)

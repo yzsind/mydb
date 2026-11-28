@@ -1,5 +1,0 @@
-{"label": "keyless-after-update", "Source_Log_File": "binlog.000008", "Read_Source_Log_Pos": 1303, "Relay_Source_Log_File": "binlog.000008", "Replica_IO_Running": "Yes", "Replica_SQL_Running": "Yes", "Exec_Source_Log_Pos": 1303, "Last_IO_Errno": 0, "Last_IO_Error": "", "Last_SQL_Errno": 0, "Last_SQL_Error": ""}
-{"label": "change-no-coordinate", "Source_Log_File": "binlog.000008", "Read_Source_Log_Pos": 1609, "Relay_Source_Log_File": "binlog.000008", "Replica_IO_Running": "No", "Replica_SQL_Running": "No", "Exec_Source_Log_Pos": 1609, "Last_IO_Errno": 0, "Last_IO_Error": "", "Last_SQL_Errno": 0, "Last_SQL_Error": ""}
-previous-exec 1609
-{"label": "large-update-72MB", "Source_Log_File": "binlog.000009", "Read_Source_Log_Pos": 108001379, "Relay_Source_Log_File": "binlog.000009", "Replica_IO_Running": "Yes", "Replica_SQL_Running": "Yes", "Exec_Source_Log_Pos": 108001379, "Last_IO_Errno": 0, "Last_IO_Error": "", "Last_SQL_Errno": 0, "Last_SQL_Error": ""}
-rows [{'HEX(a)': '616263', 'HEX(b)': '00FF0A0D', 'c': 10}]
