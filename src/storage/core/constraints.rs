@@ -1416,7 +1416,10 @@ fn coerce_column_value_for_schema(
             .default
             .as_ref()
             .is_some_and(|default| matches!(default, Value::Bytes(bytes) if bytes.is_empty()));
-        if already_stored_sentinel || schema_default_sentinel {
+        if already_stored_sentinel
+            || schema_default_sentinel
+            || crate::replication::replication_applier_active()
+        {
             return Ok(enum_zero_value());
         }
     }

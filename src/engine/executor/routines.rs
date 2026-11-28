@@ -3632,6 +3632,7 @@ fn exec_stmt(
                             session,
                             registry,
                             retry_statement()?,
+                            "",
                             &[],
                             usize::MAX,
                             frame.forbid_transaction_control,
@@ -4143,6 +4144,7 @@ fn exec_stmt(
                     session,
                     registry,
                     (*prepared.statement).clone(),
+                    &prepared.original_sql,
                     &params,
                     usize::MAX,
                     frame.forbid_transaction_control,
@@ -4556,6 +4558,7 @@ fn execute_sql_in_routine(
             session,
             registry,
             statement,
+            sql,
             &bound_params,
             if used_parameterized_template {
                 0
@@ -4628,6 +4631,7 @@ fn execute_parsed_statement_in_routine(
     session: &mut SessionContext,
     registry: &SessionRegistry,
     statement: crate::parser::Statement,
+    source_sql: &str,
     params: &[Value],
     internal_param_start: usize,
     forbid_transaction_control: bool,
@@ -4672,7 +4676,9 @@ fn execute_parsed_statement_in_routine(
                                 }
                             },
                         };
-                        match super::dispatch::execute_statement(db, session, statement, registry) {
+                        match super::execute_child_statement(
+                            db, session, statement, registry, source_sql,
+                        ) {
                             Err(err) if super::is_lock_wait_pending(&err) => {
                                 waited = true;
                                 if crate::engine::http::sent() {

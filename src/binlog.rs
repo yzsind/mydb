@@ -842,7 +842,7 @@ pub struct BinlogSourceManager {
 #[derive(Debug, Default)]
 pub struct DumpRegistry {
     entries: std::collections::BTreeMap<u32, RegisteredReplica>,
-    cancellations: HashMap<u32, Arc<Notify>>,
+    cancellations: HashMap<u32, Arc<ReplicaCancellation>>,
     /// Monotonic counter used to disambiguate two replicas that share the same
     /// `server_id` — the guard tracks its own registration id so Drop only
     /// removes the entry that this guard owns.
@@ -901,18 +901,28 @@ impl DumpRegistry {
     }
 }
 
+#[derive(Debug, Default)]
+struct ReplicaCancellation {
+    notify: Arc<Notify>,
+    replaced: AtomicBool,
+}
+
 /// RAII removes a replica from the dump registry when dropped (i.e. when the
 /// dump session ends). Owned by the session that called `register_replica`.
 pub struct RegisteredReplicaGuard {
     manager: std::sync::Arc<BinlogSourceManager>,
     server_id: u32,
     regid: u64,
-    cancelled: Arc<Notify>,
+    cancelled: Arc<ReplicaCancellation>,
 }
 
 impl RegisteredReplicaGuard {
     pub(crate) fn cancellation(&self) -> Arc<Notify> {
-        self.cancelled.clone()
+        self.cancelled.notify.clone()
+    }
+
+    pub(crate) fn is_replaced(&self) -> bool {
+        self.cancelled.replaced.load(Ordering::Acquire)
     }
 }
 
@@ -2164,6 +2174,20 @@ pub(crate) fn handle_admin_sql_for_database(
     result
 }
 
+/// Serialize explicit rotation with commit reservation and publication.
+pub(crate) fn rotate_binary_logs_if_enabled() -> Result<(), QueryError> {
+    let _retention = RETENTION_GATE.lock();
+    let _commit_gate = commit_gate();
+    if let Some(manager) = manager() {
+        manager.rotate()?;
+    }
+    Ok(())
+}
+
+// Includes the status byte and optional semi-sync header in each dump packet.
+pub(crate) const MAX_REPLICATION_PACKET_BYTES: usize = 1024 * 1024 * 1024;
+const MAX_REPLICATION_EVENT_BYTES: usize = MAX_REPLICATION_PACKET_BYTES - 3;
+
 pub fn handle_admin_sql_scoped(
     sql: &str,
     session: &SessionContext,
@@ -3136,10 +3160,12 @@ impl BinlogSourceManager {
     ) -> Result<RegisteredReplicaGuard, QueryError> {
         let server_id = info.server_id;
         let mut registry = self.dump_registry.lock();
-        let cancelled = Arc::new(Notify::new());
+        let cancelled = Arc::new(ReplicaCancellation::default());
         if let Some(previous) = registry.cancellations.insert(server_id, cancelled.clone()) {
             // notify_one retains a permit if the old dump is not polling yet.
-            previous.notify_one();
+            previous.replaced.store(true, Ordering::Release);
+            previous.notify.notify_one();
+            self.notify.notify_waiters();
         }
         let regid = registry.insert(info);
         Ok(RegisteredReplicaGuard {
@@ -5743,12 +5769,13 @@ fn encoded_event_size(
                 "binary log event size overflow",
             )
         })?;
-    u32::try_from(size).map(u64::from).map_err(|_| {
-        error(
+    if size > MAX_REPLICATION_EVENT_BYTES {
+        return Err(error(
             crate::error::catalog::ER_TOO_BIG_ROWSIZE,
-            "binary log event exceeds the 4 GiB event-size range",
-        )
-    })
+            "binary log event exceeds the 1 GiB replication packet limit; reduce the row image size",
+        ));
+    }
+    Ok(size as u64)
 }
 
 fn encoded_event_bytes(

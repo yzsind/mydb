@@ -903,6 +903,33 @@ fn response_row_count(response: &QueryResponse) -> i64 {
     }
 }
 
+/// Routine and SQL EXECUTE bodies own their DDL context, just like top-level SQL.
+fn execute_child_statement(
+    db: &Arc<Database>,
+    session: &mut SessionContext,
+    statement: Statement,
+    registry: &SessionRegistry,
+    source_sql: &str,
+) -> Result<QueryResponse, QueryError> {
+    let is_ddl = is_ddl_statement(&statement);
+    let binloggable = is_ddl
+        && !matches!(
+            statement,
+            Statement::OptimizeTable { .. } | Statement::RecycleBin(_)
+        )
+        && !statement_is_temp_ddl(session, &statement);
+    let _context = (binloggable && session.sql_log_bin && crate::binlog::enabled()).then(|| {
+        crate::binlog::enter_ddl_txn_context(
+            &session.current_database,
+            &ddl_binlog_source_sql(source_sql, &statement, &session.authenticated_as),
+            &binlog_ctx_from_session(session),
+            &session.authenticated_as,
+        )
+    });
+    let result = dispatch::execute_statement(db, session, statement, registry);
+    maybe_log_binlog_ddl(db, session, is_ddl, binloggable, source_sql, result)
+}
+
 fn maybe_log_binlog_ddl(
     db: &Database,
     session: &SessionContext,
@@ -1135,45 +1162,28 @@ fn ddl_binlog_source_sql(sql: &str, statement: &Statement, account: &AccountKey)
                         .map_or(token.span.end, |end| end.span.end),
                     _ => token.span.end,
                 };
-                return normalize_sql(&format!(
+                return format!(
                     "{}{}{}",
                     &sql[..token.span.start],
                     account.display(),
                     &sql[end..]
-                ));
+                );
             }
             if !symbolic_definer
                 && token.kind == SqlTokenKind::Word
                 && (tokens.token_text(&token).eq_ignore_ascii_case(object)
                     || (object == "VIEW" && tokens.token_text(&token).eq_ignore_ascii_case("SQL")))
             {
-                return normalize_sql(&format!(
+                return format!(
                     "{}DEFINER={} {}",
                     &sql[..token.span.start],
                     account.display(),
                     &sql[token.span.start..]
-                ));
+                );
             }
         }
     }
-    if matches!(
-        statement,
-        Statement::CreateUser(_)
-            | Statement::AlterUser(_)
-            | Statement::AlterUsers(_)
-            | Statement::SetPassword { .. }
-            | Statement::CreateRole { .. }
-            | Statement::DropRole { .. }
-            | Statement::DropUser { .. }
-            | Statement::RenameUser { .. }
-            | Statement::Grant(_)
-            | Statement::Revoke(_)
-            | Statement::SetDefaultRole(_)
-    ) {
-        sql.to_string()
-    } else {
-        normalize_sql(sql)
-    }
+    sql.to_string()
 }
 
 fn bind_binlog_account_targets(

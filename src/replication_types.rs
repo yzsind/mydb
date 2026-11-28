@@ -75,6 +75,9 @@ pub struct ReplicationStatus {
     pub configured: bool,
     pub running: bool,
     pub io_state: String,
+    /// Monotonic receive time is live-only and must not survive restart.
+    #[serde(skip)]
+    pub last_source_activity: Option<std::time::Instant>,
     pub sql_state: String,
     pub last_error: Option<String>,
     pub source_host: String,

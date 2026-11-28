@@ -26,6 +26,7 @@ Starts the IO/SQL threads of a MySQL→mydb channel; START SLAVE is a deprecated
 - Omitting the selector starts both threads. UNTIL is meaningless for IO_THREAD and is rejected.
 - Returns an explicit error when the channel is not configured, or the relay state requires a resync. The receiver is compiled into every build; there is no receiver Cargo feature to enable.
 - The legacy SLAVE spelling produces a deprecation warning.
+- Starting only IO_THREAD preserves a pending UNTIL condition. Stopping and restarting SQL apply also preserves an unsatisfied target unless a new UNTIL is supplied. Once the target has stopped apply, a subsequent SQL start without UNTIL resumes normal apply.
 
 ## Privileges, Results, and Operational Details
 

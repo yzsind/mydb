@@ -11,6 +11,8 @@
 
 The MySQL→mydb receiver is included in every build; mydb→mydb uses a separate protocol v3, LSN, timeline, and slot, and is not mixed with MySQL binlog commands.
 
+When mydb is the binlog source, each encoded event must fit the 1 GiB replication packet limit, including protocol framing. A transaction that would emit an oversized event fails before commit with error 1118. Large transactions may contain multiple events; one row image remains indivisible.
+
 ## Choosing and Observing Replication
 
 MySQL channels require an existing snapshot and ROW/FULL-compatible source history; CHANGE SOURCE does not copy previously purged data. Native replication uses physical reseeding, persisted role state and WAL retention slots. Source file positions, native LSNs and slot acknowledgments are different coordinates.

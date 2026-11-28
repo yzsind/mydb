@@ -424,11 +424,11 @@ fn binlog_multi_statement_mixed_ddl_uses_child_sql_and_implicit_commits() {
     );
     let ddl = queries
         .iter()
-        .find(|query| query.sql.contains("create table u"))
+        .find(|query| query.sql.contains("CREATE TABLE u"))
         .expect("child CREATE TABLE query event");
     assert_eq!(ddl.database, "mixed");
-    assert_eq!(ddl.sql, "create table u(id int primary key)");
-    assert!(!ddl.sql.contains("insert into"));
+    assert_eq!(ddl.sql.trim(), "CREATE TABLE u(id INT PRIMARY KEY)");
+    assert!(!ddl.sql.contains("INSERT INTO"));
 
     let QueryResponse::ResultSet(rows) = engine
         .execute_with_session(&mut session, "SELECT id FROM t ORDER BY id")
@@ -471,7 +471,7 @@ fn binlog_multi_statement_captures_session_state_and_sql_log_bin_per_child() {
     assert_eq!(queries.len(), 2, "only the row transaction has a BEGIN");
     let ddl = queries
         .iter()
-        .find(|query| query.sql.contains("create table logged"))
+        .find(|query| query.sql.contains("CREATE TABLE logged"))
         .expect("logged DDL");
     assert!(!queries.iter().any(|query| query.sql.contains("suppressed")));
     assert_eq!(
@@ -694,5 +694,81 @@ fn dump_gtid_import_reserves_local_sequence_and_reset_clears_durable_baseline() 
             .replication_property("mysql-imported-gtids")
             .unwrap(),
         Some(String::new())
+    );
+}
+
+#[test]
+fn audit1128_child_ddl_is_logged_once_with_original_identifier_case() {
+    let fixture = BinlogFixture::open_strict();
+    let mut session = SessionContext::default();
+    for sql in [
+        "CREATE TABLE t(Id INT PRIMARY KEY)",
+        "INSERT INTO t VALUES(1)",
+        "CREATE PROCEDURE p() BEGIN TRUNCATE TABLE t; END",
+        "CREATE PROCEDURE nested_p() BEGIN CALL p(); END",
+        "CREATE PROCEDURE dynamic_p() BEGIN PREPARE q FROM 'ALTER TABLE t ADD COLUMN DynamicValue INT'; EXECUTE q; DEALLOCATE PREPARE q; END",
+    ] {
+        QueryEngine::execute(&fixture.engine, &mut session, sql).unwrap();
+    }
+    for (sql, expected) in [
+        ("CALL nested_p()", "TRUNCATE TABLE t"),
+        (
+            "CALL dynamic_p()",
+            "ALTER TABLE t ADD COLUMN DynamicValue INT",
+        ),
+        ("PREPARE q FROM 'CREATE TABLE MadeHere(MixedId INT)'", ""),
+        ("EXECUTE q", "CREATE TABLE MadeHere(MixedId INT)"),
+    ] {
+        let before = fixture.events().len();
+        QueryEngine::execute(&fixture.engine, &mut session, sql).unwrap();
+        let events = fixture.events();
+        let queries = events[before..]
+            .iter()
+            .filter(|ev| ev.event_type == QUERY_EVENT)
+            .map(|ev| String::from_utf8_lossy(&ev.bytes).into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            queries.iter().filter(|q| q.contains(expected)).count(),
+            usize::from(!expected.is_empty()),
+            "{sql}: {queries:?}"
+        );
+    }
+    let before = fixture.events().len();
+    assert!(QueryEngine::execute(&fixture.engine, &mut session, "EXECUTE q").is_err());
+    assert_eq!(fixture.events().len(), before);
+}
+
+#[test]
+fn audit1128_fk_final_catalog_commit_stages_logical_ddl() {
+    let fixture = BinlogFixture::open_strict();
+    for sql in ["CREATE TABLE p(Id INT PRIMARY KEY)", "CREATE TABLE c(Id INT PRIMARY KEY,Pid INT,CONSTRAINT fk FOREIGN KEY(Pid) REFERENCES p(Id))"] {
+        fixture.engine.execute(sql).unwrap();
+    }
+    let db = fixture.engine.database_for_replication();
+    let session = SessionContext::default();
+    for sql in [
+        "ALTER TABLE c DROP FOREIGN KEY fk",
+        "ALTER TABLE c ADD CONSTRAINT fk FOREIGN KEY(Pid) REFERENCES p(Id)",
+    ] {
+        let guard = binlog::enter_ddl_txn_context(
+            "test",
+            sql,
+            &Default::default(),
+            &session.authenticated_as,
+        );
+        QueryEngine::execute(&fixture.engine, &mut SessionContext::default(), sql).unwrap();
+        // The top-level guard has returned, so inspect the storage path directly below.
+        drop(guard);
+    }
+    let _guard = binlog::enter_ddl_txn_context(
+        "test",
+        "ALTER TABLE c DROP FOREIGN KEY fk",
+        &Default::default(),
+        &session.authenticated_as,
+    );
+    db.drop_foreign_key("test.c", "fk").unwrap();
+    assert!(
+        binlog::current_ddl_transaction_staged(),
+        "FK catalog commit bypassed the WAL-linked binlog path"
     );
 }
