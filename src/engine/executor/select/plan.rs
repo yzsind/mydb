@@ -36,6 +36,7 @@ pub(crate) use scan::*;
 mod nested_loop;
 pub(super) use nested_loop::*;
 mod index_join;
+pub(in crate::engine::executor) use index_join::lookup_inlj_entries_parallel;
 pub(crate) use index_join::*;
 mod hash_join;
 pub(super) use hash_join::*;

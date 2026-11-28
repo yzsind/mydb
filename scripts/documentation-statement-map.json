@@ -19,6 +19,12 @@
     ],
     "kind": "statement-family"
   },
+  "Graph": {
+    "references": [
+      "docs/graph-rag.md"
+    ],
+    "kind": "statement-family"
+  },
   "RowSecurity": {
     "references": [
       "docs/statement/security/README.md"

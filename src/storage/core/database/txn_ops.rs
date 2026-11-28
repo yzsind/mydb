@@ -1294,6 +1294,12 @@ impl Database {
         Ok(())
     }
 
+    /// A pinned read view can also belong to a read-write transaction. Only
+    /// the registered slot proves a transaction cannot own private versions.
+    pub(crate) fn transaction_is_read_only(&self, txn_id: u64) -> bool {
+        self.txns.read().slot(txn_id).is_some_and(|slot| slot.read_only)
+    }
+
     /// M1.1 - Begin a read-only transaction (Oracle SET TRANSACTION READ ONLY).
     /// Read-only txns:
     /// - allocate a txn_id and snapshot SCN

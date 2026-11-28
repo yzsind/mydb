@@ -1,6 +1,6 @@
 {
   "baseline": "MySQL Community Server 8.0.46",
-  "reviewed_at": "2026-11-27",
+  "reviewed_at": "2026-11-28",
   "scope": "classic protocol and MySQL replication source protocol",
   "capabilities": {
     "CLIENT_FOUND_ROWS": "compatible",
@@ -48,11 +48,11 @@
     "multi-threaded replica apply"
   ],
   "evidence": {
-    "review_scope": "Source and documentation contract review; focused classic-protocol, prepared-numeric and prepared EXPLAIN regressions. This fingerprint is a review trigger, not proof all combinations are supported. Prepared numeric-context refresh/restoration, semantic error propagation, and EXPLAIN catalog admission/statistics publication were reviewed. ENUM/SET TABLE_MAP wire types, preservation of internal row encoders, and reuse of numeric binlog file/position ordering for replica UNTIL checks were reviewed with focused regressions; capability and command compatibility classifications are unchanged. Per-dump heartbeat cursor semantics were reviewed against MySQL 8.0 and validated with NONE/CRC32 publication/rotation regressions, a raw dump check covering 1,000 writes and 200 rotations, and a real MySQL 8.0.46 replica across 28 tables, reconnects and 35 seconds of idle heartbeats; capability and command classifications are unchanged. ROW/FULL replication audit fixes were reviewed with unsigned TIMESTAMP2 decoding, raw binary and geometry row identity, virtual-column routing, ENUM-zero apply, exact DDL session state and identifier case, WAL-linked FK DDL, gated rotation, bounded connect/read recovery, pending UNTIL preservation and source admission at the 1 GiB replication packet limit. Duplicate server_id replacement now sends a fatal ERR at a complete packet boundary, with bounded cancellation under socket backpressure. Local source/replica regressions cover these paths; protocol capability and command classifications are unchanged.",
+    "review_scope": "Source and documentation contract review; focused classic-protocol, prepared-numeric and prepared EXPLAIN regressions. This fingerprint is a review trigger, not proof all combinations are supported. Prepared numeric-context refresh/restoration, semantic error propagation, and EXPLAIN catalog admission/statistics publication were reviewed. ENUM/SET TABLE_MAP wire types, preservation of internal row encoders, and reuse of numeric binlog file/position ordering for replica UNTIL checks were reviewed with focused regressions; capability and command compatibility classifications are unchanged. Per-dump heartbeat cursor semantics were reviewed against MySQL 8.0 and validated with NONE/CRC32 publication/rotation regressions, a raw dump check covering 1,000 writes and 200 rotations, and a real MySQL 8.0.46 replica across 28 tables, reconnects and 35 seconds of idle heartbeats; capability and command classifications are unchanged. ROW/FULL replication audit fixes were reviewed with unsigned TIMESTAMP2 decoding, raw binary and geometry row identity, virtual-column routing, ENUM-zero apply, exact DDL session state and identifier case, WAL-linked FK DDL, gated rotation, bounded connect/read recovery, pending UNTIL preservation and source admission at the 1 GiB replication packet limit. Duplicate server_id replacement now sends a fatal ERR at a complete packet boundary, with bounded cancellation under socket backpressure. Local source/replica regressions cover these paths; protocol capability and command classifications are unchanged. Prepared graph read scheduling and batched BIGINT result encoding were reviewed with graph, session, and packet regressions; capability and command compatibility classifications are unchanged.",
     "source_sha256": {
       "src/mysql/protocol.rs": "4319edb06cee12e06302ff88890b9e5441e5d20cfc283724b31fbc9597073467",
       "src/mysql/server.rs": "80499aca67183a4f19e3f04dd5394fefec0dc7167fa703ba359e08a53aee107b",
-      "src/mysql/session.rs": "bc5ffece7a0966632b24ca136faf6dfaaf12114523e980c5229ee7a25db88238",
+      "src/mysql/session.rs": "d2344be3a4400f9d0e9b9ba5a67b8a827db33997ecb31dc14dc73c83cef420eb",
       "src/binlog.rs": "f038867327c35c4f5134bec2469136518dd763d818b6cafd90975904001f08c9",
       "src/mysql/peer_monitor.rs": "2664258b1e0b97bdd36da7735f24a32826af97f9ffbbd63987d8152fd1e104f6"
     },
@@ -78,7 +78,10 @@
       "src/mysql/session/prepared_explain_tests.rs",
       "src/replication_audit_1128_tests.rs",
       "src/engine/executor/events.rs",
-      "src/binlog/release_audit_tests.rs"
+      "src/binlog/release_audit_tests.rs",
+      "src/engine/executor/tests/graph.rs",
+      "src/mysql/session/stream_tests.rs",
+      "src/mysql/packet.rs"
     ],
     "update_policy": "Review changed capability/command behavior, run relevant regressions, then refresh source hashes and reviewed_at together."
   }

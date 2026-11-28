@@ -4842,7 +4842,7 @@ pub(super) fn charge_existing_inlj_entries(
 /// be deduplicated inside that slice.  Results are merged in task order and
 /// local key positions are rebased to the original list, preserving the
 /// serial API's deterministic `(key index, row id)` ordering.
-pub(super) fn lookup_inlj_entries_parallel(
+pub(in crate::engine::executor) fn lookup_inlj_entries_parallel(
     db: &Arc<Database>,
     index_handle: &IndexHandle,
     table: &TableSchema,

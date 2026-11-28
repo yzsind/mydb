@@ -587,6 +587,10 @@ pub(crate) struct StatementActivityGuard {
     started: Instant,
 }
 
+pub(crate) fn active_statement_count() -> usize {
+    ACTIVE_STATEMENTS.load(Ordering::Relaxed)
+}
+
 impl StatementActivityGuard {
     pub(crate) fn enter() -> Self {
         ensure_worker();

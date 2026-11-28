@@ -11,6 +11,13 @@ macro_rules! define_walk {
             visitor.enter_statement(statement);
             match statement {
                 Statement::RecycleBin(_) => {},
+                Statement::Graph(command) => {
+                    if let crate::graph::Command::Program(program) = & $($mutable)* **command {
+                        for atom in & $($mutable)* program.atoms {
+                            walk_expr(visitor, atom);
+                        }
+                    }
+                },
                 Statement::RowSecurity(command) => {
                     match command {
                         crate::parser::rls::RlsStatement::SetContext { value, .. } => walk_expr(visitor, value),

@@ -85,6 +85,12 @@ const LOCKING_READ: StatementEffects = StatementEffects {
 pub(crate) fn statement_effects(statement: &Statement) -> StatementEffects {
     use Statement as S;
     match statement {
+        S::Graph(command) if command.ddl() => StatementEffects {
+            requires_implicit_commit: false,
+            ..CATALOG_DDL
+        },
+        S::Graph(command) if command.writes() => DATA_WRITE,
+        S::Graph(_) => READ_ONLY,
         S::RecycleBin(command) => {
             if matches!(command, crate::recyclebin::Command::Show { .. }) {
                 READ_ONLY

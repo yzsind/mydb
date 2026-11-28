@@ -5515,6 +5515,7 @@ where
             param_count,
             has_parsed_template,
             is_select_template,
+            is_graph_template,
             normalized_sql,
             database,
             parser_sql_mode_bits,
@@ -5579,6 +5580,7 @@ where
                 prepared.param_count,
                 prepared.parsed.is_some(),
                 matches!(prepared.parsed.as_deref(), Some(Statement::Select(_))),
+                matches!(prepared.parsed.as_deref(), Some(Statement::Graph(_))),
                 Arc::clone(&prepared.normalized_sql),
                 Arc::clone(&prepared.database),
                 prepared.parser_sql_mode_bits,
@@ -5731,6 +5733,34 @@ where
                 }
             }
 
+            if is_graph_template {
+                let graph = self
+                    .prepared
+                    .get(&statement_id)
+                    .and_then(|entry| entry.parsed.clone())
+                    .expect("prepared graph statement");
+                if let Some(result) =
+                    self.try_execute_inline_graph_read(&sql, &graph, &values, &perf_texts)
+                {
+                    if self.kill_flag.load(Ordering::Acquire) {
+                        return Ok(());
+                    }
+                    if cursor_requested {
+                        self.write_stmt_cursor_execute_response(statement_id, result)
+                            .await?;
+                    } else {
+                        self.write_stmt_execute_response_for(Some(statement_id), result)
+                            .await?;
+                    }
+                    if let Some(entry) = self.prepared.get_mut(&statement_id) {
+                        clear_prepared_long_data(entry);
+                        values.clear();
+                        entry.value_scratch = values;
+                    }
+                    return Ok(());
+                }
+            }
+
             // Compile-once / late-bind SELECT runner: an eligible read-only
             // SELECT reuses a memoized physical plan held on the prepared
             // statement, so this EXECUTE skips the AST clone + re-planning
@@ -5874,7 +5904,7 @@ where
             // waits and statement-savepoint rollback. Conflicts fall back to
             // the blocking pool; they must never park a Tokio worker while
             // waiting for another connection to commit and release its lock.
-            if !cursor_requested {
+            if !cursor_requested && !is_graph_template {
                 let (parsed_arc, dml_inline_retry, static_has_http, dml_state) = {
                     let entry = self
                         .prepared
@@ -6436,11 +6466,21 @@ where
         rows: &[Vec<crate::types::Value>],
         metadata: &PreparedResultMetadata,
     ) -> io::Result<()> {
-        let needed = rows
-            .iter()
-            .map(|row| crate::mysql::protocol::estimate_binary_row_packet_bytes(row))
-            .max()
-            .unwrap_or(0);
+        use crate::types::{ColumnType, Value};
+        let bigint_rows = !rows.is_empty()
+            && matches!(metadata.columns.as_ref(), [column]
+            if column.column_type == ColumnType::LongLong && !column.source.round_decimal_result)
+            && rows
+                .iter()
+                .all(|row| matches!(row.as_slice(), [Value::Int(_) | Value::Null]));
+        let needed = if bigint_rows {
+            10
+        } else {
+            rows.iter()
+                .map(|row| crate::mysql::protocol::estimate_binary_row_packet_bytes(row))
+                .max()
+                .unwrap_or(0)
+        };
         ensure_governed_scratch_capacity(
             &mut self.binary_row_scratch,
             &mut self.binary_row_scratch_charge,
@@ -6480,19 +6520,35 @@ where
                 self.command_response_sequence,
             )
         };
-        for row in rows {
-            if let Some(err) = self.context.cancelled_error() {
-                return finish_error_result_set(batch, sequence_id, &err).await;
+        for chunk in rows.chunks(256) {
+            if bigint_rows {
+                if let Some(err) = self.context.cancelled_error() {
+                    return finish_error_result_set(batch, sequence_id, &err).await;
+                }
+                let values = chunk.iter().map(|row| match row[0] {
+                    Value::Int(value) => Some(value),
+                    Value::Null => None,
+                    _ => unreachable!("validated BIGINT rows"),
+                });
+                if let Some(next) = batch.try_buffer_binary_bigints(sequence_id, values) {
+                    sequence_id = next;
+                    continue;
+                }
             }
-            crate::mysql::protocol::binary_row_packet_into_with_charset(
-                &metadata.columns,
-                row,
-                row_payload.as_mut(),
-                result_charset,
-            );
-            sequence_id = batch
-                .write_packet_seq(sequence_id, row_payload.as_ref())
-                .await?;
+            for row in chunk {
+                if let Some(err) = self.context.cancelled_error() {
+                    return finish_error_result_set(batch, sequence_id, &err).await;
+                }
+                crate::mysql::protocol::binary_row_packet_into_with_charset(
+                    &metadata.columns,
+                    row,
+                    row_payload.as_mut(),
+                    result_charset,
+                );
+                sequence_id = batch
+                    .write_packet_seq(sequence_id, row_payload.as_ref())
+                    .await?;
+            }
         }
         write_result_set_terminator_batched(
             &mut batch,
@@ -8402,6 +8458,49 @@ where
         }
     }
 
+    fn try_execute_inline_graph_read(
+        &mut self,
+        sql: &str,
+        statement: &Statement,
+        params: &[crate::types::Value],
+        perf_texts: &crate::engine::perf_events::PreparedStatementTexts,
+    ) -> Option<Result<QueryResponse, QueryError>> {
+        let Statement::Graph(command) = statement else {
+            return None;
+        };
+        let crate::graph::Command::Program(program) = command.as_ref() else {
+            return None;
+        };
+        if !program.may_inline_read()
+            || self.context.sysvars.max_execution_time_ms != 0
+            || !self.context.autocommit
+            || self.context.explicit_txn
+            || self.context.current_txn.is_some()
+            || self.context.xa_branch.is_some()
+            || self.context.has_explicit_table_locks()
+            || self.context.effective_isolation() == crate::storage::IsolationLevel::Serializable
+        {
+            return None;
+        }
+        let _catalog = self.try_catalog_read_permit().ok()?;
+        let result = crate::engine::perf_events::with_prepared_statement_texts(perf_texts, || {
+            crate::engine::params::with_params_slice(params, || {
+                crate::storage::with_nonblocking_lock_waits(|| {
+                    self.engine.execute_prepared_statement(
+                        &mut self.context,
+                        sql,
+                        statement.clone(),
+                    )
+                })
+            })
+        });
+        if matches!(&result, Some(Err(err)) if crate::storage::is_lock_would_block_error(err)) {
+            None
+        } else {
+            result
+        }
+    }
+
     async fn execute_prepared_statement_blocking(
         &mut self,
         sql: Arc<str>,
@@ -8416,6 +8515,19 @@ where
                 "server-side cursors for multi-result prepared statements",
             )));
         }
+        // A standalone graph read can do storage I/O but cannot take DML
+        // locks or emit routine results. Keep the executor's authorization,
+        // snapshot and MDL checks while using the read scheduling path.
+        let graph_read = matches!(
+            &statement,
+            Statement::Graph(command)
+                if matches!(command.as_ref(), crate::graph::Command::Program(program) if !program.writes())
+        ) && self.context.autocommit
+            && !self.context.explicit_txn
+            && self.context.current_txn.is_none()
+            && self.context.xa_branch.is_none()
+            && !self.context.has_explicit_table_locks()
+            && self.context.effective_isolation() != crate::storage::IsolationLevel::Serializable;
         // Use the inline path only for eligible reads with catalog admission.
         // Row-lock waits and blocking control statements use a worker.
         // `params` is installed in the thread-local parameter context for
@@ -8430,7 +8542,9 @@ where
         // demand. Materializing up front would defeat server-side cursor
         // fetching (`useCursorFetch=true`) by buffering the full result
         // set in memory before the FETCH loop even starts.
-        let http = if crate::engine::http::statement_has_http(&statement) {
+        let http = if graph_read {
+            false
+        } else if crate::engine::http::statement_has_http(&statement) {
             true
         } else {
             match self.sql_may_call_http(&sql).await {
@@ -8482,6 +8596,7 @@ where
         // Transaction control can finish an already-open transaction. Never
         // queue its completion behind admission for new lock-taking statements.
         if !http
+            && !graph_read
             && !is_transaction_control(&statement)
             && (!statement_is_lock_safe_read(&statement)
                 || !context_allows_inline_lock_safe_read(&self.context))
@@ -8514,7 +8629,11 @@ where
         } else {
             None
         };
-        let (sink, receiver) = self.routine_packet_stream(&sql, true);
+        let (sink, receiver) = if graph_read {
+            (None, None)
+        } else {
+            self.routine_packet_stream(&sql, true)
+        };
         let engine = Arc::clone(&self.engine);
         let mut context = self.park_context();
         let work = move || {
@@ -8544,6 +8663,8 @@ where
             crate::engine::http::spawn_coordinator(work)
         } else if ai {
             crate::engine::ai::runtime::spawn_coordinator(work)
+        } else if graph_read {
+            crate::util::blocking_pool::spawn_session(self.blocking_affinity.as_ref(), work)
         } else {
             crate::util::blocking_pool::spawn_affine(self.blocking_affinity.as_ref(), work)
         };

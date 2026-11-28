@@ -2006,6 +2006,71 @@ impl Database {
         Ok(entries)
     }
 
+    // Fast lane for covering prefix batches without an active repair set.
+    // Declining lets the caller use its ordinary snapshot range cursor.
+    pub(crate) fn lookup_prefixes_prefetched(
+        &self,
+        table: &TableSchema,
+        index: &IndexSchema,
+        keys: &[IndexKey],
+        txn: TxnView,
+        max_entries: usize,
+    ) -> Result<Option<(Vec<(IndexKey, RowId)>, u64)>, QueryError> {
+        self.lookup_prefixes_prefetched_mapped(table, index, keys, txn, max_entries, |key, row| (key, row))
+    }
+
+    pub(crate) fn lookup_prefixes_prefetched_mapped<T>(
+        &self,
+        table: &TableSchema,
+        index: &IndexSchema,
+        keys: &[IndexKey],
+        txn: TxnView,
+        max_entries: usize,
+        map: impl Fn(IndexKey, RowId) -> T,
+    ) -> Result<Option<(Vec<T>, u64)>, QueryError> {
+        self.prefetched_index_read(table, index, txn, |file| {
+            file.lookup_prefix_entries_many_mapped(keys, max_entries, map)
+        })
+    }
+
+    pub(crate) fn lookup_exact_rows_prefetched(
+        &self,
+        table: &TableSchema,
+        index: &IndexSchema,
+        keys: &[IndexKey],
+        txn: TxnView,
+        max_entries: usize,
+    ) -> Result<Option<(Vec<(u32, RowId)>, u64)>, QueryError> {
+        if !index.unique || keys.iter().any(|key| key.0.len() != index.columns.len()) {
+            return Ok(None);
+        }
+        self.prefetched_index_read(table, index, txn, |file| {
+            file.lookup_exact_rows_many_prefetched(keys, max_entries)
+        })
+    }
+
+    fn prefetched_index_read<T>(
+        &self,
+        table: &TableSchema,
+        index: &IndexSchema,
+        txn: TxnView,
+        lookup: impl FnOnce(&IndexFile) -> Result<Option<(Vec<T>, u64)>, QueryError>,
+    ) -> Result<Option<(Vec<T>, u64)>, QueryError> {
+        self.check_index_read_view(table, index, txn)?;
+        let version = self.index_repair_version();
+        if self.has_pending_index_repairs_for(table.id, &index.name) {
+            return Ok(None);
+        }
+        let handle = self.cached_index_handle(table.id, &index.name)?;
+        let result = lookup(&handle.read())?;
+        if version != self.index_repair_version()
+            || self.has_pending_index_repairs_for(table.id, &index.name)
+        {
+            return Ok(None);
+        }
+        Ok(result)
+    }
+
     /// Optional candidate discovery without retaining a complete prefix's RIDs.
     /// The callback may decline; every partial result must then be discarded.
     /// Repair publication invalidates the entire visit before any caller output.

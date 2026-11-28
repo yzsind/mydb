@@ -99,6 +99,7 @@ pub(crate) use core::{
     ZONE_MAP_METADATA_DECODE_NS, ZONE_MAP_RUNTIME_CANDIDATE_NS, ZONE_MAP_RUNTIME_PAGES,
     ZONE_MAP_RUNTIME_PAGES_SKIPPED, ZONE_MAP_RUNTIME_TASKS,
 };
+pub(crate) use txn::{lock_waits_nonblocking, lock_would_block_error};
 // ENUM/SET on-disk width helpers — single source of truth (see the
 // `set_storage_width` / `enum_storage_width` doc comments in row_codec).
 pub(crate) use core::CatalogTxnBatchGuard;

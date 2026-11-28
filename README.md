@@ -316,6 +316,14 @@ depend on the operation, types, and indexes. See
 [online column type changes](docs/online-column-type-change.md), and the
 [DDL compatibility boundaries](docs/mysql80-compatibility.md#table-ddl).
 
+### Property graphs for GraphRAG
+
+Open property graphs support GQL pattern matching, bounded traversals, and graph
+updates over the existing MySQL connection. Use the same SQL transaction for
+vector retrieval, graph expansion, and document lookups. See the
+[property graph and GraphRAG guide](docs/graph-rag.md) for the supported GQL
+subset and runnable example.
+
 ### Native vectors: from storage to large-scale similarity search
 
 - **Native `VECTOR(n, datatype)` type**: FLOAT32 (default), FLOAT16, BFLOAT16, INT8, and BINARY retain their native payloads. Numeric vectors support L2, cosine, and dot-product distance; BINARY supports Hamming and Jaccard. Dimension limits depend on the datatype, from 16,383 for FLOAT32 to 524,256 bits for BINARY.

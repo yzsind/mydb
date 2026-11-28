@@ -422,6 +422,53 @@ fn small_batch_lookup_spanning_prefixes_duplicates_and_empty_tree() {
 }
 
 #[test]
+fn covering_prefixes_keep_duplicate_runs_across_separator_fences() {
+    let key_for = |n| {
+        IndexKey::from(vec![
+            KeyPart::UInt(1),
+            KeyPart::UInt((n / 6000) as u64 * 2),
+            KeyPart::UInt((n % 1200) as u64),
+            KeyPart::UInt(n as u64),
+        ])
+    };
+    let (_dir, mut index) = index_fixture((0..18_000).map(key_for).collect());
+    let keys: Vec<_> = (0..=6)
+        .map(|anchor| IndexKey::from(vec![KeyPart::UInt(1), KeyPart::UInt(anchor)]))
+        .collect();
+
+    for delete in [false, true] {
+        if delete {
+            for n in (0..18_000).step_by(7) {
+                index
+                    .delete(
+                        key_for(n),
+                        RowId {
+                            page_id: (n / 32) as u32,
+                            slot_id: (n % 32) as u16,
+                        },
+                    )
+                    .unwrap();
+            }
+        }
+        let mut expected: Vec<_> = keys
+            .iter()
+            .flat_map(|key| index.prefix_entries(key, false).unwrap())
+            .collect();
+        let (mut actual, _) = index
+            .lookup_prefix_entries_many_prefetched(&keys, 18_000)
+            .unwrap()
+            .unwrap();
+        expected.sort_unstable();
+        actual.sort_unstable();
+        assert_eq!(actual, expected);
+        assert!(index
+            .lookup_prefix_entries_many_prefetched(&keys, 12)
+            .unwrap()
+            .is_none());
+    }
+}
+
+#[test]
 fn small_batch_lookup_routes_through_multiple_internal_levels() {
     let make = |n| IndexKey::from(vec![KeyPart::String(format!("{n:08}-{}", "x".repeat(200)))]);
     let (_dir, index) = index_fixture((0..20_000).map(make).collect());
@@ -783,4 +830,51 @@ fn hot_internal_routing_image_follows_mutation_and_eviction() {
     index.buffer_pool.flush_and_evict_all().unwrap();
     assert!(token.image.load().is_none());
     assert_eq!(index.get_unique_one(&key).unwrap(), expected);
+}
+
+#[test]
+fn covering_exact_composite_probes_keep_input_slots_and_row_ids() {
+    let key = |n: u64| {
+        IndexKey::from(vec![
+            KeyPart::UInt(n / 8192),
+            KeyPart::Bytes(format!("group-{}", (n / 512) % 3).into_bytes()),
+            KeyPart::Int(n as i64 - 8192),
+        ])
+    };
+    let stored = (0..8192).map(|n| key(2 * n)).collect::<Vec<_>>();
+    let (_dir, index) = index_fixture(stored);
+    let mut requested = (0..16384)
+        .step_by(7)
+        .map(|n| (key(n), n))
+        .collect::<Vec<_>>();
+    requested.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
+    let keys = requested
+        .iter()
+        .map(|(key, _)| key.clone())
+        .collect::<Vec<_>>();
+    let expected = requested
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, n))| n % 2 == 0)
+        .map(|(slot, (_, n))| {
+            let stored_slot = n / 2;
+            (
+                slot as u32,
+                RowId {
+                    page_id: (stored_slot / 32) as u32,
+                    slot_id: (stored_slot % 32) as u16,
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    let (mut actual, _) = index
+        .lookup_exact_rows_many_prefetched(&keys, expected.len())
+        .unwrap()
+        .unwrap();
+    actual.sort_unstable();
+    assert_eq!(actual, expected);
+    assert!(index
+        .lookup_exact_rows_many_prefetched(&keys, expected.len() - 1)
+        .unwrap()
+        .is_none());
 }

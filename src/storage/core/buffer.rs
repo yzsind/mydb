@@ -373,6 +373,7 @@ struct OrderedReadWork {
     next: AtomicUsize,
     state: parking_lot::Mutex<(usize, Option<QueryError>)>,
     done: parking_lot::Condvar,
+    covering: bool,
     _charge: crate::engine::executor::mem_budget::ControlledMemoryCharge,
 }
 
@@ -8063,6 +8064,23 @@ impl BufferPool {
         file: &Arc<BufferPageFileKey>,
         page_ids: &[u64],
     ) -> Result<(), QueryError> {
+        self.load_ordered_probe_pages_with_gaps(file, page_ids, false)
+    }
+
+    fn load_ordered_covering_pages(
+        self: &Arc<Self>,
+        file: &Arc<BufferPageFileKey>,
+        page_ids: &[u64],
+    ) -> Result<(), QueryError> {
+        self.load_ordered_probe_pages_with_gaps(file, page_ids, true)
+    }
+
+    fn load_ordered_probe_pages_with_gaps(
+        self: &Arc<Self>,
+        file: &Arc<BufferPageFileKey>,
+        page_ids: &[u64],
+        coalesce_gaps: bool,
+    ) -> Result<(), QueryError> {
         if page_ids.is_empty() || self.durability == DurabilityMode::Memory {
             return Ok(());
         }
@@ -8095,6 +8113,49 @@ impl BufferPool {
         keys.sort_unstable_by_key(|key| key.page_id);
         keys.dedup_by_key(|key| key.page_id);
 
+        // Nearby cold covering-index probes can share a positioned read.
+        // Bound both the size of an individual gap and the aggregate
+        // amplification. A resident page would split the read anyway.
+        let active_covering_commands = if coalesce_gaps {
+            crate::engine::memory_reclaimer::active_statement_count().max(1)
+        } else {
+            1
+        };
+        if coalesce_gaps
+            && matches!(&file.kind, BufferPageFileKind::Index { .. })
+            && active_covering_commands <= 2
+            && keys.len() >= 16
+        {
+            let mut spare = keys.len() / 2;
+            let mut contiguous = Vec::with_capacity(keys.len() + spare);
+            let mut previous: Option<u64> = None;
+            for key in keys {
+                if let Some(page) = previous {
+                    let start = page.saturating_add(1);
+                    let gap = (key.page_id - start) as usize;
+                    if gap != 0 && gap <= spare && gap <= 8 {
+                        let mut missing = true;
+                        for page_id in start..key.page_id {
+                            if self.lookup_frame_ref(PageKeyRef { file, page_id })?.is_some() {
+                                missing = false;
+                                break;
+                            }
+                        }
+                        if missing {
+                            contiguous.extend((start..key.page_id).map(|page_id| PageKey {
+                                file: Arc::clone(file),
+                                page_id,
+                            }));
+                            spare -= gap;
+                        }
+                    }
+                }
+                previous = Some(key.page_id);
+                contiguous.push(key);
+            }
+            keys = contiguous;
+        }
+
         // Keep every preadv comfortably below platform IOV_MAX (macOS
         // rejects oversized iovec arrays with EINVAL). 64 pages = 1 MiB.
         const MAX_ORDERED_READ_PAGES: usize = 64;
@@ -8112,7 +8173,25 @@ impl BufferPool {
             start = end;
         }
 
-        let workers = self.io_threads.max(1).min(runs.len());
+        // Sparse covering probes spend most of their time waiting on I/O
+        // rather than parsing rows. Give a lone, broad request more queue
+        // depth without raising the reservation during concurrent work.
+        let read_parallelism = if coalesce_gaps
+            && active_covering_commands == 1
+            && runs.len() > self.io_threads
+            && self.io_threads > 1
+            && crate::util::env::var("MYDB_BUFFER_POOL_IO_THREADS").is_err()
+        {
+            let parallelism = if runs.len() >= 64 {
+                self.io_threads.saturating_mul(3).saturating_add(1)
+            } else {
+                self.io_threads.saturating_mul(2)
+            };
+            parallelism.min(MAX_BUFFER_POOL_IO_THREADS)
+        } else {
+            self.io_threads
+        };
+        let workers = read_parallelism.max(1).min(runs.len());
         // The overwhelmingly common OLTP MRR miss is one sparse page (or one
         // contiguous run). Spawning a scoped OS thread for that single run
         // adds thread creation, stack mapping and join work without exposing
@@ -8121,20 +8200,20 @@ impl BufferPool {
         // bounded parallel path below.
         if workers == 1 {
             for (from, to) in runs {
-                self.load_page_run(&keys[from..to], AccessIntent::Probe)?;
+                self.load_ordered_run(&keys[from..to], coalesce_gaps)?;
             }
             return Ok(());
         }
         // Reuse the existing blocking workers instead of creating OS threads
         // for each sparse window. Bound queued helpers as well as running ones;
         // a busy pool leaves the read on its caller instead of growing a queue.
-        let helper_limit = self.io_threads;
+        let helper_limit = read_parallelism;
         let mut active = self.ordered_read_helpers.load(Ordering::Acquire);
         let helpers = loop {
             let count = (workers - 1).min(helper_limit.saturating_sub(active));
             if count == 0 {
                 for (from, to) in runs {
-                    self.load_page_run(&keys[from..to], AccessIntent::Probe)?;
+                    self.load_ordered_run(&keys[from..to], coalesce_gaps)?;
                 }
                 return Ok(());
             }
@@ -8165,7 +8244,7 @@ impl BufferPool {
             self.ordered_read_helpers
                 .fetch_sub(helpers, Ordering::Release);
             for (from, to) in runs {
-                self.load_page_run(&keys[from..to], AccessIntent::Probe)?;
+                self.load_ordered_run(&keys[from..to], coalesce_gaps)?;
             }
             return Ok(());
         };
@@ -8175,6 +8254,7 @@ impl BufferPool {
             next: AtomicUsize::new(0),
             keys,
             runs,
+            covering: coalesce_gaps,
             _charge: charge,
         });
         for _ in 0..helpers {
@@ -8208,14 +8288,31 @@ impl BufferPool {
         }
     }
 
+    fn load_ordered_run(
+        self: &Arc<Self>,
+        keys: &[PageKey],
+        covering: bool,
+    ) -> Result<(), QueryError> {
+        if let [key] = keys {
+            if covering {
+                return self
+                    .pin_page_with_intent_ref(key.borrowed(), AccessIntent::Probe)
+                    .map(drop);
+            }
+        }
+        self.load_page_run(keys, AccessIntent::Probe)
+    }
+
     fn run_ordered_read_work(self: &Arc<Self>, work: &OrderedReadWork) {
+        let mut completed = 0;
+        let mut first_error = None;
         loop {
             let next = work.next.fetch_add(1, Ordering::Relaxed);
             let Some(&(from, to)) = work.runs.get(next) else {
-                return;
+                break;
             };
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                self.load_page_run(&work.keys[from..to], AccessIntent::Probe)
+                self.load_ordered_run(&work.keys[from..to], work.covering)
             }))
             .unwrap_or_else(|_| {
                 Err(error(
@@ -8223,11 +8320,17 @@ impl BufferPool {
                     "ordered buffer read worker panicked",
                 ))
             });
+            if first_error.is_none() {
+                first_error = result.err();
+            }
+            completed += 1;
+        }
+        if completed != 0 {
             let mut state = work.state.lock();
             if state.1.is_none() {
-                state.1 = result.err();
+                state.1 = first_error;
             }
-            state.0 -= 1;
+            state.0 -= completed;
             if state.0 == 0 {
                 work.done.notify_all();
             }

@@ -1573,6 +1573,7 @@ impl<P: std::ops::Deref<Target = BufferPool>> PinnedFrame<P> {
             entries,
             next_leaf: leaf.next_leaf,
             continue_key_offsets,
+            page_max_trx_id: leaf.page_max_trx_id,
         }))
     }
 

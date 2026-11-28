@@ -267,6 +267,62 @@ impl Database {
         Ok(complete.then_some(rows))
     }
 
+    /// Visit inline JSON without copying the payload. Batch any cold page
+    /// misses before retrying the unfinished suffix. Callers can keep the
+    /// results already visited and use the undo-aware reader for gaps.
+    pub(crate) fn visit_inline_json_rows(
+        &self,
+        heap: &HeapHandle,
+        table: &TableSchema,
+        row_ids: &[RowId],
+        txn: TxnView,
+        column: usize,
+        mut visit: impl FnMut(RowId, Option<&[u8]>) -> Result<(), QueryError>,
+    ) -> Result<(), QueryError> {
+        self.check_primary_read_view(table, txn)?;
+        debug_assert!(row_ids.windows(2).all(|rows| rows[0] <= rows[1]));
+        let mut visibility = ScanVisibilityCache::new();
+        let heap = heap.read();
+        let mut examined = 0;
+        let mut read = |ids: &[RowId], last: &mut Option<RowId>| {
+            heap.visit_mvcc_payloads_many_cached_with_plan(ids, &[column], |row| {
+                if row.layout_id != table.active_layout_id
+                    || !self.row_version_visible_cached(&mut visibility, row.header, txn)?
+                {
+                    return Ok(false);
+                }
+                if !row.header.is_deleted() {
+                    let Some(payload) = borrow_inline_json(
+                        &row.payload[row.body_offset..],
+                        row.layout_id,
+                        row.plan,
+                        row.has_external,
+                    )?
+                    else {
+                        return Ok(false);
+                    };
+                    visit(row.row_id, payload)?;
+                    examined += 1;
+                }
+                *last = Some(row.row_id);
+                Ok(true)
+            })
+        };
+        let mut last = None;
+        if !read(row_ids, &mut last)? {
+            let start = last.map_or(0, |last| row_ids.partition_point(|id| *id <= last));
+            let remaining = &row_ids[start..];
+            if remaining.len() >= 2 {
+                let mut pages: Vec<_> = remaining.iter().map(|row| u64::from(row.page_id)).collect();
+                pages.dedup();
+                heap.load_ordered_covering_pages(&pages)?;
+                read(remaining, &mut last)?;
+            }
+        }
+        crate::engine::perf_events::record_rows_examined(examined);
+        Ok(())
+    }
+
     pub(crate) fn read_row_columns_many_with_handle_and_plan(
         &self,
         heap: &HeapHandle,

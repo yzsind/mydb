@@ -4686,7 +4686,10 @@ impl TableSchema {
     /// option is additive catalog metadata, so catalogs written before the
     /// feature naturally receive the new default.
     pub fn zone_map_enabled(&self) -> bool {
-        if self.system || self.table_type.eq_ignore_ascii_case("TEMPORARY") {
+        if self.system
+            || self.table_type.eq_ignore_ascii_case("TEMPORARY")
+            || self.table_type == crate::graph::STORAGE_TYPE
+        {
             return false;
         }
         !self

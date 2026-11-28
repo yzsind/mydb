@@ -67,6 +67,7 @@ pub(crate) mod cte;
 pub(crate) mod cte_store;
 mod ddl_deprecation;
 mod dispatch;
+pub(crate) mod graph;
 mod integer_range_text;
 pub(crate) use dispatch::statement_writes_only_temp_tables;
 pub(crate) mod rls;
@@ -3798,6 +3799,7 @@ impl StorageQueryEngine {
 
     pub fn reset_session(&self, session: &mut SessionContext) -> Result<(), QueryError> {
         *session.mdl_fast_cache.borrow_mut() = Default::default();
+        session.current_graph = None;
         session.clear_sql_prepared_statements();
         let held_global_read_lock = crate::binlog::unlock_tables_for_session_scoped(
             session,
@@ -4411,6 +4413,9 @@ impl QueryEngine for StorageQueryEngine {
                 format!("unknown database '{database}'"),
             ));
         }
+        if session.current_database != db_name {
+            session.current_graph = None;
+        }
         session.current_database = db_name;
         session.mark_pfs_variables_dirty();
         Ok(())
@@ -4770,6 +4775,17 @@ impl QueryEngine for StorageQueryEngine {
             if let Err(err) = session.check_cancelled() {
                 return Some(Err(err));
             }
+            // GQL programs have their own expression and storage dispatcher.
+            // Keep diagnostics, cancellation and per-execution authorization
+            // while avoiding SQL function scopes and relational plan hints.
+            if matches!(statement, Statement::Graph(_)) {
+                let preserve_warnings = begin_statement_diagnostics(&self.db, session, sql);
+                let cancel_guard = crate::engine::cancel::install_session_cancel_context(session);
+                let result = self.execute_qualified_parsed_statement(session, sql, statement);
+                drop(cancel_guard);
+                finish_statement_diagnostics(&self.db, session, preserve_warnings, &result);
+                return Some(result);
+            }
             // SAFETY: db/session outlive this statement, including the constant
             // SELECT lane that bypasses dispatch. Sequence calls remain serial.
             let sequence_dependent = crate::planner::sql_mentions_sequence_fn(sql);
@@ -4794,11 +4810,10 @@ impl QueryEngine for StorageQueryEngine {
             // where L8 quota enforcement normally runs). Charge the per-account
             // budget here so sqlx / Connector/J prepared-binding apps don't sneak
             // past the limit.
-            let full_routine_dispatch = matches!(statement, Statement::Call(_))
+            let full_dispatch = matches!(statement, Statement::Call(_))
                 || routines::statement_references_stored_function(&self.db, session, &statement);
-            // Routine statements re-enter the full dispatcher, which charges the
-            // account itself. Keep the lightweight path's accounting exactly once.
-            if !session.internal_system_session && !full_routine_dispatch {
+            // The full dispatcher charges the account itself.
+            if !session.internal_system_session && !full_dispatch {
                 let limits = &session.account_limits;
                 if let Err(err) = crate::engine::auth::charge_question(
                     &session.authenticated_as,
@@ -6362,6 +6377,9 @@ impl StorageQueryEngine {
         // expression-column names (P2-C1), consistent with the execute path.
         let mut statement = (*self.parse_cached_statement(session, sql)?).clone();
         authorize_statement(&self.db, session, &statement)?;
+        if let Statement::Graph(command) = &statement {
+            return Ok(graph::columns(command));
+        }
         qualify_statement_tables(&self.db, session, &mut statement)?;
         // Bind routine return domains without executing their bodies. Keep the
         // same versioned descriptors available to PREPARE's column inference.
@@ -6837,7 +6855,7 @@ impl StorageQueryEngine {
         let binloggable_ddl = is_ddl
             && !matches!(
                 statement,
-                Statement::OptimizeTable { .. } | Statement::RecycleBin(_)
+                Statement::OptimizeTable { .. } | Statement::RecycleBin(_) | Statement::Graph(_)
             )
             && !statement_is_temp_ddl(session, &statement);
         let ddl_binlog_context =
@@ -6910,7 +6928,7 @@ impl StorageQueryEngine {
         let binloggable_ddl = is_ddl
             && !matches!(
                 statement,
-                Statement::OptimizeTable { .. } | Statement::RecycleBin(_)
+                Statement::OptimizeTable { .. } | Statement::RecycleBin(_) | Statement::Graph(_)
             )
             && !statement_is_temp_ddl(session, &statement);
         let ddl_binlog_context =
@@ -6952,7 +6970,7 @@ impl StorageQueryEngine {
         let binloggable_ddl = is_ddl
             && !matches!(
                 statement,
-                Statement::OptimizeTable { .. } | Statement::RecycleBin(_)
+                Statement::OptimizeTable { .. } | Statement::RecycleBin(_) | Statement::Graph(_)
             )
             && !statement_is_temp_ddl(session, &statement);
         let ddl_binlog_context =
@@ -6965,7 +6983,8 @@ impl StorageQueryEngine {
                     &session.authenticated_as,
                 )
             });
-        let already_qualified = !statement_refs_temp_table(session, &statement);
+        let already_qualified = !matches!(statement, Statement::Graph(_))
+            && !statement_refs_temp_table(session, &statement);
         let (result, wait_stats) =
             self.execute_statement_with_lock_wait_mode(session, statement, already_qualified, None);
         let result = maybe_log_binlog_ddl(
