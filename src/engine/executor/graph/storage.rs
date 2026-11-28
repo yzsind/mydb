@@ -1,7 +1,7 @@
 use super::super::mem_budget::{ControlledMemoryCategory, ControlledMemoryCharge};
 use super::*;
 use crate::graph::{Direction, IndexType, PropertyIndex};
-use crate::storage::{KeyPart, StoredRow};
+use crate::storage::{IndexState, KeyPart, StoredRow};
 use crate::util::fast_hash::{ah_hash_map, ah_hash_set, AhHashMap, AhHashSet};
 use serde_json::{Map, Value as Json};
 use smallvec::{smallvec, SmallVec};
@@ -21,6 +21,9 @@ const OWNER: usize = 4;
 const TOKEN: usize = 5;
 const TIE: usize = 6;
 const PAYLOAD: usize = 7;
+const EDGE_ROLE: usize = 10;
+const LABELED_OUT: &str = "g_lout";
+const LABELED_IN: &str = "g_lin";
 const MAX_KEY_BYTES: usize = 512;
 pub(super) const MAX_EDGES: usize = 1_000_000;
 const MAX_INLINE_EDGES: usize = 128;
@@ -39,9 +42,14 @@ pub(super) fn create(db: &Database, name: &str) -> Result<(), QueryError> {
             g_token VARBINARY(512),
             g_tie BIGINT UNSIGNED,
             g_payload JSON,
+            g_edge_src BIGINT UNSIGNED,
+            g_edge_dst BIGINT UNSIGNED,
+            g_edge_role BIGINT UNSIGNED,
             INDEX g_out (g_role, g_a, g_b, g_id),
             INDEX g_in (g_role, g_b, g_a, g_id) WHERE g_role IN (1,2,6),
-            UNIQUE INDEX g_key (g_role, g_owner, g_token, g_tie) WHERE g_role >= 3
+            UNIQUE INDEX g_key (g_role, g_owner, g_token, g_tie) WHERE g_role >= 3,
+            INDEX g_lout (g_token, g_edge_role, g_edge_src, g_edge_dst, g_a) WHERE g_role = 4,
+            INDEX g_lin (g_token, g_edge_role, g_edge_dst, g_edge_src, g_a) WHERE g_role = 4
         )",
     )
     .map_err(super::super::parse_error_to_query_error)?
@@ -67,6 +75,12 @@ impl ElementRef {
 #[derive(Clone, Copy)]
 pub(super) struct Neighbor {
     pub edge: ElementRef,
+    pub node: u64,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct LabeledNeighbor {
+    pub edge: u64,
     pub node: u64,
 }
 
@@ -106,6 +120,7 @@ struct GraphReadCache {
     location_builder: parking_lot::Mutex<()>,
     projected: [parking_lot::RwLock<Option<ProjectedPropertySnapshot>>; READ_CACHE_SHARDS],
     adjacency: [parking_lot::RwLock<Option<AdjacencySnapshot>>; READ_CACHE_SHARDS],
+    label_bounds: parking_lot::RwLock<Option<LabelBoundsSnapshot>>,
     index_definitions: parking_lot::RwLock<Option<IndexDefinitionsSnapshot>>,
     indexed_nodes: parking_lot::RwLock<Option<IndexedNodesSnapshot>>,
 }
@@ -192,7 +207,34 @@ struct ProjectedPropertySnapshot {
 
 struct AdjacencySnapshot {
     scn: u64,
-    lists: AhHashMap<(u64, Direction, bool), AdjacentList>,
+    lists: AhHashMap<AdjacencyCacheKey, AdjacentList>,
+    charge: ControlledMemoryCharge,
+}
+
+type AdjacencyCacheKey = (u64, Direction, bool, AdjacencyBounds);
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub(super) struct AdjacencyBounds {
+    edge: Option<(u64, u64)>,
+    endpoint: Option<(u64, u64)>,
+}
+
+impl AdjacencyBounds {
+    fn contains(self, edge: u64, endpoint: u64) -> bool {
+        self.edge
+            .is_none_or(|(low, high)| (low..=high).contains(&edge))
+            && self
+                .endpoint
+                .is_none_or(|(low, high)| (low..=high).contains(&endpoint))
+    }
+}
+
+type LabelKey = (u64, Vec<u8>);
+type LabelExtent = Option<(u64, u64)>;
+
+struct LabelBoundsSnapshot {
+    scn: u64,
+    bounds: AhHashMap<LabelKey, LabelExtent>,
     charge: ControlledMemoryCharge,
 }
 
@@ -374,6 +416,7 @@ impl GraphReadCache {
         scn: u64,
         direction: Direction,
         vertices_only: bool,
+        bounds: AdjacencyBounds,
         lists: &AhHashMap<u64, AdjacentList>,
         missed: &[u64],
     ) {
@@ -384,6 +427,7 @@ impl GraphReadCache {
                 scn,
                 direction,
                 vertices_only,
+                bounds,
                 lists,
                 missed,
                 limit,
@@ -402,6 +446,7 @@ impl GraphReadCache {
                     scn,
                     direction,
                     vertices_only,
+                    bounds,
                     lists,
                     &ids,
                     limit,
@@ -415,6 +460,7 @@ impl GraphReadCache {
         scn: u64,
         direction: Direction,
         vertices_only: bool,
+        bounds: AdjacencyBounds,
         lists: &AhHashMap<u64, AdjacentList>,
         missed: &[u64],
         limit: usize,
@@ -447,11 +493,11 @@ impl GraphReadCache {
         let cache = slot.as_mut().expect("adjacency snapshot was initialized");
         let mut remaining = limit.saturating_sub(cache.charge.bytes());
         let mut reserved = 0;
-        let mut additions = SmallVec::<[((u64, Direction, bool), &AdjacentList); 16]>::new();
+        let mut additions = SmallVec::<[(AdjacencyCacheKey, &AdjacentList); 16]>::new();
         for &id in missed {
             let list = &lists[&id];
-            let bytes = 96 + list.payload.bytes();
-            let key = (id, direction, vertices_only);
+            let bytes = 96 + std::mem::size_of::<AdjacencyBounds>() + list.payload.bytes();
+            let key = (id, direction, vertices_only, bounds);
             if bytes > remaining || bytes > 16 * 1024 || cache.lists.contains_key(&key) {
                 continue;
             }
@@ -501,6 +547,7 @@ impl NodeLocatorCache {
             location_builder: parking_lot::Mutex::new(()),
             projected: Default::default(),
             adjacency: Default::default(),
+            label_bounds: Default::default(),
             index_definitions: parking_lot::RwLock::default(),
             indexed_nodes: parking_lot::RwLock::default(),
         });
@@ -818,6 +865,16 @@ impl<'a> GraphStore<'a> {
             .iter()
             .find(|index| index.name.eq_ignore_ascii_case(name))
             .expect("graph indexes are fixed")
+    }
+
+    pub fn has_labeled_adjacency(&self) -> bool {
+        !self.txn.historical
+            && [LABELED_OUT, LABELED_IN].iter().all(|name| {
+                self.table
+                    .indexes
+                    .iter()
+                    .any(|index| index.name == *name && index.state == IndexState::Public)
+            })
     }
 
     fn read_cache(&self) -> Option<&Arc<GraphReadCache>> {
@@ -1244,7 +1301,9 @@ impl<'a> GraphStore<'a> {
                 ids.retain(|id| !self.projected_values.contains_key(id));
             }
         }
-        for window in ids.chunks(128) {
+        // Scalar predicates borrow the JSON bytes. Give each ordered page
+        // read a wider set of positions without accumulating whole payloads.
+        for window in ids.chunks(512) {
             crate::engine::cancel::check_cancelled()?;
             let mut inline = Vec::new();
             self.db.visit_inline_json_rows(
@@ -1381,7 +1440,20 @@ impl<'a> GraphStore<'a> {
         ids.sort_unstable();
         ids.dedup();
         let mut members = ah_hash_set();
-        for window in ids.chunks(1024) {
+        let filtered = if ids.len() >= 64 {
+            match self.label_extent(role, &label)? {
+                Some(None) => return Ok(members),
+                Some(Some((low, high))) => {
+                    let start = ids.partition_point(|id| *id < low);
+                    let end = ids.partition_point(|id| *id <= high);
+                    &ids[start..end]
+                }
+                None => &ids,
+            }
+        } else {
+            &ids
+        };
+        for window in filtered.chunks(1024) {
             crate::engine::cancel::check_cancelled()?;
             if window.len() >= 16 && !self.txn.historical {
                 let keys: Vec<_> = window
@@ -1395,32 +1467,24 @@ impl<'a> GraphStore<'a> {
                         ])
                     })
                     .collect();
-                let entries = self.db.lookup_prefixes_prefetched_mapped(
+                let entries = self.db.lookup_exact_rows_prefetched(
                     &self.table,
                     self.index("g_key"),
                     &keys,
                     self.txn,
                     window.len(),
-                    |key, row| match key.0.last() {
-                        Some(KeyPart::UInt(id)) => Some((*id, row)),
-                        _ => None,
-                    },
                 )?;
                 if let Some((entries, bound)) = entries {
-                    let invalid_key = || invalid("Invalid graph label index key");
                     // A label membership is inserted or deleted as a whole.
                     // Its key never changes in place, so only visibility is needed.
                     let visible = self.index_visibility_mask(
                         "g_key",
                         bound,
-                        entries
-                            .iter()
-                            .map(|entry| entry.map(|(_, row)| row).ok_or_else(invalid_key)),
+                        entries.iter().map(|&(_, row)| Ok(row)),
                     )?;
-                    for (slot, entry) in entries.into_iter().enumerate() {
-                        let (id, _) = entry.ok_or_else(invalid_key)?;
+                    for (slot, (key, _)) in entries.into_iter().enumerate() {
                         if visible.as_ref().is_none_or(|mask| mask[slot]) {
-                            members.insert(id);
+                            members.insert(window[key as usize]);
                         }
                     }
                     continue;
@@ -1433,6 +1497,133 @@ impl<'a> GraphStore<'a> {
             }
         }
         Ok(members)
+    }
+
+    pub fn adjacency_bounds(
+        &self,
+        edge_label: Option<&String>,
+        endpoint_label: Option<&String>,
+    ) -> Result<Option<AdjacencyBounds>, QueryError> {
+        let extent = |role, label: Option<&String>| {
+            if let Some(label) = label.filter(|label| label.len() <= MAX_KEY_BYTES) {
+                self.label_extent(role, label.as_bytes())
+            } else {
+                Ok(None)
+            }
+        };
+        let edge = extent(EDGE_LABEL, edge_label)?;
+        let endpoint = extent(NODE_LABEL, endpoint_label)?;
+        if edge == Some(None) || endpoint == Some(None) {
+            return Ok(None);
+        }
+        Ok(Some(AdjacencyBounds {
+            edge: edge.flatten(),
+            endpoint: endpoint.flatten(),
+        }))
+    }
+
+    // The first and last keys are conservative for visibility: a snapshot's
+    // retired keys are merged by the cursor and newer physical keys can
+    // only widen the bounds. The point probes still check label visibility.
+    fn label_extent(&self, role: u64, label: &[u8]) -> Result<Option<LabelExtent>, QueryError> {
+        if self.txn.historical || crate::storage::lock_waits_nonblocking() {
+            return Ok(None);
+        }
+        let Some(cache) = self.read_cache() else {
+            return Ok(None);
+        };
+        let key = (role, label.to_vec());
+        let scn = self.txn.snapshot_scn;
+        {
+            let Some(slot) = cache.label_bounds.try_read() else {
+                return Ok(None);
+            };
+            if let Some(cache) = slot.as_ref() {
+                if cache.scn > scn {
+                    return Ok(None);
+                }
+                if cache.scn == scn {
+                    if let Some(extent) = cache.bounds.get(&key) {
+                        return Ok(Some(*extent));
+                    }
+                    if cache.bounds.len() >= 128 {
+                        return Ok(None);
+                    }
+                }
+            }
+        }
+        let Some(mut slot) = cache.label_bounds.try_write() else {
+            return Ok(None);
+        };
+        if slot.as_ref().is_some_and(|cache| cache.scn > scn) {
+            return Ok(None);
+        }
+        if slot.as_ref().is_none_or(|cache| cache.scn != scn) {
+            let Some(charge) =
+                ControlledMemoryCharge::try_new_optional(ControlledMemoryCategory::DerivedCache, 0)
+            else {
+                return Ok(None);
+            };
+            *slot = Some(LabelBoundsSnapshot {
+                scn,
+                bounds: ah_hash_map(),
+                charge,
+            });
+        }
+        let state = slot
+            .as_mut()
+            .expect("label bounds snapshot was initialized");
+        if let Some(extent) = state.bounds.get(&key) {
+            return Ok(Some(*extent));
+        }
+        if state.bounds.len() >= 128 {
+            return Ok(None);
+        }
+
+        let prefix = Some(IndexBound {
+            key: IndexKey(smallvec![
+                KeyPart::UInt(role),
+                KeyPart::UInt(0),
+                KeyPart::Bytes(label.to_vec()),
+            ]),
+            inclusive: true,
+        });
+        let index = self.index("g_key");
+        let mut forward = self.db.range_index_snapshot_cursor(
+            &self.table,
+            index,
+            prefix.clone(),
+            prefix.clone(),
+            self.txn,
+        )?;
+        let read_id = |entries: Vec<(IndexKey, RowId)>| {
+            entries.first().and_then(|(key, _)| match key.0.last() {
+                Some(KeyPart::UInt(id)) => Some(*id),
+                _ => None,
+            })
+        };
+        let (entries, _) = forward.next_leaf_chunk(1)?;
+        let extent = if entries.is_empty() {
+            None
+        } else {
+            let low = read_id(entries).ok_or_else(|| invalid("Invalid graph label index key"))?;
+            let mut reverse = self.db.range_index_snapshot_reverse_cursor(
+                &self.table,
+                index,
+                prefix.clone(),
+                prefix,
+                self.txn,
+            )?;
+            let Some(high) = read_id(reverse.next_leaf_chunk(1)?.0).filter(|high| *high >= low)
+            else {
+                return Ok(None);
+            };
+            Some((low, high))
+        };
+        if state.charge.try_grow_optional(96 + key.1.len()) {
+            state.bounds.insert(key, extent);
+        }
+        Ok(Some(extent))
     }
 
     fn labels_for(
@@ -1632,6 +1823,7 @@ impl<'a> GraphStore<'a> {
         anchors: &[u64],
         direction: Direction,
         vertices_only: bool,
+        bounds: AdjacencyBounds,
     ) -> Result<Option<AdjacentBatch>, QueryError> {
         if anchors.is_empty() {
             return Ok(None);
@@ -1656,7 +1848,7 @@ impl<'a> GraphStore<'a> {
                     .as_ref()
                     .and_then(|slot| slot.as_ref())
                     .filter(|state| state.scn == self.txn.snapshot_scn)
-                    .and_then(|state| state.lists.get(&(id, direction, vertices_only)));
+                    .and_then(|state| state.lists.get(&(id, direction, vertices_only, bounds)));
                 let Some(list) = list else {
                     return true;
                 };
@@ -1679,7 +1871,7 @@ impl<'a> GraphStore<'a> {
                 .iter()
                 .map(|&id| IndexKey(smallvec![KeyPart::UInt(role), KeyPart::UInt(id)]))
                 .collect();
-            let Some((entries, bound)) = self.db.lookup_prefixes_prefetched_mapped(
+            let Some((mut entries, bound)) = self.db.lookup_prefixes_prefetched_mapped(
                 &self.table,
                 index,
                 &keys,
@@ -1698,6 +1890,23 @@ impl<'a> GraphStore<'a> {
             };
             batch_entries += entries.len();
             let invalid_key = || invalid("Invalid graph adjacency index key");
+            if bounds != AdjacencyBounds::default() {
+                // A label extent is only a negative proof. Drop unrelated
+                // entries before visiting their heap pages for visibility.
+                entries.retain(|entry| {
+                    let Some((anchor, node, edge, _)) = *entry else {
+                        return true;
+                    };
+                    if bounds.contains(edge, node) {
+                        return true;
+                    }
+                    pending
+                        .entry(anchor)
+                        .or_insert_with(|| (0, NeighborBuffer::new(vertices_only)))
+                        .0 += 1;
+                    false
+                });
+            }
             let visible = self.index_visibility_mask(
                 name,
                 bound,
@@ -1744,6 +1953,7 @@ impl<'a> GraphStore<'a> {
                 self.txn.snapshot_scn,
                 direction,
                 vertices_only,
+                bounds,
                 &found,
                 &unique,
             );
@@ -1760,10 +1970,11 @@ impl<'a> GraphStore<'a> {
         direction: Direction,
         vertices_only: bool,
         batch_size: usize,
+        bounds: AdjacencyBounds,
     ) -> Result<SmallVec<[Option<AdjacentBatch>; 4]>, QueryError> {
         let collect = |part: &[u64]| {
             part.chunks(batch_size)
-                .map(|batch| self.lookup_adjacent_batch(batch, direction, vertices_only))
+                .map(|batch| self.lookup_adjacent_batch(batch, direction, vertices_only, bounds))
                 .collect::<Result<SmallVec<[Option<AdjacentBatch>; 4]>, _>>()
         };
         if anchors.len() <= batch_size {
@@ -1794,6 +2005,147 @@ impl<'a> GraphStore<'a> {
         })
     }
 
+    /// The index entries belong to transactional edge-label memberships.
+    /// An anonymous edge needs only the logical edge and neighbor IDs.
+    pub fn labeled_adjacency(
+        &mut self,
+        anchors: &[u64],
+        direction: Direction,
+        label: &str,
+        bounds: AdjacencyBounds,
+    ) -> Result<AhHashMap<u64, Vec<LabeledNeighbor>>, QueryError> {
+        let label = token(label)?;
+        let mut unique = anchors.to_vec();
+        unique.sort_unstable();
+        unique.dedup();
+        let inline = crate::storage::lock_waits_nonblocking();
+        let limit = if inline { MAX_INLINE_EDGES } else { MAX_EDGES };
+        let remaining = limit.saturating_sub(self.edges_examined);
+        let too_many = || {
+            if inline {
+                crate::storage::lock_would_block_error()
+            } else {
+                invalid("GQL adjacency examination limit exceeded")
+            }
+        };
+        let mut found = ah_hash_map::<u64, (usize, Vec<LabeledNeighbor>)>();
+        let mut examined = 0;
+        for &(adjacency, role) in adjacency_probes(direction) {
+            let incoming = adjacency == "g_in";
+            let name = if incoming { LABELED_IN } else { LABELED_OUT };
+            let index = self.index(name);
+            let prefix = |anchor| {
+                IndexKey(smallvec![
+                    KeyPart::Bytes(label.clone()),
+                    KeyPart::UInt(role),
+                    KeyPart::UInt(anchor),
+                ])
+            };
+            let keys = unique.iter().map(|&id| prefix(id)).collect::<Vec<_>>();
+            let decode = |key: IndexKey, row| match key.0.as_slice() {
+                [_, _, KeyPart::UInt(anchor), KeyPart::UInt(node), KeyPart::UInt(edge)] => Some((
+                    *anchor,
+                    LabeledNeighbor {
+                        edge: *edge,
+                        node: *node,
+                    },
+                    row,
+                )),
+                _ => None,
+            };
+            let consume = |entries: Vec<Option<(u64, LabeledNeighbor, RowId)>>,
+                           page_bound,
+                           found: &mut AhHashMap<u64, (usize, Vec<LabeledNeighbor>)>,
+                           examined: &mut usize|
+             -> Result<(), QueryError> {
+                *examined += entries.len();
+                if *examined > remaining {
+                    return Err(too_many());
+                }
+                let invalid_key = || invalid("Invalid labeled graph adjacency index key");
+                let visible = self.index_visibility_mask(
+                    name,
+                    page_bound,
+                    entries
+                        .iter()
+                        .map(|entry| entry.map(|(_, _, row)| row).ok_or_else(invalid_key)),
+                )?;
+                for (slot, entry) in entries.into_iter().enumerate() {
+                    let (anchor, edge, _) = entry.ok_or_else(invalid_key)?;
+                    let (count, neighbors) = found.entry(anchor).or_default();
+                    *count += 1;
+                    let duplicate_loop = incoming
+                        && edge.node == anchor
+                        && matches!(direction, Direction::Either | Direction::Undirected);
+                    if !duplicate_loop
+                        && bounds.contains(edge.edge, edge.node)
+                        && visible.as_ref().is_none_or(|mask| mask[slot])
+                    {
+                        neighbors.push(edge);
+                    }
+                }
+                Ok(())
+            };
+            if let Some((entries, bound)) = self.db.lookup_prefixes_prefetched_mapped(
+                &self.table,
+                index,
+                &keys,
+                self.txn,
+                (remaining - examined).min(65_536),
+                decode,
+            )? {
+                consume(entries, bound, &mut found, &mut examined)?;
+                continue;
+            }
+            if inline {
+                return Err(crate::storage::lock_would_block_error());
+            }
+            for key in keys {
+                let bound = Some(IndexBound {
+                    key,
+                    inclusive: true,
+                });
+                let mut cursor = self.db.range_index_snapshot_cursor(
+                    &self.table,
+                    index,
+                    bound.clone(),
+                    bound,
+                    self.txn,
+                )?;
+                loop {
+                    crate::engine::cancel::check_cancelled()?;
+                    let (entries, page_bound) = cursor.next_leaf_chunk(256)?;
+                    if entries.is_empty() {
+                        break;
+                    }
+                    consume(
+                        entries
+                            .into_iter()
+                            .map(|(key, row)| decode(key, row))
+                            .collect(),
+                        page_bound,
+                        &mut found,
+                        &mut examined,
+                    )?;
+                }
+            }
+        }
+        let examined: usize = anchors
+            .iter()
+            .filter_map(|id| found.get(id))
+            .map(|(count, _)| *count)
+            .sum();
+        if examined > remaining {
+            return Err(too_many());
+        }
+        self.edges_examined += examined;
+        self.charge(examined * std::mem::size_of::<LabeledNeighbor>())?;
+        Ok(found
+            .into_iter()
+            .map(|(id, (_, edges))| (id, edges))
+            .collect())
+    }
+
     pub fn account_adjacency_batch(&mut self, batch: &AdjacentBatch) -> Result<(), QueryError> {
         if batch.examined > MAX_EDGES - self.edges_examined {
             return Err(invalid("GQL adjacency examination limit exceeded"));
@@ -1803,26 +2155,41 @@ impl<'a> GraphStore<'a> {
     }
 
     pub fn adjacent(&mut self, id: u64, direction: Direction) -> Result<Vec<Neighbor>, QueryError> {
+        self.adjacent_bounded(id, direction, AdjacencyBounds::default())
+    }
+
+    pub fn adjacent_bounded(
+        &mut self,
+        id: u64,
+        direction: Direction,
+        bounds: AdjacencyBounds,
+    ) -> Result<Vec<Neighbor>, QueryError> {
         if crate::storage::lock_waits_nonblocking() {
             return Err(crate::storage::lock_would_block_error());
         }
         let mut neighbors = Vec::new();
         for &(name, role) in adjacency_probes(direction) {
             let idx = self.index(name);
-            let bound = Some(IndexBound {
-                key: IndexKey(smallvec![KeyPart::UInt(role), KeyPart::UInt(id)]),
-                inclusive: true,
-            });
+            let bound = |endpoint: Option<u64>| {
+                let mut key = smallvec![KeyPart::UInt(role), KeyPart::UInt(id)];
+                if let Some(endpoint) = endpoint {
+                    key.push(KeyPart::UInt(endpoint));
+                }
+                Some(IndexBound {
+                    key: IndexKey(key),
+                    inclusive: true,
+                })
+            };
             let mut cursor = self.db.range_index_snapshot_cursor(
                 &self.table,
                 idx,
-                bound.clone(),
-                bound,
+                bound(bounds.endpoint.map(|(low, _)| low)),
+                bound(bounds.endpoint.map(|(_, high)| high)),
                 self.txn,
             )?;
             let mut batch_size = 16;
             loop {
-                let (entries, page_bound) = cursor.next_leaf_chunk(batch_size)?;
+                let (mut entries, page_bound) = cursor.next_leaf_chunk(batch_size)?;
                 if entries.is_empty() {
                     break;
                 }
@@ -1830,6 +2197,11 @@ impl<'a> GraphStore<'a> {
                 self.edges_examined += entries.len();
                 if self.edges_examined > MAX_EDGES {
                     return Err(invalid("GQL adjacency examination limit exceeded"));
+                }
+                if bounds.edge.is_some() {
+                    entries.retain(|(key, _)| {
+                        adjacency_key(key).is_none_or(|(_, node, edge)| bounds.contains(edge, node))
+                    });
                 }
                 self.charge(entries.len() * std::mem::size_of::<Neighbor>())?;
                 let visible = self.index_visibility_mask(
@@ -1850,8 +2222,11 @@ impl<'a> GraphStore<'a> {
         Ok(neighbors)
     }
 
-    fn insert_row(&self, values: Vec<Value>) -> Result<ElementRef, QueryError> {
+    fn insert_row(&self, mut values: Vec<Value>) -> Result<ElementRef, QueryError> {
         let role = uint(&values[ROLE])?;
+        if values.len() < self.table.columns.len() {
+            values.resize(self.table.columns.len(), Value::Null);
+        }
         let inserted = self
             .db
             .insert_rows_detailed(self.txn, &self.name, vec![values])?;
@@ -1876,7 +2251,7 @@ impl<'a> GraphStore<'a> {
             json(Json::Object(props.clone())),
         ])?;
         self.nodes.remove(&entry.id);
-        self.insert_labels(entry, labels)?;
+        self.insert_labels(entry, labels, None)?;
         self.refresh_properties(entry, labels, &props)?;
         Ok(entry)
     }
@@ -1919,7 +2294,7 @@ impl<'a> GraphStore<'a> {
             Value::Null,
             json(Json::Object(props)),
         ])?;
-        self.insert_labels(entry, labels)?;
+        self.insert_labels(entry, labels, Some((src.id, dst.id)))?;
         Ok(entry)
     }
 
@@ -1941,11 +2316,16 @@ impl<'a> GraphStore<'a> {
         Ok(())
     }
 
-    fn insert_labels(&self, entry: ElementRef, labels: &[String]) -> Result<(), QueryError> {
+    fn insert_labels(
+        &self,
+        entry: ElementRef,
+        labels: &[String],
+        endpoints: Option<(u64, u64)>,
+    ) -> Result<(), QueryError> {
         let role = if entry.node() { NODE_LABEL } else { EDGE_LABEL };
         let labels: std::collections::BTreeSet<_> = labels.iter().collect();
         for label in labels {
-            self.insert_row(vec![
+            let mut row = vec![
                 Value::Null,
                 Value::UInt(role),
                 Value::UInt(entry.id),
@@ -1954,7 +2334,11 @@ impl<'a> GraphStore<'a> {
                 Value::Bytes(token(label)?),
                 Value::UInt(entry.id),
                 Value::Null,
-            ])?;
+            ];
+            if let Some((src, dst)) = endpoints.filter(|_| self.table.columns.len() > EDGE_ROLE) {
+                row.extend([Value::UInt(src), Value::UInt(dst), Value::UInt(entry.role)]);
+            }
+            self.insert_row(row)?;
         }
         Ok(())
     }
@@ -1983,7 +2367,12 @@ impl<'a> GraphStore<'a> {
         if label {
             let old = labels.iter().position(|(_, old_label)| old_label == key);
             if value.is_some() && old.is_none() {
-                self.insert_labels(entry, &[key.to_owned()])?;
+                let endpoints = if entry.node() {
+                    None
+                } else {
+                    Some((uint(&current.values[A])?, uint(&current.values[B])?))
+                };
+                self.insert_labels(entry, &[key.to_owned()], endpoints)?;
                 labels.push((entry.row, key.into()));
             } else if let Some(old) = old.filter(|_| value.is_none()) {
                 self.delete_row(labels.remove(old).0)?;

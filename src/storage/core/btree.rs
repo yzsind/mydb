@@ -8278,21 +8278,49 @@ impl IndexFile {
         max_entries: usize,
         map: impl Fn(IndexKey, RowId) -> T,
     ) -> Result<Option<(Vec<T>, u64)>, QueryError> {
+        self.lookup_entries_many_prefetched_pages(keys, max_entries, false, |buf, keys, base| {
+            lookup_leaf_entries_many_page_bytes(
+                buf,
+                keys,
+                base,
+                false,
+                &mut None,
+                &|_, key, row| map(key, row),
+            )
+        })
+    }
+
+    /// Covering probes that return the input slot and physical RowId. The
+    /// full stored key is not needed by a caller probing an exact key.
+    pub(crate) fn lookup_exact_rows_many_prefetched(
+        &self,
+        keys: &[IndexKey],
+        max_entries: usize,
+    ) -> Result<Option<(Vec<(u32, RowId)>, u64)>, QueryError> {
+        self.lookup_entries_many_prefetched_pages(keys, max_entries, true, |buf, keys, base| {
+            lookup_leaf_entries_many_keyed_page_bytes(buf, keys, base, true, &mut None)
+        })
+    }
+
+    fn lookup_entries_many_prefetched_pages<T>(
+        &self,
+        keys: &[IndexKey],
+        max_entries: usize,
+        exact: bool,
+        lookup_page: impl Fn(
+            &[u8],
+            &[IndexKey],
+            usize,
+        ) -> Result<LeafEntriesManyLookupResult<T>, QueryError>,
+    ) -> Result<Option<(Vec<T>, u64)>, QueryError> {
         let _structure = self.structure_lock.read_recursive();
         self.ensure_healthy()?;
         let mut entries = Vec::new();
         let mut page_bound = 0;
         let mut continuations = Vec::new();
         let complete = self.visit_covering_prefix_leaves(keys, |range, buf| {
-            page_bound = page_bound.max(parse_leaf_payload_header(buf)?.page_max_trx_id);
-            let result = lookup_leaf_entries_many_page_bytes(
-                buf,
-                &keys[range.start..range.end],
-                range.start,
-                false,
-                &mut None,
-                &|_, key, row| map(key, row),
-            )?;
+            let result = lookup_page(buf, &keys[range.start..range.end], range.start)?;
+            page_bound = page_bound.max(result.page_max_trx_id);
             entries.extend(result.entries);
             if entries.len() > max_entries {
                 return Ok(false);
@@ -8301,16 +8329,12 @@ impl IndexFile {
                 for offset in result.continue_key_offsets {
                     let offset = range.start + offset;
                     if range.upper.as_deref().is_some_and(|upper| {
-                        compare_index_entry_to_lookup_key(upper, &keys[offset], false)
+                        compare_index_entry_to_lookup_key(upper, &keys[offset], exact)
                             == std::cmp::Ordering::Greater
                     }) {
                         continue;
                     }
-                    continuations.push((
-                        offset,
-                        first_leaf,
-                        IndexPageProgress::new(first_leaf),
-                    ));
+                    continuations.push((offset, first_leaf, IndexPageProgress::new(first_leaf)));
                 }
             }
             Ok(true)
@@ -8334,9 +8358,7 @@ impl IndexFile {
             for (offset, leaf, mut chain) in continuations.drain(..) {
                 let pinned = self.buffer_pool.pin_page_ref(self.page_key_ref(leaf))?;
                 let result = pinned.with_index_raw_bytes(|buf| {
-                    lookup_leaf_entry_page_bytes(
-                        buf, &keys[offset], 0, false, &mut None, &|_, key, row| map(key, row),
-                    )
+                    lookup_page(buf, &keys[offset..offset + 1], offset)
                 })?;
                 drop(pinned);
                 page_bound = page_bound.max(result.page_max_trx_id);
@@ -8344,7 +8366,10 @@ impl IndexFile {
                 if entries.len() > max_entries {
                     return Ok(None);
                 }
-                if let Some(next) = result.next_leaf.filter(|_| result.should_continue) {
+                if let Some(next) = result
+                    .next_leaf
+                    .filter(|_| !result.continue_key_offsets.is_empty())
+                {
                     chain.advance(next)?;
                     next_round.push((offset, next, chain));
                 }
@@ -17583,6 +17608,7 @@ struct LeafEntriesManyLookupResult<E> {
     entries: Vec<E>,
     next_leaf: Option<u64>,
     continue_key_offsets: Vec<usize>,
+    page_max_trx_id: u64,
 }
 
 /// Per-leaf outcome for `keys_first_visible_match_leaf_page` — the
@@ -21179,6 +21205,7 @@ fn lookup_leaf_entries_many_page_bytes<E, F: Fn(usize, IndexKey, RowId) -> E>(
             entries: Vec::new(),
             next_leaf: hdr.next_leaf,
             continue_key_offsets: (0..keys.len()).collect(),
+            page_max_trx_id: hdr.page_max_trx_id,
         });
     }
 
@@ -21257,6 +21284,7 @@ fn lookup_leaf_entries_many_page_bytes<E, F: Fn(usize, IndexKey, RowId) -> E>(
         entries,
         next_leaf: hdr.next_leaf,
         continue_key_offsets,
+        page_max_trx_id: hdr.page_max_trx_id,
     })
 }
 
@@ -21273,6 +21301,7 @@ fn lookup_leaf_entries_many_keyed_page_bytes(
             entries: Vec::new(),
             next_leaf: hdr.next_leaf,
             continue_key_offsets: (0..keys.len()).collect(),
+            page_max_trx_id: hdr.page_max_trx_id,
         });
     }
 
@@ -21283,6 +21312,8 @@ fn lookup_leaf_entries_many_keyed_page_bytes(
     // binary search at slot zero.  This turns a page-local batch into
     // an ordered merge with binary skips: each successive lookup only
     // searches the unconsumed suffix of the leaf.
+    let search_depth = (usize::BITS - hdr.count.leading_zeros()) as usize;
+    let dense = keys.len().saturating_mul(search_depth) >= hdr.count;
     let mut search_floor = 0usize;
     for (key_offset, target) in keys.iter().enumerate() {
         if exact {
@@ -21334,17 +21365,19 @@ fn lookup_leaf_entries_many_keyed_page_bytes(
         }
 
         let mut lo = search_floor;
-        let mut hi = hdr.count;
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            let mut cursor = hdr.read_slot_offset(mid);
-            let mid_key = hdr.decode_key_at(&mut cursor)?;
-            if compare_index_entry_to_lookup_key(&mid_key, target, exact)
-                == std::cmp::Ordering::Less
-            {
-                lo = mid + 1;
-            } else {
-                hi = mid;
+        if dense && key_offset > 0 {
+            while lo < hdr.count && hdr.cmp_key_at(lo, target)?.0 == std::cmp::Ordering::Less {
+                lo += 1;
+            }
+        } else {
+            let mut hi = hdr.count;
+            while lo < hi {
+                let mid = lo + (hi - lo) / 2;
+                if hdr.cmp_key_at(mid, target)?.0 == std::cmp::Ordering::Less {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
             }
         }
 
@@ -21352,8 +21385,13 @@ fn lookup_leaf_entries_many_keyed_page_bytes(
         let mut i = lo;
         while i < hdr.count {
             let mut cursor = hdr.read_slot_offset(i);
-            let entry_key = hdr.decode_key_at(&mut cursor)?;
-            match compare_index_entry_to_lookup_key(&entry_key, target, exact) {
+            let ordering = if hdr.key_layout == KEY_LAYOUT_GENERIC {
+                compare_generic_index_key_from_mode(hdr.payload, &mut cursor, target, !exact)?
+            } else {
+                let entry_key = hdr.decode_key_at(&mut cursor)?;
+                compare_index_entry_to_lookup_key(&entry_key, target, exact)
+            };
+            match ordering {
                 std::cmp::Ordering::Less => {
                     return Err(error(
                         crate::error::catalog::ER_GET_ERRNO,
@@ -21384,6 +21422,7 @@ fn lookup_leaf_entries_many_keyed_page_bytes(
         entries,
         next_leaf: hdr.next_leaf,
         continue_key_offsets,
+        page_max_trx_id: hdr.page_max_trx_id,
     })
 }
 

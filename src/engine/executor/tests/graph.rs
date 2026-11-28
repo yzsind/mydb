@@ -435,7 +435,8 @@ fn property_graph_fixed_walk_batches_labels_with_snapshot_visibility() {
         writer,
         &format!(
             "FOR k IN [{keys}] INSERT (a:Anchor {{key:k}}), (b:Leaf & Active {{key:k}}), \
-         (a)-[:Link & Keep]->(b), (a)~[:Link & Keep]~(b), (a)-[:Link]->(b)"
+         (a)-[:Link & Keep {{weight:1}}]->(b), (a)~[:Link & Keep {{weight:2}}]~(b), \
+         (a)-[:Link {{weight:3}}]->(b)"
         ),
     );
     let pattern = "(a:Anchor {key:k})-[:Link & Keep]-(b:Leaf & Active WHERE b.key >= 2)";
@@ -444,6 +445,23 @@ fn property_graph_fixed_walk_batches_labels_with_snapshot_visibility() {
     let reference = format!("FOR k IN [{keys},{keys}] MATCH p = WALK {pattern} {projection}");
     let expected = rows(&engine, reader, &reference);
     assert_eq!(expected.len(), 88);
+    let edge_pattern =
+        "(a:Anchor {key:k})-[e:Link & Keep WHERE e.weight >= 2]-(b:Leaf & Active WHERE b.key >= 2)";
+    let edge_projection =
+        "RETURN CAST(b.key AS INT64) AS key, CAST(e.weight AS INT64) AS weight ORDER BY key";
+    let batched_edges = format!("FOR k IN [{keys},{keys}] MATCH {edge_pattern} {edge_projection}");
+    let reference_edges =
+        format!("FOR k IN [{keys},{keys}] MATCH p = WALK {edge_pattern} {edge_projection}");
+    let expected_edges = rows(&engine, reader, &reference_edges);
+    assert_eq!(expected_edges.len(), 44);
+    query(
+        &engine,
+        writer,
+        &format!(
+            "FOR k IN [{keys}] MATCH (a:Anchor {{key:k}}) \
+             INSERT (a)-[:Link {{weight:2}}]->(:Other {{key:k}})"
+        ),
+    );
     query(
         &engine,
         reader,
@@ -451,8 +469,14 @@ fn property_graph_fixed_walk_batches_labels_with_snapshot_visibility() {
     );
     query(&engine, reader, "START TRANSACTION READ ONLY");
     assert_eq!(rows(&engine, reader, &batched), expected);
+    assert_eq!(rows(&engine, reader, &batched_edges), expected_edges);
+    let broader = format!(
+        "FOR k IN [{keys},{keys}] MATCH (a:Anchor {{key:k}})-[:Link]-(b) \
+         RETURN CAST(b.key AS INT64) AS key ORDER BY key"
+    );
+    assert_eq!(rows(&engine, reader, &broader).len(), 192);
 
-    let remove = "MATCH (:Anchor)-[e:Keep]-(:Leaf) REMOVE e:Keep";
+    let remove = "MATCH (:Anchor)-[e:Keep]-(:Leaf) REMOVE e:Link";
     query(&engine, writer, "BEGIN");
     query(&engine, writer, remove);
     assert!(rows(&engine, writer, &batched).is_empty());
@@ -461,6 +485,170 @@ fn property_graph_fixed_walk_batches_labels_with_snapshot_visibility() {
 
     query(&engine, writer, remove);
     assert_eq!(rows(&engine, reader, &batched), expected);
+    assert_eq!(rows(&engine, reader, &batched_edges), expected_edges);
     query(&engine, reader, "COMMIT");
     assert!(rows(&engine, reader, &batched).is_empty());
+    assert!(rows(&engine, reader, &batched_edges).is_empty());
+    query(
+        &engine,
+        writer,
+        "MATCH (:Anchor)-[e:Keep]-(:Leaf) SET e:Link",
+    );
+    assert_eq!(rows(&engine, reader, &batched_edges), expected_edges);
+}
+
+fn labeled_graph_fixture(engine: &StorageQueryEngine, session: &mut SessionContext) {
+    open_graph(engine, session);
+    query(
+        engine,
+        session,
+        "INSERT (a:N {k:0}), (b:N {k:1}), (c:N {k:2}), (d:N {k:3}), \
+         (a)-[:Blue & Red]->(b), (a)-[:Red]->(b), (a)-[:Blue]->(c), \
+         (b)-[:Blue]->(a), (a)-[:Blue]->(a), (a)~[:Blue & Red]~(d), (a)~[:Blue]~(a)",
+    );
+}
+
+fn labeled_endpoints(
+    engine: &StorageQueryEngine,
+    session: &mut SessionContext,
+    pattern: &str,
+) -> Vec<Value> {
+    rows(
+        engine,
+        session,
+        &format!("MATCH {pattern} RETURN CAST(b.k AS INT64) AS k ORDER BY k"),
+    )
+    .into_iter()
+    .map(|mut row| row.remove(0))
+    .collect()
+}
+
+#[test]
+fn property_graph_labeled_adjacency_directions_and_snapshot_visibility() {
+    let tmp = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let engine = open_strict_test_engine(tmp.path());
+    let reader = &mut SessionContext::default();
+    let writer = &mut SessionContext::default();
+    writer.connection_id = 2;
+    labeled_graph_fixture(&engine, reader);
+    query(&engine, writer, "SESSION SET GRAPH kg");
+    let schema = engine
+        .database_for_replication()
+        .table_in_database("test", "__mydb_graph_kg")
+        .unwrap();
+    assert!(schema.indexes.iter().any(|i| i.name == "g_lout"));
+    assert!(schema.indexes.iter().any(|i| i.name == "g_lin"));
+    for (pattern, expected) in [
+        ("(:N {k:0})-[:Blue]->(b)", vec![0, 1, 2]),
+        ("(:N {k:0})<-[:Blue]-(b)", vec![0, 1]),
+        ("(:N {k:0})-[:Blue]-(b)", vec![0, 0, 1, 1, 2, 3]),
+        ("(:N {k:0})~[:Blue]~(b)", vec![0, 3]),
+        ("(:N {k:3})~[:Blue & Red]~(b)", vec![0]),
+        ("(:N {k:0})-[:Blue & Red]->(b)", vec![1]),
+        ("(:N {k:0})-[:Red]->(b)", vec![1, 1]),
+    ] {
+        assert_eq!(
+            labeled_endpoints(&engine, reader, pattern),
+            expected.into_iter().map(Value::Int).collect::<Vec<_>>(),
+            "{pattern}"
+        );
+    }
+    let both = "(:N {k:0})-[:Blue & Red]->(b)";
+    query(
+        &engine,
+        reader,
+        "SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ",
+    );
+    query(&engine, reader, "START TRANSACTION READ ONLY");
+    assert_eq!(
+        labeled_endpoints(&engine, reader, both),
+        vec![Value::Int(1)]
+    );
+    let remove = "MATCH (:N {k:0})-[e:Blue & Red]->(:N {k:1}) REMOVE e:Blue";
+    query(&engine, writer, "BEGIN");
+    query(&engine, writer, "SAVEPOINT s");
+    query(&engine, writer, remove);
+    assert!(labeled_endpoints(&engine, writer, both).is_empty());
+    query(&engine, writer, "ROLLBACK TO s");
+    assert_eq!(
+        labeled_endpoints(&engine, writer, both),
+        vec![Value::Int(1)]
+    );
+    query(&engine, writer, remove);
+    query(&engine, writer, "COMMIT");
+    assert_eq!(
+        labeled_endpoints(&engine, reader, both),
+        vec![Value::Int(1)]
+    );
+    query(&engine, reader, "COMMIT");
+    assert!(labeled_endpoints(&engine, reader, both).is_empty());
+
+    query(
+        &engine,
+        writer,
+        "MATCH (:N {k:0})-[e:Red]->(:N {k:1}) SET e:Blue",
+    );
+    assert_eq!(
+        labeled_endpoints(&engine, reader, both),
+        vec![Value::Int(1), Value::Int(1)]
+    );
+    query(&engine, writer, "MATCH (b:N {k:1}) DETACH DELETE b");
+    assert!(labeled_endpoints(&engine, reader, both).is_empty());
+    assert_eq!(
+        labeled_endpoints(&engine, reader, "(:N {k:0})-[:Blue]-(b)"),
+        vec![Value::Int(0), Value::Int(0), Value::Int(2), Value::Int(3)]
+    );
+}
+
+#[test]
+fn property_graph_labeled_adjacency_replays_committed_wal() {
+    const CHILD_DIR: &str = "MYDB_LABELED_GRAPH_CRASH_DIR";
+    if let Some(path) = std::env::var_os(CHILD_DIR) {
+        let engine = open_strict_test_engine(std::path::Path::new(&path));
+        let session = &mut SessionContext::default();
+        labeled_graph_fixture(&engine, session);
+        engine.database_for_replication().checkpoint().unwrap();
+        query(&engine, session, "BEGIN");
+        query(
+            &engine,
+            session,
+            "MATCH (:N {k:0})-[e:Blue & Red]->(:N {k:1}) REMOVE e:Blue",
+        );
+        query(
+            &engine,
+            session,
+            "MATCH (a:N {k:0}), (c:N {k:2}) INSERT (a)~[:Red & Blue]~(c)",
+        );
+        query(&engine, session, "COMMIT");
+        query(&engine, session, "BEGIN");
+        query(
+            &engine,
+            session,
+            "MATCH (a:N {k:0}), (b:N {k:1}) INSERT (a)-[:Red & Blue]->(b)",
+        );
+        std::process::exit(86);
+    }
+
+    let tmp = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "engine::executor::tests::graph::property_graph_labeled_adjacency_replays_committed_wal",
+        ])
+        .env(CHILD_DIR, tmp.path())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(86), "{output:?}");
+    let engine = open_strict_test_engine(tmp.path());
+    let session = &mut SessionContext::default();
+    query(&engine, session, "SESSION SET GRAPH kg");
+    assert!(labeled_endpoints(&engine, session, "(:N {k:0})-[:Blue & Red]->(b)").is_empty());
+    assert_eq!(
+        labeled_endpoints(&engine, session, "(:N {k:0})~[:Blue & Red]~(b)"),
+        vec![Value::Int(2), Value::Int(3)]
+    );
+    assert_eq!(
+        labeled_endpoints(&engine, session, "(:N {k:2})~[:Blue & Red]~(b)"),
+        vec![Value::Int(0)]
+    );
 }
