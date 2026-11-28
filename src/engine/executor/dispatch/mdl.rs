@@ -843,7 +843,11 @@ fn add_ddl_table_mdl_targets(
                     let (schema, name) = crate::storage::split_table_name(&schema, table);
                     add(
                         &crate::storage::table_key(&schema, &name),
-                        MdlLockType::Exclusive,
+                        if stmt.lock == AlterLock::Exclusive {
+                            MdlLockType::Exclusive
+                        } else {
+                            MdlLockType::SharedUpgradable
+                        },
                     );
                 }
             }

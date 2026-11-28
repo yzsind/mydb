@@ -1108,7 +1108,11 @@ impl Database {
         for table in db.catalog_read()?.tables.values() {
             db.primary_definition_highwater
                 .fetch_max(table.primary_definition_scn, Ordering::Release);
-            if table.primary_definition_scn != 0 {
+            if table.row_generation_txn_id != 0 {
+                db.primary_definition_highwater
+                    .fetch_max(db.visible_scn(), Ordering::Release);
+            }
+            if table.primary_definition_scn != 0 || table.row_generation_txn_id != 0 {
                 db.table_locks_sharded
                     .set_schema_floor(table.id, table.schema_version);
                 for id in table.storage_ids() {

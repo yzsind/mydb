@@ -4813,7 +4813,7 @@ impl Database {
         self.with_overflow_read(table_id, |ovf| Ok((ovf.page_count(), ovf.free_count())))
     }
 
-    /// Validate each published physical B-tree under its structural latch.
+    /// Validate published indexes without holding the handle exclusively.
     /// Vector graphs have their own storage format and are not B-trees.
     pub(crate) fn check_table_index_integrity(&self, table: &TableSchema) -> Vec<String> {
         let mut problems = Vec::new();
@@ -4824,8 +4824,15 @@ impl Database {
             {
                 let result = (|| {
                     let handle = self.index_handle(sid, &index.name)?;
-                    let file = handle.write();
-                    file.validate_structure()
+                    #[cfg(test)]
+                    if crate::util::env::var("MYDB_CHECK_BLOCKING_ORACLE").as_deref() == Ok("1") {
+                        return handle.write().validate_structure();
+                    }
+                    let file = handle.read();
+                    file.validate_structure_online(|| {
+                        #[cfg(test)]
+                        self.pause_ddl_backfill_for_test();
+                    })
                 })();
                 if let Err(err) = result {
                     problems.push(format!(
@@ -4839,47 +4846,77 @@ impl Database {
         problems
     }
 
-    /// M6 CHECK TABLE (docs/lob-management-audit-2026-07.md) — LOB
-    /// integrity check for one table. Returns a list of human-readable
-    /// problems (empty = healthy). Two layers:
-    ///   1. **Structural** per storage id (partitions each have their own
-    ///      `.lob`): free-list is cycle-free and every physical page is a
-    ///      well-formed overflow page (`validate_structure`).
-    ///   2. **Row-driven** chain walk: only when the table actually has
-    ///      externalized data (or a declared LOB column), visit every live
-    ///      row in bounded physical ranges. This reads each referenced chain,
-    ///      so dangling, broken or cyclic chains surface as 1030 corruption.
-    ///      Reuses the tested scan path rather than reimplementing row iteration.
+    fn check_lob_structure_online(&self, sid: u64) -> Result<u64, QueryError> {
+        let epoch = self.storage_handle_open_epoch(sid);
+        for _ in 0..8 {
+            crate::engine::cancel::check_cancelled()?;
+            let before = epoch.load(Ordering::Acquire);
+            let handle = self.overflow_handle(sid)?;
+            let stamp = handle.read().integrity_stamp();
+            if stamp.1 > 1 {
+                #[cfg(test)]
+                self.pause_ddl_backfill_for_test();
+            }
+            let result = (|| {
+                let mut next = stamp.2;
+                let mut count = 0;
+                while next != 0 {
+                    if count >= stamp.1 {
+                        return Err(error(crate::error::catalog::ER_GET_ERRNO,
+                            "corrupt overflow free list (cycle or changed allocation)"));
+                    }
+                    handle.read().validate_free_batch(&mut next, &mut count)?;
+                }
+                if count != stamp.3 {
+                    return Err(error(crate::error::catalog::ER_GET_ERRNO,
+                        "overflow free-list count disagrees with cached count"));
+                }
+                for page in (0..stamp.1).step_by(32) {
+                    handle.read().validate_page_range(page, (page + 32).min(stamp.1))?;
+                }
+                Ok(stamp.1)
+            })();
+            crate::engine::cancel::check_cancelled()?;
+            if epoch.load(Ordering::Acquire) == before && handle.read().integrity_stamp() == stamp {
+                return result;
+            }
+        }
+        Err(error(crate::error::catalog::ER_LOCK_WAIT_TIMEOUT,
+            "CHECK could not obtain a stable LOB view; retry when writes subside"))
+    }
+
+    /// Check physical LOB pages in bounded lock batches, then materialize
+    /// snapshot-visible chains a heap page at a time. The pin prevents purge
+    /// from reclaiming historical chains while writers replace live values.
     pub(crate) fn check_table_lob_integrity(&self, table: &TableSchema) -> Vec<String> {
         let mut problems = Vec::new();
+        let snapshot = StorageReadSnapshot::new(self);
         let storage_ids = table.storage_ids();
         let mut any_lob_pages = false;
         for sid in &storage_ids {
-            match self.with_overflow_read(*sid, |ovf| {
-                ovf.validate_structure()?;
-                Ok(ovf.page_count())
-            }) {
-                // >1 page means real data pages exist beyond the meta page.
-                Ok(page_count) => {
-                    if page_count > 1 {
-                        any_lob_pages = true;
-                    }
-                }
+            match self.check_lob_structure_online(*sid) {
+                Ok(pages) => any_lob_pages |= pages > 1,
                 Err(e) => problems.push(format!("storage {sid} `.lob` structure: {}", e.message())),
             }
         }
         if any_lob_pages || table_has_externalizable_column(table) {
-            let qname = self.storage_key_for_table(table);
-            if let Err(e) = self.scan_rows_ordered_streaming(
-                &qname,
-                TxnView::read_only(u64::MAX, crate::storage::IsolationLevel::ReadCommitted),
-                |_| Ok(()),
-            ) {
+            let result = (|| {
+                for sid in storage_ids {
+                    let pages = self.with_heap_read(sid, |heap| heap.page_count())?;
+                    for page in 0..pages {
+                        crate::engine::cancel::check_cancelled()?;
+                        self.scan_rows_storage_range(table, sid, snapshot.txn, page, page + 1)?;
+                    }
+                }
+                Ok::<_, QueryError>(())
+            })();
+            if let Err(e) = result {
                 problems.push(format!("row/LOB chain scan: {}", e.message()));
             }
         }
         problems
     }
+
 }
 
 /// Match the row encoder's externalization eligibility, including VARCHAR,

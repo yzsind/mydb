@@ -1524,7 +1524,9 @@ impl Database {
                                     self.primary_definition_highwater
                                         .fetch_max(commit_scn, Ordering::Release);
                                 }
-                                if table.primary_definition_scn != 0 {
+                                if table.primary_definition_scn != 0
+                                    || table.row_generation_txn_id == txn_id
+                                {
                                     self.table_locks_sharded
                                         .set_schema_floor(table.id, table.schema_version);
                                     for id in table.storage_ids() {
@@ -1545,8 +1547,17 @@ impl Database {
                     // only `live.tables` leaves a freshly replicated CREATE
                     // invisible to normal table lookup until restart.
                     self.catalog.publish_table_deltas(&object_ids);
-                    for (_, table) in &loaded {
-                        let Some(table) = table else { continue };
+                    for (id, table) in &loaded {
+                        let Some(table) = table else {
+                            self.drop_table_modification_delta(*id);
+                            continue;
+                        };
+                        // A physical ownership/generation publication carries a
+                        // complete population baseline at this transaction.
+                        if table.row_generation_txn_id == txn_id {
+                            self.drop_table_modification_delta(table.id);
+                            continue;
+                        }
                         let Some(previous) = old_tables.iter().find(|old| old.id == table.id)
                         else {
                             continue;
@@ -1821,6 +1832,7 @@ impl Database {
         let handle = cache.values().find(|h| h.read().path == abs).cloned();
         if let Some(handle) = handle {
             let index = handle.read();
+            let _mutation = index.begin_mutation();
             index
                 .spatial
                 .as_ref()

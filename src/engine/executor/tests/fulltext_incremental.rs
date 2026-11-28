@@ -763,23 +763,17 @@ fn fulltext_incremental_exchange_transfers_counters_with_catalog_publication() {
         assert_corpora(&e, "test.ft_stage", current(&e));
         let indexed="SELECT id,MATCH(body) AGAINST('quartz') s FROM ft_stage WHERE active=1 AND MATCH(body) AGAINST('quartz') ORDER BY id";
         let heap = indexed.replace("active=1", "COALESCE(active,0)=1");
-        let QueryResponse::ResultSet(a) = e
-            .execute_with_session(&mut old, indexed)
-            .unwrap()
-            .materialize()
-            .unwrap()
-        else {
-            panic!("rows")
-        };
-        let QueryResponse::ResultSet(b) = e
-            .execute_with_session(&mut old, &heap)
-            .unwrap()
-            .materialize()
-            .unwrap()
-        else {
-            panic!("rows")
-        };
-        assert_eq!(a.rows, b.rows);
+        // Ownership changed after this view. Both access paths must reject
+        // it instead of combining the new heap binding with an old corpus.
+        for query in [indexed, heap.as_str()] {
+            assert_eq!(
+                e.execute_with_session(&mut old, query)
+                    .and_then(QueryResponse::materialize)
+                    .unwrap_err()
+                    .code(),
+                1412
+            );
+        }
         e.execute_with_session(&mut old, "COMMIT").unwrap();
 
         e.execute(

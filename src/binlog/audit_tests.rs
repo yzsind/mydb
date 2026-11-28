@@ -69,7 +69,9 @@ fn audit_staged_positions_are_not_public() {
         before.position
     );
     assert_eq!(manager.binary_logs().unwrap()[0].size, before.position);
-    let heartbeat = manager.heartbeat_event(&before.file, before.position).unwrap();
+    let heartbeat = manager
+        .heartbeat_event(&before.file, before.position)
+        .unwrap();
     assert_eq!(
         u32::from_le_bytes(heartbeat[13..17].try_into().unwrap()) as u64,
         before.position
@@ -105,7 +107,9 @@ fn issue123_heartbeat_keeps_dump_cursor_when_publication_or_rotation_wins_race()
         manager.rotate().unwrap();
         assert_ne!(manager.current_position().unwrap().file, cursor.file);
         assert_eq!(
-            manager.heartbeat_event(&cursor.file, cursor.position).unwrap(),
+            manager
+                .heartbeat_event(&cursor.file, cursor.position)
+                .unwrap(),
             heartbeat
         );
         assert_eq!(heartbeat[4], HEARTBEAT_EVENT);
@@ -128,9 +132,7 @@ fn issue123_heartbeat_keeps_dump_cursor_when_publication_or_rotation_wins_race()
         assert!(pending
             .iter()
             .any(|event| event.event_type == WRITE_ROWS_EVENT_V2));
-        assert!(pending
-            .iter()
-            .any(|event| event.event_type == ROTATE_EVENT));
+        assert!(pending.iter().any(|event| event.event_type == ROTATE_EVENT));
     }
 }
 
