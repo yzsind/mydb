@@ -6399,9 +6399,12 @@ where
         metadata: &PreparedResultMetadata,
     ) -> io::Result<()> {
         use crate::types::{ColumnType, Value};
-        let bigint_rows = !rows.is_empty() && matches!(metadata.columns.as_ref(), [column]
+        let bigint_rows = !rows.is_empty()
+            && matches!(metadata.columns.as_ref(), [column]
             if column.column_type == ColumnType::LongLong && !column.source.round_decimal_result)
-            && rows.iter().all(|row| matches!(row.as_slice(), [Value::Int(_) | Value::Null]));
+            && rows
+                .iter()
+                .all(|row| matches!(row.as_slice(), [Value::Int(_) | Value::Null]));
         let needed = if bigint_rows {
             10
         } else {
@@ -8415,8 +8418,11 @@ where
         let result = crate::engine::perf_events::with_prepared_statement_texts(perf_texts, || {
             crate::engine::params::with_params_slice(params, || {
                 crate::storage::with_nonblocking_lock_waits(|| {
-                    self.engine
-                        .execute_prepared_statement(&mut self.context, sql, statement.clone())
+                    self.engine.execute_prepared_statement(
+                        &mut self.context,
+                        sql,
+                        statement.clone(),
+                    )
                 })
             })
         });

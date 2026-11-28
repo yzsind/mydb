@@ -4556,7 +4556,8 @@ pub(super) fn authorize_prepared_statement_with_epoch(
     for required in required_privileges {
         if let PrivilegeScope::Table { database, table } = &required.scope {
             if crate::graph::is_storage_table(table) {
-                return Err(crate::error::catalog::ER_NO_SUCH_TABLE.error(format!("Table '{database}.{table}' does not exist")));
+                return Err(crate::error::catalog::ER_NO_SUCH_TABLE
+                    .error(format!("Table '{database}.{table}' does not exist")));
             }
             if database.eq_ignore_ascii_case("__mydb_temp")
                 && !required_privilege_targets_session_temp(session, required)

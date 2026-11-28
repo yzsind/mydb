@@ -54,7 +54,6 @@ pub(crate) use core::default_buffer_pool_bytes;
 pub(crate) use core::enum_set_numeric_assignment;
 pub(crate) use core::index_build_extended_perf_snapshot;
 pub(crate) use core::is_lock_wait_pending_error;
-pub(crate) use txn::{lock_waits_nonblocking, lock_would_block_error};
 pub(crate) use core::quantize_time_text_micros;
 #[cfg(test)]
 pub(crate) use core::set_update_delta_enabled_for_test;
@@ -100,6 +99,7 @@ pub(crate) use core::{
     ZONE_MAP_METADATA_DECODE_NS, ZONE_MAP_RUNTIME_CANDIDATE_NS, ZONE_MAP_RUNTIME_PAGES,
     ZONE_MAP_RUNTIME_PAGES_SKIPPED, ZONE_MAP_RUNTIME_TASKS,
 };
+pub(crate) use txn::{lock_waits_nonblocking, lock_would_block_error};
 // ENUM/SET on-disk width helpers — single source of truth (see the
 // `set_storage_width` / `enum_storage_width` doc comments in row_codec).
 pub(crate) use core::CatalogTxnBatchGuard;
