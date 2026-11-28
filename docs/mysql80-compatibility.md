@@ -1401,6 +1401,18 @@ The following expression differences are retained:
   or `2` modes. `CREATE DATABASE MyCaseDb` shows up as `mycasedb` in SHOW and information_schema.
   This policy is retained for cross-platform consistency and differs from MySQL's Linux default configuration; see the
   [MySQL system variable documentation](https://dev.mysql.com/doc/refman/8.0/en/server-system-variables.html#sysvar_lower_case_table_names).
+  Migration tools must normalize database/table names with this target policy before comparing source object lists
+  against SHOW or information_schema output, including uppercase names from Oracle-style sources.
+  Setting `lower_case_table_names=0` is not a supported workaround.
+- Cross-dialect schema migration must translate source expressions into supported target SQL and enforce the
+  64-character constraint-name limit before submitting DDL. For example, translate an array membership CHECK
+  into `CHECK (gender IN ('M', 'F'))`; malformed `ANY (ARRAY...)` expressions are rejected, never ignored.
+  A naming generator can shorten long names and append a stable hash, checking for collisions in the target namespace.
+  PostgreSQL partition children are separate source relations; mydb partitions are listed in
+  `information_schema.PARTITIONS`, not exposed as independent tables. A migration tool must map that object model
+  explicitly rather than verify source child-relation names as target tables.
+  Preserve native vector dimensions in target DDL and verify `SHOW CREATE TABLE` or `information_schema.COLUMNS.COLUMN_TYPE`
+  before loading data; a vector dimension mismatch is an error, not an implicit resize.
 - After a table or view that a view depends on is dropped, mydb keeps an explicit invalidation marker and queries report 1356.
   Recreating a same-named table does not automatically restore the view; `CREATE OR REPLACE VIEW` must rebind explicitly.
   This policy prevents a new object with different semantics from taking over an old view merely because the name matches; the cost is incompatibility with MySQL's
