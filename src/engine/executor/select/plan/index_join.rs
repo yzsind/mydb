@@ -1620,7 +1620,15 @@ pub(super) fn execute_index_nested_loop_join_from_left_rows_inner(
                         let mut visible_iter = visible_mask.into_iter();
                         new.retain(|_| visible_iter.next().unwrap_or(false));
                         let arc = Arc::new(new);
-                        entries_cache.insert(bounds.clone(), Arc::clone(&arc));
+                        let retained_bytes = arc
+                            .capacity()
+                            .saturating_mul(std::mem::size_of::<(IndexKey, RowId)>())
+                            .saturating_add(
+                                arc.iter()
+                                    .map(|(key, _)| key.heap_capacity_bytes())
+                                    .sum::<usize>(),
+                            );
+                        entries_cache.insert(bounds.clone(), Arc::clone(&arc), retained_bytes);
                         arc
                     }
                 }
@@ -1691,7 +1699,11 @@ pub(super) fn execute_index_nested_loop_join_from_left_rows_inner(
                             high,
                         )?;
                         let arc = Arc::new(new);
-                        ids_cache.insert(bounds.clone(), Arc::clone(&arc));
+                        ids_cache.insert(
+                            bounds.clone(),
+                            Arc::clone(&arc),
+                            arc.capacity().saturating_mul(std::mem::size_of::<RowId>()),
+                        );
                         arc
                     }
                 }
@@ -1957,9 +1969,18 @@ pub(crate) static INLJ_MRR_LRU_EVICTIONS: AtomicU64 = AtomicU64::new(0);
 /// `K = (Option<IndexBound>, Option<IndexBound>)` in practice; parameterised
 /// here for testability. Counters are bumped on every get/insert so SHOW
 /// ENGINE MYDB STATUS can report hit / miss / eviction totals.
-pub(super) enum MrrBoundsCache<V> {
-    /// Batched probes bypass this scalar memo entirely. Defer allocation
-    /// until a scalar miss has a result worth retaining.
+pub(super) struct MrrBoundsCache<V> {
+    storage: MrrBoundsStorage<V>,
+    charge: crate::engine::executor::mem_budget::ScopedCharge,
+    byte_limit: usize,
+}
+
+struct MrrCachedValue<V> {
+    value: V,
+    bytes: usize,
+}
+
+enum MrrBoundsStorage<V> {
     Deferred {
         cap: usize,
         use_lru: bool,
@@ -1968,72 +1989,137 @@ pub(super) enum MrrBoundsCache<V> {
     Lru(
         crate::engine::executor::select::mrr_lru::MrrLru<
             (Option<IndexBound>, Option<IndexBound>),
-            V,
+            MrrCachedValue<V>,
         >,
     ),
     Legacy {
-        map: hashbrown::HashMap<(Option<IndexBound>, Option<IndexBound>), V>,
+        map: hashbrown::HashMap<(Option<IndexBound>, Option<IndexBound>), MrrCachedValue<V>>,
         cap: usize,
     },
 }
 
 impl<V> MrrBoundsCache<V> {
     fn with_initial_capacity(cap: usize, use_lru: bool, initial: usize) -> Self {
-        Self::Deferred {
-            cap,
-            use_lru,
-            initial,
+        let byte_limit = crate::engine::executor::mem_budget::current_budget()
+            .map_or(8 * 1024 * 1024, |budget| budget.limit() / 8)
+            .min(64 * 1024 * 1024);
+        Self {
+            storage: MrrBoundsStorage::Deferred {
+                cap,
+                use_lru,
+                initial,
+            },
+            charge: crate::engine::executor::mem_budget::ScopedCharge::new(0),
+            byte_limit,
         }
     }
 
     pub(super) fn get(&mut self, key: &(Option<IndexBound>, Option<IndexBound>)) -> Option<&V> {
-        let hit = match self {
-            MrrBoundsCache::Deferred { .. } => None,
-            MrrBoundsCache::Lru(lru) => lru.get(key),
-            MrrBoundsCache::Legacy { map, .. } => map.get(key),
+        let hit = match &mut self.storage {
+            MrrBoundsStorage::Deferred { .. } => None,
+            MrrBoundsStorage::Lru(lru) => lru.get(key),
+            MrrBoundsStorage::Legacy { map, .. } => map.get(key),
         };
         if hit.is_some() {
             INLJ_MRR_LRU_HITS.fetch_add(1, Ordering::Relaxed);
         } else {
             INLJ_MRR_LRU_MISSES.fetch_add(1, Ordering::Relaxed);
         }
-        hit
+        hit.map(|entry| &entry.value)
     }
 
-    pub(super) fn insert(&mut self, key: (Option<IndexBound>, Option<IndexBound>), value: V) {
-        if let Self::Deferred {
+    pub(super) fn insert(
+        &mut self,
+        key: (Option<IndexBound>, Option<IndexBound>),
+        value: V,
+        payload_bytes: usize,
+    ) {
+        // A bound count does not bound residency: one range may contain the
+        // entire inner table. Include retained vector capacity, variable-width
+        // keys, both bound copies and conservative map/node overhead.
+        let bytes = payload_bytes.saturating_add(1024).saturating_add(
+            key.0
+                .iter()
+                .chain(key.1.iter())
+                .map(|b| b.key.heap_capacity_bytes().saturating_mul(2))
+                .sum::<usize>(),
+        );
+        if bytes > self.byte_limit {
+            return;
+        }
+        let exists = match &mut self.storage {
+            MrrBoundsStorage::Lru(lru) => lru.get(&key).is_some(),
+            MrrBoundsStorage::Legacy { map, .. } => map.contains_key(&key),
+            MrrBoundsStorage::Deferred { .. } => false,
+        };
+        if exists {
+            return;
+        }
+
+        if let MrrBoundsStorage::Deferred {
             cap,
             use_lru,
             initial,
-        } = self
+        } = self.storage
         {
-            if *cap == 0 {
+            if cap == 0 {
                 return;
             }
-            let (cap, use_lru, initial) = (*cap, *use_lru, *initial);
-            *self = if use_lru {
-                Self::Lru(
+            let initial = initial.min(cap).min(self.byte_limit / 2048);
+            if !self
+                .charge
+                .add_within(initial.saturating_mul(1024), self.byte_limit)
+            {
+                return;
+            }
+            self.storage = if use_lru {
+                MrrBoundsStorage::Lru(
                     crate::engine::executor::select::mrr_lru::MrrLru::with_initial_capacity(
                         cap, initial,
                     ),
                 )
             } else {
-                Self::Legacy {
+                MrrBoundsStorage::Legacy {
                     map: hashbrown::HashMap::new(),
                     cap,
                 }
             };
         }
-        match self {
-            MrrBoundsCache::Deferred { .. } => unreachable!("cache initialized for insertion"),
-            MrrBoundsCache::Lru(lru) => {
-                if lru.insert(key, value).is_some() {
+        while self.charge.charged().saturating_add(bytes) > self.byte_limit {
+            let released = match &mut self.storage {
+                MrrBoundsStorage::Lru(lru) => lru.pop_tail().map(|(_, entry)| entry.bytes),
+                MrrBoundsStorage::Legacy { map, .. } => {
+                    let key = map.keys().next().cloned();
+                    key.and_then(|key| map.remove(&key))
+                        .map(|entry| entry.bytes)
+                }
+                MrrBoundsStorage::Deferred { .. } => unreachable!(),
+            };
+            let Some(released) = released else {
+                return;
+            };
+            self.charge.release_bytes(released);
+            INLJ_MRR_LRU_EVICTIONS.fetch_add(1, Ordering::Relaxed);
+        }
+        if !self.charge.add_within(bytes, self.byte_limit) {
+            return;
+        }
+        let entry = MrrCachedValue { value, bytes };
+        match &mut self.storage {
+            MrrBoundsStorage::Deferred { .. } => unreachable!(),
+            MrrBoundsStorage::Lru(lru) => {
+                if let Some((_, evicted)) = lru.insert(key, entry) {
+                    self.charge.release_bytes(evicted.bytes);
                     INLJ_MRR_LRU_EVICTIONS.fetch_add(1, Ordering::Relaxed);
                 }
             }
-            MrrBoundsCache::Legacy { map, cap } => {
+            MrrBoundsStorage::Legacy { map, cap } => {
                 if map.len() < *cap {
-                    map.insert(key, value);
+                    if let Some(old) = map.insert(key, entry) {
+                        self.charge.release_bytes(old.bytes);
+                    }
+                } else {
+                    self.charge.release_bytes(bytes);
                 }
             }
         }
@@ -2053,17 +2139,17 @@ fn mrr_bounds_cache_allocates_only_after_scalar_insert_and_keeps_policy() {
     };
     for lru in [true, false] {
         let mut cache = MrrBoundsCache::with_initial_capacity(4, lru, 1);
-        assert!(matches!(cache, MrrBoundsCache::Deferred { .. }));
+        assert!(matches!(cache.storage, MrrBoundsStorage::Deferred { .. }));
         assert_eq!(cache.get(&key(0)), None);
-        assert!(matches!(cache, MrrBoundsCache::Deferred { .. }));
+        assert!(matches!(cache.storage, MrrBoundsStorage::Deferred { .. }));
         for value in 0..4 {
-            cache.insert(key(value), value);
+            cache.insert(key(value), value, 8);
         }
-        assert!(!matches!(cache, MrrBoundsCache::Deferred { .. }));
+        assert!(!matches!(cache.storage, MrrBoundsStorage::Deferred { .. }));
         for value in 0..4 {
             assert_eq!(cache.get(&key(value)), Some(&value));
         }
-        cache.insert(key(4), 4);
+        cache.insert(key(4), 4, 8);
         assert_eq!(cache.get(&key(0)), if lru { None } else { Some(&0) });
         assert_eq!(cache.get(&key(4)), if lru { Some(&4) } else { None });
     }
@@ -6899,4 +6985,29 @@ mod constant_residual_tests {
         });
         assert_eq!(budget.used(), 0);
     }
+}
+
+#[test]
+fn audit1127_mrr_cache_has_a_byte_bound_for_large_range_results() {
+    let budget = Arc::new(crate::engine::executor::mem_budget::MemBudget::new(
+        1024 * 1024,
+    ));
+    crate::engine::executor::mem_budget::with_query_budget(budget.clone(), || {
+        for lru in [false, true] {
+            let mut cache = MrrBoundsCache::with_initial_capacity(8192, lru, 16);
+            for value in 0..1000 {
+                let key = (
+                    Some(IndexBound {
+                        key: IndexKey::from(vec![KeyPart::Int(value)]),
+                        inclusive: true,
+                    }),
+                    None,
+                );
+                cache.insert(key, Arc::new(vec![0u8; 16384]), 16384);
+                assert!(cache.charge.charged() <= budget.limit() / 8);
+            }
+            drop(cache);
+            assert_eq!(budget.used(), 0);
+        }
+    });
 }

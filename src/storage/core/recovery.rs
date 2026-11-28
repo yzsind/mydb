@@ -1841,6 +1841,14 @@ fn redo_page_delta(data_dir: &Path, record: &WalRecord) -> Result<(), QueryError
     file.read_exact(&mut before).map_err(io_err)?;
     validate(&before)?;
     let current_lsn = page_lsn(&before);
+    if current_lsn >= record.lsn {
+        if let Some(length) = redo_lob_allocation_length(relative, *page_id, &before)? {
+            if file.metadata().map_err(io_err)?.len() < length {
+                file.set_len(length).map_err(io_err)?;
+                note_recovery_write(data_dir, data_dir.join(relative))?;
+            }
+        }
+    }
     if current_lsn > record.lsn {
         return Ok(());
     }
@@ -1873,6 +1881,11 @@ fn redo_page_delta(data_dir: &Path, record: &WalRecord) -> Result<(), QueryError
         ));
     }
     validate(&after)?;
+    if let Some(length) = redo_lob_allocation_length(relative, *page_id, &after)? {
+        if file.metadata().map_err(io_err)?.len() < length {
+            file.set_len(length).map_err(io_err)?;
+        }
+    }
     if page_lsn(&after) == 0 {
         set_page_lsn_if_formatted(&mut after, record.lsn);
     }
@@ -1971,19 +1984,66 @@ fn redo_page_update_with_context(
                 && zone_identity
                     .is_none_or(|identity| zone_map_page::View::open(&current, identity).is_ok());
         if valid_identity && !context.must_redo(lsn) && page_lsn(&current) >= lsn {
+            if let Some(length) = redo_lob_allocation_length(relative, page_id, &current)? {
+                if len < length {
+                    file.set_len(length).map_err(io_err)?;
+                    note_recovery_write(data_dir, data_dir.join(relative))?;
+                }
+            }
             return Ok(());
         }
     }
+    let allocation_length = redo_lob_allocation_length(relative, page_id, after)?;
     let mut page = after.to_vec();
     page.resize(PAGE_SIZE, 0);
     stamp_page_owner(&mut page, &page_owner(&data_dir.join(relative)), page_id);
     set_page_lsn_if_formatted(&mut page, lsn);
-    file.set_len(len.max(offset + PAGE_SIZE as u64))
-        .map_err(io_err)?;
+    let required_length = (offset + PAGE_SIZE as u64).max(allocation_length.unwrap_or(0));
+    // Re-truncating an already allocated file is expensive on copy-on-write
+    // filesystems and adds no redo effect. Never shrink newer extents.
+    if len < required_length {
+        file.set_len(required_length).map_err(io_err)?;
+    }
     file.seek(SeekFrom::Start(offset)).map_err(io_err)?;
     file.write_all(&page).map_err(io_err)?;
     note_recovery_write(data_dir, data_dir.join(relative))?;
     file.flush().map_err(io_err)
+}
+
+/// LOB reservations publish their allocation metadata before chain pages.
+/// Recreate that source extent before making the metadata readable, including
+/// at a crash/stream prefix ending between reservation and the first page.
+/// Unreferenced reserved pages may be zero until subsequent redo arrives.
+fn redo_lob_allocation_length(
+    relative: &str,
+    page_id: u64,
+    image: &[u8],
+) -> Result<Option<u64>, QueryError> {
+    if page_id != 0 || !relative.ends_with(".lob") {
+        return Ok(None);
+    }
+    if image.len() != PAGE_SIZE
+        || read_u32(image, OVFL_OFF_MAGIC) != OVFL_MAGIC
+        || read_u16(image, OVFL_OFF_VERSION) != OVFL_VERSION
+        || read_u32(image, 16) != page_checksum(image, 16)
+    {
+        return Err(error(
+            crate::error::catalog::ER_GET_ERRNO,
+            "invalid LOB allocation redo image",
+        ));
+    }
+    let pages = read_u64(image, OVFL_META_PAGE_COUNT);
+    if pages == 0
+        || pages > u64::from(u32::MAX) + 1
+        || read_u64(image, OVFL_META_FREE_HEAD) >= pages
+        || read_u64(image, OVFL_META_NEXT_GENERATION) == 0
+    {
+        return Err(error(
+            crate::error::catalog::ER_GET_ERRNO,
+            "invalid LOB allocation redo bounds",
+        ));
+    }
+    Ok(Some(pages * PAGE_SIZE as u64))
 }
 
 fn redo_heap_insert(

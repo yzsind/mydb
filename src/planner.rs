@@ -17185,6 +17185,9 @@ fn multi_valued_index_access(
             }
         };
         let target = target_for_index_column(table, index, pos);
+        if !index_in_lookup_preserves_comparison(target, std::slice::from_ref(constraint)) {
+            return None;
+        }
         prefix.push(constraint_key_part_for_index(
             constraint, target, index, pos,
         )?);
@@ -21855,6 +21858,9 @@ fn collect_physical_plan_tables_into(plan: &PhysicalPlan, tables: &mut Vec<PlanT
             tables.push(PlanTable::new(0, std::sync::Arc::new(schema), None));
         }
         PhysicalPlan::JsonTableScan {
+            relation, columns, ..
+        }
+        | PhysicalPlan::GenerateSeries {
             relation, columns, ..
         } => {
             let schema =

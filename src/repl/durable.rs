@@ -33,11 +33,14 @@ pub fn atomic_write_sync(path: &Path, tmp: &Path, bytes: &[u8]) -> IoResult<()> 
         let mut name = tmp.as_os_str().to_os_string();
         name.push(format!(".{}.{sequence}.tmp", std::process::id()));
         let staging = PathBuf::from(name);
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&staging)
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
         {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&staging) {
             Ok(file) => break (staging, file),
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(err) => return Err(err),

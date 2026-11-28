@@ -787,7 +787,7 @@ impl SemiSyncSource {
 /// file names share a base and a zero-padded numeric suffix; compare by that
 /// suffix (robust to a rollover in digit width) then by byte position. An empty
 /// file name (a replica that has never acked) sorts before any real position.
-fn binlog_pos_ge(a: (&str, u64), b: (&str, u64)) -> bool {
+pub(crate) fn binlog_pos_ge(a: (&str, u64), b: (&str, u64)) -> bool {
     binlog_pos_cmp(a, b) != std::cmp::Ordering::Less
 }
 
@@ -3824,23 +3824,12 @@ impl BinlogSourceManager {
         self.notify.notified()
     }
 
-    pub fn heartbeat_event(&self) -> Result<Vec<u8>, QueryError> {
-        let state = self.state.lock();
-        // MySQL Heartbeat_log_event semantics: `timestamp = 0` marks it
-        // synthetic, and `log_pos` must equal the source's current tail
-        // (state.active_pos) — the very position where the *next* real
-        // event will be written. The generic encode_event flow computes
-        // end_log_pos = start_pos + event_size, which would send a
-        // position that is *below* the last real event's end_log_pos in
-        // MySQL's stream tracker; the replica then hits ER_HEARTBEAT_QUEUE_FAILURE
-        // ("heartbeat event contained the position N which is smaller
-        // than the position M that was computed from earlier events") and
-        // aborts the IO thread.
-        encode_heartbeat_event(
-            &self.config,
-            state.published_position(),
-            state.active_file.as_bytes(),
-        )
+    pub fn heartbeat_event(&self, file: &str, position: u64) -> Result<Vec<u8>, QueryError> {
+        // Report this dump session's consumed cursor, not the global tail.
+        // A commit or rotation can publish after the session's empty read;
+        // advertising that unseen tail can skip rows or send the next file's
+        // low position before its ROTATE event, stopping a MySQL receiver.
+        encode_heartbeat_event(&self.config, position, file.as_bytes())
     }
 
     pub fn rotate(&self) -> Result<(), QueryError> {
@@ -5782,14 +5771,13 @@ fn encoded_event_bytes(
 
 /// Encode a synthetic `HEARTBEAT_LOG_EVENT` with:
 /// - `timestamp = 0` (marks it artificial per MySQL convention)
-/// - `end_log_pos = current_tail` exactly (not `tail + event_size`), so
-///   the replica's IO thread does not see the source's stream position
-///   go backwards.
+/// - `end_log_pos = dump_position` exactly (not `position + event_size`),
+///   without advancing past events this connection has not consumed.
 /// - `flags = LOG_EVENT_ARTIFICIAL_F (0x0020)` as a belt-and-suspenders
 ///   marker.
 fn encode_heartbeat_event(
     config: &BinlogConfig,
-    current_tail: u64,
+    dump_position: u64,
     file_name: &[u8],
 ) -> Result<Vec<u8>, QueryError> {
     let has_checksum = config.checksum == BinlogChecksum::Crc32;
@@ -5799,10 +5787,8 @@ fn encode_heartbeat_event(
     out.push(HEARTBEAT_EVENT);
     out.extend_from_slice(&config.server_id.to_le_bytes());
     out.extend_from_slice(&(event_size as u32).to_le_bytes());
-    // log_pos = current tail (NOT tail + event_size): per MySQL
-    // Heartbeat_log_event this reports the source's currently-durable
-    // position, from which the replica advances Read_Source_Log_Pos.
-    out.extend_from_slice(&(current_tail as u32).to_le_bytes());
+    // Heartbeats repeat the dump cursor without occupying on-disk bytes.
+    out.extend_from_slice(&(dump_position as u32).to_le_bytes());
     out.extend_from_slice(&0x0020u16.to_le_bytes()); // LOG_EVENT_ARTIFICIAL_F
     out.extend_from_slice(file_name);
     if has_checksum {
@@ -6043,7 +6029,14 @@ fn encode_table_map_payload(table: &BinlogTable) -> Vec<u8> {
     payload.push(0);
     write_lenenc_int(&mut payload, table.columns.len() as u64);
     for column in &table.columns {
-        payload.push(column.column_type);
+        // ENUM/SET have a STRING table-map type with the real type in metadata.
+        payload.push(
+            if matches!(column.column_type, MYSQL_TYPE_ENUM | MYSQL_TYPE_SET) {
+                MYSQL_TYPE_STRING
+            } else {
+                column.column_type
+            },
+        );
     }
     let mut metadata = Vec::new();
     for column in &table.columns {
@@ -9138,6 +9131,28 @@ mod tests {
 
         assert_eq!(row_events, 3);
         assert_eq!(decoded_images, 4);
+    }
+
+    #[test]
+    fn audit1127_enum_set_table_map_uses_string_wire_type() {
+        let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let engine = crate::engine::StorageQueryEngine::open(dir.path()).unwrap();
+        engine
+            .execute("CREATE TABLE enum_wire(e ENUM('a','b'),s SET('x','y'))")
+            .unwrap();
+        let table = engine
+            .database_for_replication()
+            .table("test.enum_wire")
+            .unwrap();
+        let wire = binlog_table_from_schema(&table).unwrap();
+        let payload = encode_table_map_payload(&wire);
+        let types_offset = 6 + 2 + 1 + wire.database.len() + 1 + 1 + wire.name.len() + 1 + 1;
+        assert_eq!(
+            &payload[types_offset..types_offset + 2],
+            &[MYSQL_TYPE_STRING, MYSQL_TYPE_STRING]
+        );
+        assert_eq!(wire.columns[0].metadata, vec![MYSQL_TYPE_ENUM, 1]);
+        assert_eq!(wire.columns[1].metadata, vec![MYSQL_TYPE_SET, 1]);
     }
 
     #[test]

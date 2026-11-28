@@ -9508,22 +9508,17 @@ pub(super) fn execute_qualified_statement(
                         .map(|name| {
                             let (d, t) =
                                 crate::storage::split_table_name(&session.current_database, name);
-                            format!("`{d}`.`{t}`")
+                            format!("`{}`.`{}`", d.replace('`', "``"), t.replace('`', "``"))
                         })
                         .collect::<Vec<_>>()
                         .join(", ");
                     let sql = format!("DROP TABLE {if_exists_clause}{list}");
                     let ctx = super::binlog_ctx_from_session(session);
-                    if let Err(err) = crate::binlog::record_ddl_autocommit_with(
+                    crate::binlog::record_ddl_autocommit_with(
                         &session.current_database,
                         &sql,
                         &ctx,
-                    ) {
-                        crate::engine::api::push_statement_condition(
-                            crate::error::ConditionLevel::Warning,
-                            &err,
-                        );
-                    }
+                    )?;
                 }
             }
             if !temp_names.is_empty() {

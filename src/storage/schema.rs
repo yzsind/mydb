@@ -5338,23 +5338,7 @@ impl TableSchema {
             .iter()
             .flatten()
             .find(|expr| expr.multi_valued)?;
-        let target = multi_valued_index_cast_target(expr_part)?.to_ascii_uppercase();
-        let base = target
-            .split_once('(')
-            .map_or(target.as_str(), |(base, _)| base);
-        Some(match base {
-            "SIGNED" => ParamTarget::Int,
-            "UNSIGNED" => ParamTarget::UInt,
-            "DECIMAL" => {
-                let params = decimal_target_params(&target);
-                ParamTarget::Decimal {
-                    precision: params.first().copied().unwrap_or(65),
-                    scale: params.get(1).copied().unwrap_or(30),
-                }
-            }
-            "CHAR" | "DATE" | "DATETIME" | "TIME" => ParamTarget::String,
-            _ => ParamTarget::String,
-        })
+        Some(index_expression_param_target(expr_part))
     }
 
     /// Generate all inverted keys of one row for a FULLTEXT index: take each indexed column's
@@ -6011,8 +5995,8 @@ fn multi_valued_index_elements(value: &Value) -> Result<Vec<Value>, QueryError> 
     }
     if root.is_object() {
         return Err(error(
-            crate::error::catalog::ER_INVALID_JSON_TEXT_IN_PARAM,
-            "multi-valued index expression did not return a JSON array or scalar",
+            crate::error::catalog::ER_NOT_SUPPORTED_YET,
+            "CAST-ing JSON OBJECT type to array is not supported",
         ));
     }
     Ok(vec![Value::Json(bytes)])

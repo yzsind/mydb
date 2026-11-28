@@ -4941,6 +4941,16 @@ fn literal_default_value(expr: &Expr) -> Result<Value, QueryError> {
         Expr::Literal(Literal::BitBytes(value)) | Expr::Literal(Literal::HexBytes(value)) => {
             Ok(Value::Bytes(value.clone()))
         }
+        // Charset introducers (including N'...') are literals. Preserve the
+        // parser's provenance marker and use the shared charset kernel so
+        // raw bytes, client encoding and invalid sequences follow SELECT.
+        Expr::Function { name, args, distinct: false }
+            if name.eq_ignore_ascii_case("CONVERT_USING")
+                && matches!(args.as_slice(), [
+                    Expr::Literal(Literal::String(_) | Literal::HexBytes(_) | Literal::BitBytes(_)),
+                    Expr::Literal(Literal::String(_)),
+                    Expr::Literal(Literal::Bool(true)),
+                ]) => crate::engine::expr::eval_const(expr),
         Expr::Unary {
             op: UnaryOp::Neg,
             expr,

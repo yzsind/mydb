@@ -1,0 +1,6 @@
+{"sql": "UPDATE invalid_wire SET v=NEW.v", "populated": false, "error": 1054}
+{"sql": "DELETE FROM invalid_wire WHERE v=OLD.v", "populated": false, "error": 1054}
+{"sql": "INSERT INTO invalid_wire VALUES(1,20) ON DUPLICATE KEY UPDATE v=NEW.v", "populated": false, "error": 1054}
+{"sql": "UPDATE invalid_wire SET v=NEW.v", "populated": true, "error": 1054}
+{"sql": "DELETE FROM invalid_wire WHERE v=OLD.v", "populated": true, "error": 1054}
+{"sql": "INSERT INTO invalid_wire VALUES(1,20) ON DUPLICATE KEY UPDATE v=NEW.v", "populated": true, "error": 1054}

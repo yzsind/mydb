@@ -1140,7 +1140,7 @@ impl MydbReplManager {
     ) -> Result<QueryResponse, QueryError> {
         let _transition = self.transition_guard()?;
         self.ensure_no_pending_promotion()?;
-        let state = self.role_state.lock().unwrap();
+        let state = self.role_state.lock().unwrap().clone();
         if state.role != Role::Replica || state.master_endpoint.is_none() {
             return Err(error(
                 crate::error::catalog::MYDB_ER_REPLICATION_STATE,
@@ -1151,6 +1151,20 @@ impl MydbReplManager {
             return Err(error(crate::error::catalog::ER_RESTART_SERVER_FAILED,
                 "FORCE_RESYNC requires in-process RESTART support; enable RESTART or restart manually"));
         }
+        let runtime = self.runtime_handle.lock().clone().ok_or_else(|| {
+            error(
+                crate::error::catalog::MYDB_ER_REPLICATION_STATE,
+                "FORCE_RESYNC requires a running replication runtime",
+            )
+        })?;
+        runtime.block_on(base_backup::check_backup_source(
+            state
+                .master_endpoint
+                .as_deref()
+                .expect("configured master checked"),
+            &state.node_uuid,
+            &self.config,
+        ))?;
         replica::progress::write_resync_marker(&self.data_dir, "explicit FORCE_RESYNC requested")
             .map_err(|err| {
             error(

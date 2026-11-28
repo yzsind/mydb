@@ -1,5 +1,6 @@
 mod ai;
 mod audit_five_resolution;
+mod audit_fixes_1127;
 mod availability;
 mod bug_report_1107;
 mod collated_constant_in;
@@ -634,3 +635,5 @@ mod vector_online_ddl;
 mod copy_file_publication;
 
 mod copy_publication_perf;
+
+mod issues_108_123;

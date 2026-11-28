@@ -267,6 +267,14 @@ impl Database {
         if self.durability_mode() == DurabilityMode::Memory || self.is_snapshot_read_only() {
             return Ok(());
         }
+        // A replica may stop at any source WAL prefix, including halfway
+        // through a paged graph mutation whose completion record has not
+        // arrived. Its intermediate node counters/links are not a loadable
+        // graph yet. Physical REDO already restored this prefix; the separate
+        // completion tracker fences vector readers until the source finishes.
+        if vector_storage_paged() && self.physical_replica_mode() {
+            return Ok(());
+        }
         let mut committed = HashMap::new();
         let mut unfinished = BTreeSet::new();
         for record in records.records().only(&[

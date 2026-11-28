@@ -225,7 +225,7 @@ impl SemiSyncWaiter {
             .iter()
             .filter(|s| {
                 let s = s.lock();
-                s.status == SlotStatus::Active && s.connected
+                s.status == SlotStatus::Active && s.connected && !s.seeding
             })
             .count() as u32
     }
@@ -265,11 +265,20 @@ impl SemiSyncWaiter {
                     let s = s.lock();
                     s.status == SlotStatus::Active
                         && s.connected
+                        && !s.seeding
                         && s.confirmed_acked_lsn >= target_lsn
                 })
                 .count() as u32;
             if met >= wait_count {
                 return SemiSyncOutcome::Acknowledged;
+            }
+            let eligible = self.active_slot_count();
+            if eligible < wait_count {
+                return if eligible == 0 {
+                    SemiSyncOutcome::NoActiveSlots
+                } else {
+                    SemiSyncOutcome::Degraded
+                };
             }
             let now = Instant::now();
             if now >= deadline {
@@ -311,7 +320,9 @@ impl SlotRegistry {
     /// Open the registry under `data_dir`, discovering any existing
     /// slot files.
     pub fn open(data_dir: impl Into<PathBuf>) -> Result<Self, QueryError> {
-        let dir: PathBuf = data_dir.into().join(SLOTS_DIR);
+        let data_dir = data_dir.into();
+        crate::replication::prepare_private_metadata_directory(&data_dir).map_err(io_to_query)?;
+        let dir: PathBuf = data_dir.join(SLOTS_DIR);
         fs::create_dir_all(&dir).map_err(io_to_query)?;
         let mut slots = HashMap::new();
         for entry in fs::read_dir(&dir).map_err(io_to_query)? {
@@ -952,4 +963,28 @@ fn release1106_seed_lease_survives_restart_without_live_quorum() {
     assert!(state.seeding);
     assert!(!state.connected);
     assert_eq!(state.confirmed_acked_lsn, 0);
+}
+
+#[cfg(test)]
+#[test]
+fn audit1127_seeding_slots_never_supply_quorum() {
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let mut registry = SlotRegistry::open(dir.path()).unwrap();
+    let seed = registry.create_or_get("seed", 0);
+    seed.record_ack(1000, 0);
+    seed.state.lock().seeding = true;
+    assert_eq!(
+        registry.wait_for_ack(500, 1, Duration::from_millis(20)),
+        SemiSyncOutcome::NoActiveSlots
+    );
+    let live = registry.create_or_get("live", 0);
+    live.record_ack(1000, 0);
+    assert_eq!(
+        registry.wait_for_ack(500, 2, Duration::from_millis(20)),
+        SemiSyncOutcome::Degraded
+    );
+    assert_eq!(
+        registry.wait_for_ack(500, 1, Duration::from_millis(20)),
+        SemiSyncOutcome::Acknowledged
+    );
 }

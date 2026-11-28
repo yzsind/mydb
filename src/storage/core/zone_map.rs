@@ -11033,6 +11033,20 @@ impl Database {
     where
         F: Fn() -> bool + Sync,
     {
+        self.maintain_zone_maps_round_with_budget_until(
+            ZONE_MAP_MAINTENANCE_ROUND_TIME,
+            should_cancel,
+        )
+    }
+
+    fn maintain_zone_maps_round_with_budget_until<F>(
+        &self,
+        time_budget: Duration,
+        should_cancel: F,
+    ) -> Result<u64, QueryError>
+    where
+        F: Fn() -> bool + Sync,
+    {
         let mut rebuilt = 0;
         let mut first_error = None;
         let started = Instant::now();
@@ -11050,7 +11064,7 @@ impl Database {
             }
             // Yield only between complete fair passes; aborting an in-flight
             // rebuild at a wall deadline can starve a wide zone forever.
-            if started.elapsed() >= ZONE_MAP_MAINTENANCE_ROUND_TIME {
+            if started.elapsed() >= time_budget {
                 break;
             }
             // Zero repairs can still advance past a Ready or hot prefix.
@@ -15466,19 +15480,43 @@ mod zone_map_tests {
         // Revisit the completed prefix, as after a restart. This first pass
         // makes no repairs; the round must still reach the missing suffix.
         map.maintenance_cursor.store(0, Ordering::Release);
-        assert_eq!(db.maintain_zone_maps_round_until(|| false).unwrap(), 9);
+        // A spent budget must yield after one complete pass, even if that
+        // pass only visits Ready zones. Resume from the resulting cursor.
+        assert_eq!(
+            db.maintain_zone_maps_round_with_budget_until(Duration::ZERO, || false)
+                .unwrap(),
+            0
+        );
+        assert_eq!(map.snapshot_for_tests().len(), 64);
+        assert_eq!(map.maintenance_cursor.load(Ordering::Acquire), 64);
+        map.maintenance_cursor.store(0, Ordering::Release);
+        // Isolate the ten-pass limit from machine speed and I/O contention.
+        assert_eq!(
+            db.maintain_zone_maps_round_with_budget_until(Duration::MAX, || false)
+                .unwrap(),
+            9
+        );
         assert_eq!(map.snapshot_for_tests().len(), 640);
         assert_eq!(map.maintenance_cursor.load(Ordering::Acquire), 640);
         assert_eq!(map.zone_mutation(0).unwrap().unwrap().epoch, first_epoch);
-        // Cancel between batches, after two more have been published. No
-        // third batch may be scheduled and the completed prefix survives.
+        // A spent budget must also preserve a published repair batch.
         assert_eq!(
-            db.maintain_zone_maps_round_until(|| {
+            db.maintain_zone_maps_round_with_budget_until(Duration::ZERO, || false)
+                .unwrap(),
+            1
+        );
+        assert_eq!(map.snapshot_for_tests().len(), 704);
+        assert_eq!(map.maintenance_cursor.load(Ordering::Acquire), 704);
+        // Resume and cancel after the next batch. No further batch may be
+        // scheduled and the completed prefix survives.
+        assert_eq!(
+            db.maintain_zone_maps_round_with_budget_until(Duration::MAX, || {
                 map.maintenance_cursor.load(Ordering::Acquire) >= 768
             })
             .unwrap(),
-            2
+            1
         );
+        assert_eq!(db.maintain_zone_maps_round_until(|| true).unwrap(), 0);
         assert_eq!(map.snapshot_for_tests().len(), 768);
         assert_eq!(map.maintenance_cursor.load(Ordering::Acquire), 768);
         assert!(!map.missing_is_empty.load(Ordering::Acquire));

@@ -3819,6 +3819,7 @@ fn convert_column_parts(
                             if signed_suffix.is_none()
                                 && (year_alias
                                     || precision_suffix
+                                    || matches!(data_type, SqlDataType::Numeric(_))
                                     || (zerofill && !is_unsigned_data_type(&data_type))) =>
                         {
                             signed_suffix = Some(!year_alias)
@@ -4218,7 +4219,8 @@ fn convert_data_type_with_unsigned(
         SqlDataType::Decimal(info)
         | SqlDataType::DecimalUnsigned(info)
         | SqlDataType::Numeric(info)
-        | SqlDataType::Dec(info) => DataType::Decimal(convert_exact_number_info(info)?),
+        | SqlDataType::Dec(info)
+        | SqlDataType::DecUnsigned(info) => DataType::Decimal(convert_exact_number_info(info)?),
         SqlDataType::Char(len) | SqlDataType::Character(len) => {
             DataType::Char(convert_character_len(len)?)
         }
@@ -8882,6 +8884,7 @@ fn is_unsigned_data_type(data_type: &SqlDataType) -> bool {
             | SqlDataType::DoublePrecisionUnsigned
             | SqlDataType::RealUnsigned
             | SqlDataType::DecimalUnsigned(_)
+            | SqlDataType::DecUnsigned(_)
     )
 }
 

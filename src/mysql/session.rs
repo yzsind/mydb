@@ -3892,7 +3892,7 @@ where
                 }
                 _ = &mut notified => {}
                 _ = tokio::time::sleep(heartbeat_interval) => {
-                    match manager.heartbeat_event() {
+                    match manager.heartbeat_event(&file, position) {
                         Ok(heartbeat) => {
                             if let Some(handle) = &self.handle {
                                 handle.set_base_state(ProcessState::SendingBinlogEventToReplica);

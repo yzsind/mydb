@@ -77,6 +77,7 @@ struct OnlineHeapRedoFile {
     file: File,
     len: u64,
     owner: [u8; 16],
+    pool_key: Option<Arc<BufferPageFileKey>>,
 }
 
 impl OnlineHeapRedoFiles {
@@ -119,12 +120,16 @@ impl OnlineHeapRedoFiles {
                 Err(err) => return Err(io_err(err)),
             };
             let len = file.metadata().map_err(io_err)?.len();
+            let owner = page_owner_result(&path)?;
+            let pool_key = Database::parse_heap_table_id(relative)
+                .map(|id| Arc::new(BufferPool::heap_file_key(path, id)));
             self.files.insert(
                 relative.to_string(),
                 OnlineHeapRedoFile {
                     file,
                     len,
-                    owner: page_owner_result(&path)?,
+                    owner,
+                    pool_key,
                 },
             );
         }
@@ -488,7 +493,7 @@ impl Database {
                     Ok(true)
                 })?;
                 self.note_dd_touch_if_needed(path, txn_id);
-                self.discard_heap_page_only(path, *page_id as u64)?;
+                self.discard_heap_page_only(path, *page_id as u64, heap_redo)?;
                 self.refresh_heap_handle_if_grown(path, *page_id as u64);
                 if crate::storage::core::heap_payload_counts_as_logical_row(payload) {
                     self.note_replicated_table_mutation(txn_id, path, 1, 1);
@@ -537,6 +542,7 @@ impl Database {
                         .or_default()
                         .push(insert);
                 }
+                let mut max_page = 0;
                 for (page_id, page_inserts) in by_page {
                     heap_redo.mutate_page(&self.data_dir, path, page_id, lsn, |page| {
                         for insert in page_inserts {
@@ -552,16 +558,10 @@ impl Database {
                         }
                         Ok(true)
                     })?;
+                    self.discard_heap_page_only(path, page_id, heap_redo)?;
+                    max_page = max_page.max(page_id);
                 }
                 self.note_dd_touch_if_needed(path, txn_id);
-                let mut max_page = 0u64;
-                for insert in inserts {
-                    let page = insert.page_id as u64;
-                    if page > max_page {
-                        max_page = page;
-                    }
-                    self.discard_heap_page_only(path, page)?;
-                }
                 self.refresh_heap_handle_if_grown(path, max_page);
                 let logical_rows = inserts
                     .iter()
@@ -604,7 +604,7 @@ impl Database {
                     Ok(true)
                 })?;
                 self.note_dd_touch_if_needed(path, txn_id);
-                self.discard_heap_page_only(path, *page_id as u64)?;
+                self.discard_heap_page_only(path, *page_id as u64, heap_redo)?;
                 self.refresh_heap_handle_if_grown(path, *page_id as u64);
                 let before_live = crate::storage::core::heap_payload_live_logical_state(before);
                 let after_live = crate::storage::core::heap_payload_live_logical_state(after);
@@ -634,7 +634,7 @@ impl Database {
                     Ok(true)
                 })?;
                 self.note_dd_touch_if_needed(path, txn_id);
-                self.discard_heap_page_only(path, *page_id as u64)?;
+                self.discard_heap_page_only(path, *page_id as u64, heap_redo)?;
                 self.refresh_heap_handle_if_grown(path, *page_id as u64);
                 let live_delta = patches
                     .iter()
@@ -664,7 +664,7 @@ impl Database {
                     Ok(true)
                 })?;
                 self.note_dd_touch_if_needed(path, txn_id);
-                self.discard_heap_page_only(path, *page_id as u64)?;
+                self.discard_heap_page_only(path, *page_id as u64, heap_redo)?;
                 self.refresh_heap_handle_if_grown(path, *page_id as u64);
                 let _ = before;
             }
@@ -719,7 +719,7 @@ impl Database {
                     },
                 )?;
                 self.note_dd_touch_if_needed(path, txn_id);
-                self.discard_heap_page_only(path, *page_id as u64)?;
+                self.discard_heap_page_only(path, *page_id as u64, heap_redo)?;
                 self.refresh_heap_handle_if_grown(path, *page_id as u64);
             }
             WalPayload::PageUpdate {
@@ -1025,7 +1025,7 @@ impl Database {
             && crate::storage::data_dictionary::is_dd_table_id(info.table_id)
     }
 
-    /// B-tree and vector indexes are rebuilt locally from committed heap data.
+    /// B-tree files use a local layout; vector graph files use physical redo.
     fn path_is_index_file(path: &str) -> bool {
         is_index_object_path(path)
     }
@@ -1085,17 +1085,31 @@ impl Database {
     /// that page is O(1), where the whole-file scan in
     /// `invalidate_buffer_pool_path` walks every pool shard and was the
     /// dominant cost of replica apply under TPC-C.
-    fn discard_heap_page_only(&self, relative: &str, page_id: u64) -> Result<(), QueryError> {
+    fn discard_heap_page_only(
+        &self,
+        relative: &str,
+        page_id: u64,
+        redo: &OnlineHeapRedoFiles,
+    ) -> Result<(), QueryError> {
         let Some(table_id) = Self::parse_heap_table_id(relative) else {
             // Not a recognizable heap object — fall back to the
             // whole-file invalidation for safety.
             return self.invalidate_buffer_pool_path(relative);
         };
-        let abs = self.data_dir.join(relative);
-        let key = PageKey {
-            file: Arc::new(BufferPool::heap_file_key(abs, table_id)),
-            page_id,
-        };
+        // Resolve owner/control/image capabilities once per open file in this
+        // bounded chunk. Recreating a file key for every row performs repeated
+        // metadata I/O even when the affected page is absent from the pool.
+        let file = redo
+            .files
+            .get(relative)
+            .and_then(|file| file.pool_key.clone())
+            .unwrap_or_else(|| {
+                Arc::new(BufferPool::heap_file_key(
+                    self.data_dir.join(relative),
+                    table_id,
+                ))
+            });
+        let key = PageKey { file, page_id };
         self.buffer_pool.discard_page(&key)?;
         Ok(())
     }
@@ -1170,7 +1184,10 @@ impl Database {
         if !matches!(info.kind, crate::storage::naming::ObjectFileKind::Index) {
             return None;
         }
-        if info.ext != "rtree" && info.ext != "idx" && info.ext != "hnsw" && info.ext != "hvec" {
+        // Vector graph files share an index id with the companion B-tree,
+        // but have independent physical pages and cache owners. Retiring the
+        // companion on graph redo discards unflushed logical IndexBatch work.
+        if info.ext != "rtree" && info.ext != "idx" {
             return None;
         }
         // Startup keeps compact catalog headers without index definitions.
@@ -1914,7 +1931,13 @@ impl Database {
                     })
                 })?;
             let index = handle.write();
-            index.apply_replicated_batch(txn_id, entries, lsn)?;
+            index
+                .apply_replicated_batch(txn_id, entries, lsn)
+                .map_err(|err| {
+                    err.map_message(|message| {
+                        format!("apply index batch {path} (lsn {lsn}): {message}")
+                    })
+                })?;
             // No flush here: index pages stay dirty in the shared
             // buffer pool (master PageUpdate/FileCreate images are
             // skipped for index files, so nothing discards them), and

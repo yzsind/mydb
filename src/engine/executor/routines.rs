@@ -5377,16 +5377,6 @@ fn assign_target(
             if let Some((qualifier, _)) = name.split_once('.') {
                 check_trigger_row_qualifier(qualifier).map_err(RoutineExecError::from)?;
             }
-            // B4 — a generated NEW column is read-only; assigning it is 3105
-            // (checked before the writable path so it is not silently stored).
-            if trigger_generated_new_keys.contains(&key) {
-                let column = name.rsplit('.').next().unwrap_or(name.as_str());
-                return Err(error(
-                    crate::error::catalog::ER_NON_DEFAULT_VALUE_FOR_GENERATED_COLUMN,
-                    format!("The value specified for generated column '{column}' is not allowed"),
-                )
-                .into());
-            }
             if trigger_old_keys.contains(&key) {
                 return Err(error(
                     crate::error::catalog::ER_TRG_CANT_CHANGE_ROW,
@@ -5400,6 +5390,12 @@ fn assign_target(
                     "Updating of NEW row is not allowed in this trigger",
                 )
                 .into());
+            }
+            // BEFORE assignments to generated columns are ignored; storage
+            // computes them from the final base-column image. AFTER still
+            // rejects all NEW writes above.
+            if trigger_generated_new_keys.contains(&key) {
+                return Ok(());
             }
             if !locals.contains_key(&key) {
                 return Err(error(
